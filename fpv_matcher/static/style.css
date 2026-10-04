@@ -23,18 +23,17 @@
 .calibration-controls{min-width:0;padding:16px;border:1px solid var(--line);border-radius:12px;background:#090f24}
 .calibration-controls h3{margin:0 0 10px;font-size:15px}
 .calibration-preview{min-width:0}
-.calibration-preview .marker-group{margin-top:12px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:#090f24}
-.calibration-preview .marker-group h4{font-size:13px;margin:0}
-.calibration-preview .marker-group .actions{gap:8px;margin-top:10px}
-.calibration-preview .marker-group button{flex:1 1 160px;padding:9px 10px}
-.calibration-preview .marker-group .hint{font-size:12px;margin-bottom:0}
+.calibration-preview .marker-group,.calibration-playback-controls{margin-top:12px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:#090f24}
+.calibration-preview h4{font-size:13px;margin:0}
+.calibration-preview .actions{gap:8px;margin-top:10px}
+.calibration-preview button{flex:1 1 160px;padding:9px 10px}
+.calibration-preview .hint{font-size:12px;margin-bottom:0}
 .calibration-controls .actions{gap:8px;margin-top:10px}
 .calibration-frame-controls label{display:flex;align-items:center;gap:7px}
 .calibration-controls button{flex:1 1 calc(50% - 8px);padding:9px 10px}
-.calibration-controls .calibration-frame-controls #auto-regions,.calibration-controls .calibration-save-controls #save-calibration{flex-basis:100%}
 .calibration-controls details{margin-top:12px}
 .calibration-controls .hint{font-size:12px;margin-bottom:4px}
-.calibration-controls .calibration-save-controls #save-calibration{background:linear-gradient(105deg,var(--purple),#793deb 57%,var(--cyan))}
+.calibration-preview .calibration-save-controls #save-calibration{background:linear-gradient(105deg,var(--purple),#793deb 57%,var(--cyan))}
 @media(max-width:900px){.calibration-workspace{grid-template-columns:1fr}.calibration-controls{order:2}}
 /* Leave room for Windows system-font descenders in the gradient title. */
 h1{line-height:1.2;padding-bottom:.08em;overflow:visible;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}

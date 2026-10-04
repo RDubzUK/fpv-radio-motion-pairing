@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>FPV ↔ StickCam Matcher</title>
-  <link rel="stylesheet" href="/static/style.css?v=20">
+  <link rel="stylesheet" href="/static/style.css?v=21">
   <script type="module" src="/static/app.js?v=43"></script>
 </head>
 <body>
@@ -53,9 +53,15 @@
       <div class="calibration-preview">
         <div id="cal-stage" class="cal-stage"><img id="cal-image" alt="StickCam calibration frame"><video id="cal-video" class="hidden" muted playsinline preload="metadata"></video><canvas id="roi-canvas" aria-label="Draw gimbal regions and select stick tips"></canvas></div>
         <div class="marker-group"><h4>Mark the controls</h4><div class="actions" id="mark-tools"><button data-tool="box:left_gimbal" class="secondary">1. Left region</button><button data-tool="box:right_gimbal" class="secondary">2. Right region</button><button data-tool="tip:left_gimbal" class="secondary">3. Left tip</button><button data-tool="tip:right_gimbal" class="secondary">4. Right tip</button><button data-tool="center:left_gimbal" class="secondary">Left neutral centre</button><button data-tool="center:right_gimbal" class="secondary">Right neutral centre</button><button data-tool="radio-outline" class="secondary">Track radio outline</button></div><p class="hint">Optional: mark shell corners clockwise from top left. This helps track the radio face and its orientation.</p></div>
+        <div class="calibration-playback-controls" aria-label="StickCam frame, playback and calibration controls">
+          <h4>Frame &amp; calibration</h4>
+          <div class="actions calibration-frame-controls"><label>Reference frame <input id="reference-time" type="number" min="0" step="0.1" value="0"> s</label><span id="cal-duration" class="badge"></span><button id="load-frame" class="secondary">Show frame</button><button id="cal-frame-back" class="secondary">−5s</button><button id="cal-frame-forward" class="secondary">+5s</button><button id="auto-regions" class="secondary">Suggest gimbal regions</button><button id="cal-preview" class="secondary">Play reference video</button><button id="cal-pause" class="secondary hidden">Pause</button></div>
+          <p id="calibration-message" class="hint" role="status" aria-live="polite"></p>
+          <div class="actions calibration-save-controls"><button id="save-calibration">Confirm calibration &amp; next clip</button><span id="calibration-dirty" class="badge hidden">Unsaved draft · kept on this device</span><button id="discard-calibration-draft" class="secondary hidden">Discard draft</button></div>
+        </div>
       </div>
-      <aside class="calibration-controls" aria-label="StickCam frame and calibration controls">
-        <h3>Frame &amp; calibration</h3>
+      <aside class="calibration-controls" aria-label="StickCam radio and detection settings">
+        <h3>Radio &amp; detection settings</h3>
         <details id="radio-orientation-section" open><summary>Session radio &amp; orientation</summary>
           <label class="field">Radio stick assignments<select id="radio-stick-mode"><option value="2">Mode 2 · default</option><option value="1">Mode 1</option><option value="3">Mode 3</option><option value="4">Mode 4</option></select></label><p id="radio-stick-mode-summary" class="hint"></p><button id="apply-stick-mode-all" class="secondary">Use these assignments for all StickCam clips</button>
           <label class="field">Radio model<select id="session-radio-label"><option value="auto">Auto-detect · confirm a model</option><option value="other">Other</option></select></label>
@@ -69,8 +75,6 @@
           <div id="radio-orientation-result" class="hidden"><img id="radio-orientation-image" class="diagnostic" alt="StickCam frame near the midpoint for radio orientation review"><p id="radio-orientation-evidence" class="hint"></p><button id="apply-radio-orientation" class="secondary">Use suggested calibration orientation</button></div>
           <p class="hint">Confirm a clear radio outline and both sticks once as the session reference. The model is a soft hint and never excludes a different visible shape. Shape and distributed face details then identify that same radio near each clip’s midpoint (retrying ±5s / ±10s), and at its calibration frame. Unknown results need manual review. The model label is yours to confirm; a silhouette alone cannot identify a model reliably.</p>
         </details>
-        <div class="actions calibration-frame-controls"><label>Reference frame <input id="reference-time" type="number" min="0" step="0.1" value="0"> s</label><span id="cal-duration" class="badge"></span><button id="load-frame" class="secondary">Show frame</button><button id="cal-frame-back" class="secondary">−5s</button><button id="cal-frame-forward" class="secondary">+5s</button><button id="auto-regions" class="secondary">Suggest gimbal regions</button><p id="calibration-message" class="hint" role="status" aria-live="polite"></p><button id="cal-preview" class="secondary">Play reference video</button><button id="cal-pause" class="secondary hidden">Pause</button></div>
-        <div class="actions calibration-save-controls"><button id="save-calibration">Confirm calibration &amp; next clip</button><span id="calibration-dirty" class="badge hidden">Unsaved draft · kept on this device</span><button id="discard-calibration-draft" class="secondary hidden">Discard draft</button></div>
         <details><summary>More calibration tools</summary><div class="actions"><button id="check-tracking" class="secondary">Check 3 seconds of tracking</button><button id="copy-regions" class="secondary">Copy regions to other clips</button></div><div id="tracking-check" class="hidden"><p id="tracking-message"></p><img id="tracking-image" class="diagnostic" alt="Stick tip tracking markers at successive moments"></div></details>
         <details><summary>Detection settings</summary><p class="hint">Neutral centres start in the middle of each region. Adjust them if needed. Tip templates are the primary detector; brightness settings control its fallback.</p><div class="actions"><label>Tip radius <input id="tip-radius" type="number" min="2" max="100" value="10"> px</label><label>Fallback threshold <input id="tip-threshold" type="number" min="0" max="255" value="70"></label><label>Tip brightness <select id="tip-polarity"><option value="dark">Dark</option><option value="light">Light</option></select></label></div></details>
       </aside>
