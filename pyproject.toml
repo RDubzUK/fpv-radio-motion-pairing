@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fpv-radio-motion-pairing"
+version = "0.2.0"
+description = "Proof of concept for pairing FPV and radio videos using motion fingerprints"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6,<7", "telemetry-parser>=0.3,<0.4", "numpy>=1.26,<3", "opencv-python-headless>=4.8,<5", "scipy>=1.11,<2", "matplotlib>=3.8,<4", "fastapi>=0.110,<1", "starlette>=0.49,<2", "anyio>=4,<5", "uvicorn[standard]>=0.27,<1", "python-multipart>=0.0.9,<1"]
+
+[tool.uv.sources]
+telemetry-parser = { path = "vendor/telemetry-parser/bin/python-module" }
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+ignore = ["B008"] # FastAPI Body/Query defaults describe the HTTP API.
+
+[project.scripts]
+fpv-match = "fpv_matcher.cli:main"
+fpv-match-web = "fpv_matcher.web:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fpv_matcher*"]
+
+[tool.setuptools.package-data]
+fpv_matcher = ["static/*.html", "static/*.css", "static/*.js"]

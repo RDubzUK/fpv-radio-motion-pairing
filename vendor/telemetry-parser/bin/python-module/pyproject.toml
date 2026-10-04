@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "telemetry-parser"
+dynamic = ["version"]
+requires-python = ">=3.7"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Adrian", email = "adrian.eddy@gmail.com" }]
+readme = "README.md"
+classifiers = [
+    "Topic :: Utilities",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.urls]
+homepage = "https://github.com/AdrianEddy/telemetry-parser"

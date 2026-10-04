@@ -1,0 +1,6 @@
+target/
+.vscode/
+dev/
+.env*/
+*.code-workspace
+publish.sh

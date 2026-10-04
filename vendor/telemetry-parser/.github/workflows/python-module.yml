@@ -1,0 +1,172 @@
+name: Python-module
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.7
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.8
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build wheels - x86_64
+        uses: messense/maturin-action@v1
+        with:
+          target: x86_64
+          command: build
+          args: -m bin/python-module/Cargo.toml --release --find-interpreter
+
+      - name: Build wheels - universal2
+        uses: messense/maturin-action@v1
+        with:
+          command: build
+          args: -m bin/python-module/Cargo.toml --release --universal2 --find-interpreter
+
+      - name: Save Wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: bin/python-module/target/wheels/*.whl
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x64, x86]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.target }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build wheels
+        uses: messense/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          command: build
+          args: -m bin/python-module/Cargo.toml --release --find-interpreter
+
+      - name: Save Wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: bin/python-module/target/wheels/*.whl
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [i686, x86_64]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build Wheels
+      uses: messense/maturin-action@v1
+      with:
+        target: ${{ matrix.target }}
+        manylinux: auto
+        command: build
+        args: -m bin/python-module/Cargo.toml --release --find-interpreter
+
+    - name: Save Wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels
+        path: bin/python-module/target/wheels/*
+
+  linux-cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64, armv7]
+        python-config: [
+          { version: 3.7, lib: "cp37-cp37m" },
+          { version: 3.8, lib: "cp38-cp38" },
+          { version: 3.9, lib: "cp39-cp39" },
+          { version: "3.10", lib: "cp310-cp310" },
+          { version: "3.11", lib: "cp311-cp311" },
+          { version: "3.12", lib: "cp312-cp312" }
+        ]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-config.version }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build Wheels
+      uses: messense/maturin-action@v1
+      env:
+        PYO3_CROSS_PYTHON_VERSION: ${{ matrix.python-config.version }}
+        PYO3_CROSS_LIB_DIR: '/opt/python/${{ matrix.python-config.lib }}/lib'
+      with:
+        target: ${{ matrix.target }}
+        manylinux: auto
+        command: build
+        args: -m bin/python-module/Cargo.toml --release -i python${{ matrix.python-config.version }}
+
+    - name: Save Wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels
+        path: bin/python-module/target/wheels/*.whl
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [ macos, windows, linux, linux-cross ]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Publish to PyPi
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+        run: |
+          pip install --upgrade twine
+          twine upload --skip-existing *

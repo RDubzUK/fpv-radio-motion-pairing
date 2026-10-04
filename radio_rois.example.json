@@ -1,0 +1,7 @@
+{
+  "stickcam_mode": "fixed",
+  "reference_time": 0,
+  "left_gimbal": {"x": 100, "y": 300, "width": 250, "height": 250, "center_x": 125, "center_y": 125, "travel_x": 100, "travel_y": 100, "tip_x": 125, "tip_y": 125, "tip_radius": 10, "threshold": 70, "polarity": "dark"},
+  "right_gimbal": {"x": 400, "y": 300, "width": 250, "height": 250, "center_x": 125, "center_y": 125, "travel_x": 100, "travel_y": 100, "tip_x": 125, "tip_y": 125, "tip_radius": 10, "threshold": 70, "polarity": "dark"},
+  "signs": {"roll": 1, "pitch": 1, "yaw": 1, "throttle": 1}
+}

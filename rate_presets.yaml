@@ -1,0 +1,18 @@
+# Shared FPV rate presets. Model values use the same units as the web form.
+version: 1
+default: RDubz Kiss
+presets:
+  RDubz Kiss:
+    model: kiss
+    roll:
+      rc_rate: 0.93
+      rate: 0.65
+      rc_curve: 0.2
+    pitch:
+      rc_rate: 0.93
+      rate: 0.65
+      rc_curve: 0.2
+    yaw:
+      rc_rate: 0.93
+      rate: 0.65
+      rc_curve: 0.2

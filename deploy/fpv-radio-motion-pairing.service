@@ -1,0 +1,19 @@
+[Unit]
+Description=FPV and StickCam pairing workspace
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/vscode_projects/fpv-radio-motion-pairing
+ExecStart=%h/vscode_projects/fpv-radio-motion-pairing/.venv/bin/python -m fpv_matcher.web --host 0.0.0.0 --port 8767
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+Nice=5
+
+[Install]
+WantedBy=default.target
