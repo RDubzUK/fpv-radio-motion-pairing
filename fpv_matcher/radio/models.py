@@ -6,7 +6,7 @@ A session's confirmed photographic reference always takes precedence.
 """
 from __future__ import annotations
 
-VERSION = "radio-shell-priors-v1"
+VERSION = "radio-shell-soft-layout-orientation-v3"
 
 # Rounded box and gamepad shell families. Per-model landmarks/aspects remain
 # separate: these are deliberately broad priors for perspective and hand occlusion.
@@ -24,8 +24,8 @@ def _model(id, label, family, aspect, centers, radius, screen, source, variants=
 
 
 MODELS = [
-    _model("rm-tx16s", "RadioMaster TX16S", "full size", 1.0, (.25, .75, .37), .17, [.35, .66, .65, .88],
-           "https://radiomasterrc.com/products/tx16s-mark-ii-radio-controller", ("MKII", "MAX")),
+    _model("rm-tx16s", "RadioMaster TX16S", "full size", 1.0, (.2, .8, .30), .17, [.2, .55, .8, .91],
+           "https://radiomasterrc.com/products/tx16s-mark-ii-radio-controller", ("MKI", "MKII", "MAX")),
     _model("rm-boxer", "RadioMaster Boxer", "box", 1.27, (.25, .75, .4), .19, [.32, .75, .68, .89],
            "https://radiomasterrc.com/products/boxer-radio-controller-m2", ("MAX", "Crush")),
     _model("rm-gx12", "RadioMaster GX12", "compact", 1.24, (.25, .75, .4), .18, [.35, .76, .65, .88],
@@ -67,7 +67,7 @@ def geometry_support(model, left, right, width, height):
     return float(np.exp(-distance ** 2 / (2 * .18 ** 2)))
 
 
-def suggest_shell(image, proposal, choice="auto"):
+def suggest_shell(image, proposal, choice="auto", *, allow_outline_draft=False):
     """Fit bounded silhouette hypotheses to observed rims, requiring visible edges.
 
     This is supporting geometry, not a trained model classifier. Similar shells
@@ -75,10 +75,12 @@ def suggest_shell(image, proposal, choice="auto"):
     """
     import cv2
     import numpy as np
-    if choice == "other" or proposal.get("radio_outline"):
+    if proposal.get("radio_outline"):
         return proposal
     selected = model_for(choice)
-    models = [selected] if selected else MODELS if choice == "auto" else []
+    # A model selection is a soft prior. A different case, viewing angle or
+    # incorrect label must not prevent visible body edges from being proposed.
+    models = MODELS
     regions = proposal["regions"]
     centers = np.asarray([[regions[s]["x"] + regions[s]["center_x"], regions[s]["y"] + regions[s]["center_y"]]
                           for s in ("left_gimbal", "right_gimbal")], np.float32)
@@ -119,10 +121,35 @@ def suggest_shell(image, proposal, choice="auto"):
                 coverage.append(float((distance[pixels[:, 1], pixels[:, 0]] <= tolerance).mean()))
             support = float(np.mean(coverage))
             distributed = sum(c >= .4 for c in coverage) / len(coverage)
+            # Dense grass can support almost every imagined edge. Measure
+            # whether the proposed boundary stands out from its surroundings.
+            xx, yy = np.meshgrid(np.linspace(.05, .95, 24), np.linspace(.05, .95, 24))
+            probe = np.rint(project(np.column_stack((xx.ravel(), yy.ravel())))).astype(int)
+            incidental = float((distance[probe[:,1], probe[:,0]] <= tolerance).mean())
+            specificity = max(0., support - incidental)
+            screen_support = 0.
+            if model["screen"]:
+                x0, y0, x1, y1 = model["screen"]
+                screen = project([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+                screen_segments = [np.linspace(a, b, 16) for a, b in zip(screen, np.roll(screen, -1, axis=0))]
+                perimeter = np.concatenate(screen_segments)
+                pixels = np.rint(perimeter).astype(int)
+                if (pixels[:, 0] >= 0).all() and (pixels[:, 0] < width).all() and (pixels[:, 1] >= 0).all() and (pixels[:, 1] < height).all():
+                    edge = float((distance[pixels[:, 1], pixels[:, 0]] <= tolerance).mean())
+                    xx, yy = np.meshgrid(np.linspace(x0+.02, x1-.02, 12), np.linspace(y0+.02, y1-.02, 8))
+                    inside = project(np.column_stack((xx.ravel(), yy.ravel())))
+                    intensity = cv2.remap(image, inside[:, 0].astype(np.float32), inside[:, 1].astype(np.float32), cv2.INTER_LINEAR).ravel()
+                    # A display's flat interior and rectangular edges provide
+                    # asymmetric evidence. Neither dark pixels nor shape alone
+                    # establishes the radio's orientation.
+                    flat = max(0., 1.-float(np.std(intensity))/40.)
+                    screen_support = edge * flat
             if support >= .52 and distributed >= .6:
                 candidates.append({"model_id": model["id"], "label": model["label"],
-                                   "edge_support": support, "outline": box.tolist(), "shell": shell.tolist()})
-    candidates.sort(key=lambda row: row["edge_support"], reverse=True)
+                                   "edge_support": support, "screen_support": screen_support,
+                                   "layout_score": .15 * support + .55 * specificity + .30 * screen_support + (.12 if selected and model["id"] == selected["id"] else 0),
+                                   "outline": box.tolist(), "shell": shell.tolist()})
+    candidates.sort(key=lambda row: row["layout_score"], reverse=True)
     if not candidates:
         return {**proposal, "shape_message": "No clear shell fit; mark the outline or use a confirmed session reference."}
     unique = []
@@ -130,10 +157,17 @@ def suggest_shell(image, proposal, choice="auto"):
         if not any(row["model_id"] == candidate["model_id"] for row in unique):
             unique.append(candidate)
     best = candidates[0]
-    # Only offer shell corners for a selected model or a distinct auto hypothesis.
+    # Manual suggestions can offer an editable body without proving its model.
+    # Automatic calibration retains the distinct-hypothesis requirement.
     distinct = len(unique) == 1 or best["edge_support"] - unique[1]["edge_support"] >= .08
-    result = {**proposal, "shape_matches": [{k: r[k] for k in ("model_id", "label", "edge_support")} for r in unique[:3]],
-              "shape_message": "Approximate shell fit; confirm the model and all corners." if selected or distinct else "Several radio shapes fit; choose the model or mark its outline."}
-    if selected or distinct:
-        result.update(radio_outline=best["outline"], shape_shell=best["shell"], detection_method="paired rims with catalogue shell edges")
+    selected_fits = selected and best["model_id"] == selected["id"]
+    result = {**proposal, "shape_matches": [] if choice == "other" else [{k: r[k] for k in ("model_id", "label", "edge_support")} for r in unique[:3]],
+              "shape_message": "Approximate body outline from visible edges; check every corner. The radio model is still yours to confirm." if selected_fits or distinct else "Several body shapes fit. The outline is a draft; it does not identify the radio model."}
+    if selected_fits or distinct or allow_outline_draft:
+        result.update(radio_outline=best["outline"], shape_shell=best["shell"], shell_edge_support=best["edge_support"],
+                      shell_layout_score=best["layout_score"], screen_edge_support=best["screen_support"],
+                      outline_needs_review=True, detection_method="paired rims with visible shell edges and shape priors")
+        if not (selected_fits or distinct):
+            result["needs_review"] = True
+            result["review_reasons"] = [*proposal.get("review_reasons", []), "Body edges support an outline, but the model is ambiguous. Adjust the outline before confirming."]
     return result

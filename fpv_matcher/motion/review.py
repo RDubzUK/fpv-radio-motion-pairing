@@ -63,10 +63,9 @@ def run(request_path):
                 raise ValueError(f"Embedded motion unavailable: {exc}") from exc
             warnings.append(f"Embedded motion unavailable: {exc}. Showing image-derived motion.")
     if fpv is None:
-        fpv = cached_visual_motion(request["fpv_path"], cache, request["sample_fps"], request.get("fpv_identity"),
-                                   progress=lambda event: report("fpv", event))
-        fpv = {**fpv, "kind": np.asarray("visual"), "label": np.asarray("Image-derived motion · 2D affine estimate"),
-               "note": np.asarray("Image rotation and horizontal/vertical flow are visual proxies, not calibrated drone roll/pitch/yaw. Tracking gaps are omitted.")}
+        fpv = cached_visual_motion(request["fpv_path"], cache, request.get("fpv_sample_fps", request["sample_fps"]), request.get("fpv_identity"),
+                                   progress=lambda event: report("fpv", event), camera_profile=request.get("visual_camera"))
+
     np.savez_compressed(directory / "fpv.npz", **fpv)
     report("fpv", {"percent": 100})
     radio = None
@@ -98,7 +97,7 @@ def run(request_path):
     report("complete", {"percent": 100, "eta_seconds": 0})
     atomic_json(directory / "review.json", {"fpv_kind": str(fpv["kind"].item()), "fpv_label": str(fpv["label"].item()),
         "fpv_note": str(fpv["note"].item()), "radio_available": radio is not None,
-        "rate_profile": request.get("rate_profile"), "warnings": warnings,
+        "rate_profile": request.get("rate_profile"), "stick_mode": (calibration or {}).get("stick_mode", 2), "warnings": warnings,
         "stick_sample_fps": request.get("stick_sample_fps", request["sample_fps"]),
         "fpv_video": request["fpv_video"], "radio_video": request.get("radio_video"),
         "fpv_range": [float(fpv["time"][0]), float(fpv["time"][-1])],

@@ -40,7 +40,10 @@ from fpv_matcher.radio.stabilization import VERSION as OUTLINE_VERSION
 from fpv_matcher.matching.correlation import prepare, section_support
 from fpv_matcher.matching.evidence import normalize_sources, motion_enabled, audio_enabled_pair
 from fpv_matcher.motion.telemetry import VERSION as TELEMETRY_VERSION, validate_motion_settings, body_rates
-from fpv_matcher.motion.derivation import cache_status as fpv_cache_status, embedded_status, VERSION as VISUAL_VERSION
+from fpv_matcher.motion.visual_rotation import validate_profile as validate_visual_camera, visual_body_rates
+from zipfile import BadZipFile
+from fpv_matcher.motion.derivation import cache_status as fpv_cache_status, embedded_status, load_saved_visual, VERSION as VISUAL_VERSION
+from fpv_matcher.motion.sampling import visual_fps, MODES as VISUAL_SAMPLING_MODES
 from fpv_matcher.video.metadata import filename_timestamp, format_timestamp
 import numpy as np
 from fpv_matcher.exports import export_pair, stream_archive
@@ -159,14 +162,17 @@ def _input_video(job, kind, name):
 
 def _metadata(job, kind, name):
     path = _input_video(job, kind, name)
-    signature = [path.stat().st_size, path.stat().st_mtime_ns]
+    try:
+        signature = [path.stat().st_size, path.stat().st_mtime_ns]
+    except OSError:
+        raise HTTPException(409, f"{name} is unavailable. Restore or relink its source folder.") from None
     record = _record(job, kind, name)
     if (
         record.get("metadata_signature") == signature
         and record.get("metadata")
         and "color" in record["metadata"]
     ):
-        return record["metadata"]
+        return {**record["metadata"], "source_signature": signature}
     try:
         info = probe_video(path)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -174,12 +180,15 @@ def _metadata(job, kind, name):
 
     def mutate(current):
         item = _record(current, kind, name)
+        if kind == "radio" and record.get("metadata_signature") and record["metadata_signature"] != signature and name in current.get("calibrations", {}):
+            current.setdefault("calibration_signatures", {}).setdefault(name, record["metadata_signature"])
+            current.setdefault("calibration_reviews", {}).setdefault(name, {}).update(status="source_changed")
         item.update(metadata=info, metadata_signature=signature)
         if current["source"] == "local":
             item.update(size=info["size"], uploaded=info["size"])
 
     jobs.update(job["id"], mutate)
-    return info
+    return {**info, "source_signature": signature}
 
 
 def _public(job):
@@ -203,7 +212,7 @@ def _public(job):
     }
     result["segment_scans"] = [{"id": key, **value} for key, value in job.get("charts", {}).items() if value.get("kind") == "fpv-segments"]
     result["inputs"] = {
-        kind: [{key: item.get(key) for key in ("name", "size", "uploaded", "metadata")} for item in records]
+        kind: [{key: item.get(key) for key in ("name", "size", "uploaded", "metadata", "metadata_signature")} for item in records]
         for kind, records in job["inputs"].items()
     }
     progress_path = jobs.job_dir(job["id"]) / "results" / "progress.json"
@@ -219,6 +228,10 @@ def _public(job):
             result["early_proposal"] = json.loads(early_path.read_text())
         except (OSError, ValueError):
             pass
+    result["calibrations"] = {name: {**config, **({"source_changed": True} if job.get("calibration_reviews", {}).get(name, {}).get("status") == "source_changed" else {})} for name, config in job.get("calibrations", {}).items()}
+    result["source_folders"] = {kind: sorted({str(Path(item["path"]).parent) for item in records}) for kind, records in job["inputs"].items()}
+    result["has_results"] = (jobs.job_dir(job["id"]) / "results" / "results.json").is_file()
+    result["last_successful_at"] = job.get("last_successful_at")
     result["exports"] = [
         {"id": key, "status": value["status"], "message": value["message"]}
         for key, value in job.get("exports", {}).items()
@@ -230,6 +243,70 @@ def _public(job):
     if profile:
         result["radio_profile"]["model_id"] = profile.get("model_id", model_id(profile["label"]))
     return result
+
+
+
+@app.get("/api/jobs/{job_id}/sources")
+def source_status(job_id: str):
+    job = get_job(job_id)
+    rows = []
+    for kind, records in job["inputs"].items():
+        for record in records:
+            path = Path(record["path"])
+            try:
+                stat = path.stat()
+                readable = path.is_file() and os.access(path, os.R_OK)
+                expected = record.get("metadata_signature") or record.get("upload_signature")
+                current = [stat.st_size, stat.st_mtime_ns]
+                state = "ready" if readable else "unreadable"
+                if expected and current != expected:
+                    state = "changed"
+                rows.append({"kind": kind, "name": record["name"], "path": str(path), "status": state,
+                             "signature": current, "reason": "Review again after matching" if state == "changed" else ""})
+            except OSError as exc:
+                rows.append({"kind": kind, "name": record["name"], "path": str(path), "status": "unavailable", "reason": str(exc)})
+    return {"source": job["source"], "clips": rows}
+
+
+@app.put("/api/jobs/{job_id}/sources")
+def relink_sources(job_id: str, body: dict = Body(...)):
+    job = get_job(job_id)
+    if job["source"] != "local":
+        raise HTTPException(400, "Uploaded media is stored by this app; relinking is for server folders")
+    if job["status"] in {"running", "queued", "cancelling"} or any(task["status"] in {"queued", "running"} for task in job.get("charts", {}).values()) or any(task["status"] in {"queued", "running"} for task in job.get("exports", {}).values()):
+        raise HTTPException(409, "Finish or cancel active work before relinking source files")
+    kind = body.get("kind")
+    if kind not in {"fpv", "radio"}:
+        raise HTTPException(400, "Choose FPV or StickCam")
+    root = Path(str(body.get("path", ""))).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(400, "Choose an existing source folder on the server")
+    replacements, missing = {}, []
+    for record in job["inputs"][kind]:
+        candidate = root / record["name"]
+        if candidate.is_file() and os.access(candidate, os.R_OK):
+            stat = candidate.stat()
+            replacements[record["name"]] = (str(candidate.resolve()), stat.st_size, stat.st_mtime_ns)
+        else:
+            missing.append(record["name"])
+    if not replacements:
+        raise HTTPException(400, "This folder contains none of this session's filenames")
+    def update(current):
+        for record in current["inputs"][kind]:
+            if record["name"] not in replacements:
+                continue
+            path, size, modified = replacements[record["name"]]
+            changed = record.get("metadata_signature") != [size, modified]
+            record.update(path=path, size=size, uploaded=size)
+            if changed:
+                if kind == "radio" and record.get("metadata_signature") and record["name"] in current.get("calibrations", {}):
+                    current.setdefault("calibration_signatures", {}).setdefault(record["name"], record["metadata_signature"])
+                    current.setdefault("calibration_reviews", {}).setdefault(record["name"], {}).update(status="source_changed")
+                for key in ("metadata", "metadata_signature", "sha256", "upload_signature"):
+                    record.pop(key, None)
+        current.update(message="Source folder relinked. Check changed files and rerun matching to reuse valid caches.")
+    jobs.update(job_id, update)
+    return {"relinked": len(replacements), "missing": missing}
 
 
 @app.get("/api/system")
@@ -479,25 +556,30 @@ def create_job(body: dict = Body(...)):
         "updated_at": time.time(),
         "source": source,
         "status": "draft" if source == "local" else "uploading",
-        "message": "Calibrate StickCam clips" if source == "local" else "Ready for resumable uploads",
+        "message": "Ready to find flights automatically" if source == "local" else "Ready for resumable uploads",
         "label": str(body.get("label", ""))[:120] or time.strftime("Session %d %b %H:%M"),
         "inputs": inputs,
         "calibrations": {},
         "settings_defaults_version": 2,
         "settings": {
             "sample_fps": 30,
+            "fpv_sampling_mode": "auto",
+            "fpv_visual_fps": 30,
+            "stick_mode": 2,
+            "visual_camera": validate_visual_camera(),
             "stick_sampling_ratio": None,
             "match_fps": 30,
             "min_overlap": 2,
             "workers": 2,
             "minimum_score": 0.55,
             "audio_enabled": True,
-            "evidence_sources": normalize_sources(),
+            "matching_strategy": "automatic",
+            "evidence_sources": normalize_sources({"fpv_visual": False}),
             "match_target_kind": "all",
             "match_target_name": "",
             "match_target_names": [],
             "stop_on_confident_match": True,
-            "allow_unconfigured_radio": False,
+            "allow_unconfigured_radio": True,
             "rate_profile": default_rates,
             "motion_source": "auto",
             "camera_uptilt_deg": 0,
@@ -609,7 +691,7 @@ async def upload_chunk(job_id: str, kind: str, filename: str, request: Request):
                 item["sha256"] = digest
                 item["upload_signature"] = [target.stat().st_size, target.stat().st_mtime_ns]
             if all(i["uploaded"] == i["size"] for records in current["inputs"].values() for i in records):
-                current.update(status="draft", message="All uploads complete. Calibrate StickCam clips.")
+                current.update(status="draft", message="All uploads complete. Ready to find flights automatically.")
 
         jobs.update(job_id, mutate)
         return {"uploaded": end + 1, "complete": end + 1 == total}
@@ -646,9 +728,10 @@ def calibration_frame(job_id: str, kind: str, filename: str, at: float = 0):
 @app.put("/api/jobs/{job_id}/calibration/{filename}")
 def save_calibration(job_id: str, filename: str, config: dict = Body(...), proposal_id: str | None = None):
     job = get_job(job_id)
-    if job["status"] in {"running", "queued"}:
-        raise HTTPException(409, "Cancel analysis before changing its calibration")
+    if job["status"] in {"running", "queued", "cancelling"} or any(task.get("kind") == "stick-derivation" and task["status"] in {"queued", "running"} for task in job.get("charts", {}).values()):
+        raise HTTPException(409, "Finish or cancel matching / StickCam derivation before changing calibration")
     _record(job, "radio", filename)
+    config.pop("source_changed", None)
     if proposal_id:
         directory = _chart_directory(job_id, proposal_id)
         proposals = directory / "calibration-review.json"
@@ -678,6 +761,10 @@ def save_calibration(job_id: str, filename: str, config: dict = Body(...), propo
         raise HTTPException(400, str(exc)) from exc
     def save(current):
         current["calibrations"].update({filename: config})
+        record = _record(current, "radio", filename)
+        if record.get("metadata_signature"):
+            current.setdefault("calibration_signatures", {})[filename] = record["metadata_signature"]
+        current.setdefault("calibration_reviews", {}).setdefault(filename, {}).update(status="confirmed")
         if proposal_id:
             current.setdefault("calibration_reviews", {})[filename] = {"proposal_id": proposal_id,
                 "status": "confirmed", "at": config["reference_time"], "updated_at": time.time()}
@@ -685,12 +772,44 @@ def save_calibration(job_id: str, filename: str, config: dict = Body(...), propo
     return {"saved": True, "config": config}
 
 
+@app.put("/api/jobs/{job_id}/visual-camera")
+def set_visual_camera(job_id: str, body: dict = Body(...)):
+    job = get_job(job_id)
+    if job["status"] in {"queued", "running", "cancelling"} or any(t.get("kind") == "fpv-preparation" and t["status"] in {"running", "queued"} for t in job.get("charts", {}).values()):
+        raise HTTPException(409, "Finish or cancel motion preparation / matching before changing lens geometry")
+    try:
+        profile = validate_visual_camera(body)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    jobs.update(job_id, lambda current: current["settings"].update(visual_camera=profile))
+    return {"visual_camera": profile}
+
+
+@app.put("/api/jobs/{job_id}/stick-mode")
+def set_session_stick_mode(job_id: str, body: dict = Body(...)):
+    from fpv_matcher.radio.modes import validate_mode
+    job = get_job(job_id)
+    if job["status"] in {"running", "queued", "cancelling"} or any(t["status"] in {"running", "queued"} and t.get("kind") in {"stick-derivation", "motion-review", "calibration-scan"} for t in job.get("charts", {}).values()):
+        raise HTTPException(409, "Finish or cancel matching / StickCam preparation before changing stick assignments")
+    try:
+        mode = validate_mode(body.get("stick_mode", 2))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    def update(current):
+        current["settings"]["stick_mode"] = mode
+        for config in current["calibrations"].values():
+            if not config.get("exclude"):
+                config["stick_mode"] = mode
+    jobs.update(job_id, update)
+    return {"stick_mode": mode, "calibrations": get_job(job_id)["calibrations"]}
+
+
 @app.post("/api/jobs/{job_id}/calibration/{filename}/suggest")
 def suggest_calibration(job_id: str, filename: str, at: float = 0, request: dict = Body(default={})):
     import cv2
     import numpy as np
 
-    from fpv_matcher.radio.orientation import rotation_from_regions, suggest_upright_regions
+    from fpv_matcher.radio.orientation import rotation_from_regions, suggest_upright_regions, suggest_radio_orientation
     from fpv_matcher.radio.reference import suggest_from_reference
     from fpv_matcher.radio.tips import suggest_visible_tip
 
@@ -723,11 +842,13 @@ def suggest_calibration(job_id: str, filename: str, at: float = 0, request: dict
             ][:3]
             profile = job.get("radio_profile")
             if profile:
-                source = _input_video(job, "radio", profile["name"])
-                if [source.stat().st_size, source.stat().st_mtime_ns] != profile["signature"]:
-                    raise ValueError("Session radio reference source changed; confirm a new reference")
-                references = [(profile["name"], profile["calibration"])] + [r for r in references if r[0] != profile["name"] and r[1].get("radio_orientation_confirmed")]
-                references = references[:3]
+                try:
+                    source = _input_video(job, "radio", profile["name"])
+                    if [source.stat().st_size, source.stat().st_mtime_ns] == profile["signature"]:
+                        references = [(profile["name"], profile["calibration"])] + [r for r in references if r[0] != profile["name"] and r[1].get("radio_orientation_confirmed")]
+                        references = references[:3]
+                except (HTTPException, OSError, KeyError):
+                    pass
             for reference_name, config in references:
                 try:
                     reference_response = calibration_frame(job_id, "radio", reference_name, config["reference_time"])
@@ -752,22 +873,25 @@ def suggest_calibration(job_id: str, filename: str, at: float = 0, request: dict
                                 candidate["radio_rotation_deg"] = guessed
                         proposal = {**candidate, "reference_clip": reference_name}
                         break
-                except (HTTPException, OSError, ValueError, KeyError, subprocess.SubprocessError):
+                except (HTTPException, OSError, ValueError, KeyError, cv2.error, subprocess.SubprocessError):
                     # An unreadable/deleted reference must not block this clip.
                     continue
         if proposal is None:
             choice = request.get("radio_model", (job.get("radio_profile") or {}).get("model_id", "auto"))
             if choice not in {"auto", "other", *(m["id"] for m in RADIO_MODELS)}:
                 raise ValueError("Choose a listed radio model, Auto-detect or Other")
-            proposal = suggest_upright_regions(image, outline, rotation, choice)
-            proposal["radio_rotation_deg"] = rotation
+            if request.get("suggest_orientation", False):
+                proposal = suggest_radio_orientation(image, outline, choice, preferred_rotation=rotation, allow_uncertain=True)
+            else:
+                proposal = suggest_upright_regions(image, outline, rotation, choice, allow_uncertain=True)
+                proposal["radio_rotation_deg"] = rotation
         for region in proposal["regions"].values():
             if "tip_x" not in region:
                 tip = suggest_visible_tip(image, region)
                 if tip is not None:
                     region.update(tip)
         proposal["missing_tips"] = [side for side, region in proposal["regions"].items() if "tip_x" not in region]
-    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+    except (ValueError, OSError, cv2.error, subprocess.SubprocessError) as exc:
         raise HTTPException(422, str(exc)) from exc
     return {"frame_width": int(image.shape[1]), "frame_height": int(image.shape[0]), **proposal}
 
@@ -897,7 +1021,8 @@ def run_job(job_id: str, settings: dict = Body(default={})):
         raise HTTPException(409, "Finish the uploads first")
     options = {
         **job["settings"],
-        "rate_profile": None,
+        "matching_strategy": job["settings"].get("matching_strategy", "selected"),
+        "rate_profile": job["settings"].get("rate_profile"),
         "match_target_kind": "all",
         "match_target_name": "",
         "match_target_names": [],
@@ -907,11 +1032,22 @@ def run_job(job_id: str, settings: dict = Body(default={})):
             k: v
             for k, v in settings.items()
             if k in job["settings"]
-            or k in {"rate_profile", "match_target_kind", "match_target_name", "match_target_names", "stop_on_confident_match", "allow_unconfigured_radio", "motion_source", "camera_uptilt_deg", "imu_orientation", "gyro_video_offset", "decode_mode", "evidence_sources", "stick_sampling_ratio"}
+            or k in {"rate_profile", "match_target_kind", "match_target_name", "match_target_names", "stop_on_confident_match", "allow_unconfigured_radio", "motion_source", "camera_uptilt_deg", "imu_orientation", "gyro_video_offset", "decode_mode", "evidence_sources", "stick_sampling_ratio", "matching_strategy", "fpv_sampling_mode", "fpv_visual_fps", "stick_mode", "visual_camera"}
         },
     }
     try:
+        if options["matching_strategy"] not in {"automatic", "selected"}:
+            raise ValueError("Choose automatic staged matching or selected evidence")
+        automatic = options["matching_strategy"] == "automatic"
+        if automatic:
+            options["allow_unconfigured_radio"] = True
         options["stick_sampling_ratio"] = validate_ratio(options.get("stick_sampling_ratio"))
+        options["fpv_sampling_mode"] = options.get("fpv_sampling_mode", "auto")
+        from fpv_matcher.radio.modes import validate_mode
+        options["stick_mode"] = validate_mode(options.get("stick_mode", 2))
+        options["visual_camera"] = validate_visual_camera(options.get("visual_camera"))
+        options["fpv_visual_fps"] = _extraction_fps(options.get("fpv_visual_fps", 30))
+        visual_fps(options["fpv_sampling_mode"], options["fpv_visual_fps"], 30)
         for key in ("sample_fps", "match_fps", "min_overlap", "minimum_score"):
             options[key] = float(options[key])
             if not math.isfinite(options[key]):
@@ -950,7 +1086,7 @@ def run_job(job_id: str, settings: dict = Body(default={})):
         use_motion = motion_enabled(options["evidence_sources"])
         options["audio_enabled"] = audio_enabled_pair(options["evidence_sources"])
         options["motion_source"] = ("auto" if options["evidence_sources"]["fpv_gyro"] and options["evidence_sources"]["fpv_visual"] else "gyro" if options["evidence_sources"]["fpv_gyro"] else "visual")
-        if use_motion and options["allow_unconfigured_radio"] and not options["audio_enabled"]:
+        if use_motion and options["allow_unconfigured_radio"] and not options["audio_enabled"] and not automatic:
             raise ValueError("Audio-only StickCam matching requires boundary audio")
         options["rate_profile"] = validate_rate_profile(options["rate_profile"])
         options["motion_source"], options["camera_uptilt_deg"], options["imu_orientation"], options["gyro_video_offset"] = validate_motion_settings(options.get("motion_source", "auto"), options.get("camera_uptilt_deg", 0), options.get("imu_orientation", "zXy"), options.get("gyro_video_offset", 0))
@@ -971,13 +1107,20 @@ def run_job(job_id: str, settings: dict = Body(default={})):
             if calibration.get("exclude"):
                 continue
             if calibration.get("skip_motion"):
-                if not options["audio_enabled"]:
+                if not options["audio_enabled"] and not automatic:
                     raise ValueError("Audio-only clips require boundary audio to be enabled")
             else:
+                if automatic:
+                    continue  # The staged worker reports per-source/calibration failures without aborting the session.
                 info = _metadata(job, "radio", record["name"])
                 tracking_fps(options["sample_fps"], options["stick_sampling_ratio"], info.get("fps"))
-                validate_calibration(calibration, (info["width"], info["height"]))
-                if any("tip_x" not in calibration[side] for side in ("left_gimbal", "right_gimbal")):
+                try:
+                    validate_calibration(calibration, (info["width"], info["height"]))
+                except ValueError:
+                    if automatic:
+                        continue
+                    raise
+                if not automatic and any("tip_x" not in calibration[side] for side in ("left_gimbal", "right_gimbal")):
                     raise ValueError(f"Click both stick tips in {record['name']} before analysis")
         if all(job["calibrations"].get(record["name"], {}).get("exclude") for record in radio_records):
             raise ValueError("Keep at least one StickCam recording in this analysis")
@@ -986,12 +1129,28 @@ def run_job(job_id: str, settings: dict = Body(default={})):
     identities = {kind: {} for kind in job["inputs"]}
     for kind, records in job["inputs"].items():
         for item in records:
-            stat = Path(item["path"]).stat()
+            try:
+                stat = Path(item["path"]).stat()
+            except OSError:
+                if automatic:
+                    continue
+                raise HTTPException(409, f"{item['name']} is unavailable. Restore its source drive/share before matching.") from None
             if item.get("sha256") and item.get("upload_signature") == [stat.st_size, stat.st_mtime_ns]:
                 identities[kind][item["name"]] = item["sha256"]
-    config = {"clips": job["calibrations"], "identities": identities}
+    current_calibrations = {}
+    for name, calibration in job["calibrations"].items():
+        expected = job.get("calibration_signatures", {}).get(name)
+        try:
+            source = _input_video(job, "radio", name)
+            valid = not expected or expected == [source.stat().st_size, source.stat().st_mtime_ns]
+        except (OSError, HTTPException):
+            valid = False
+        if valid or calibration.get("exclude") or calibration.get("skip_motion"):
+            current_calibrations[name] = calibration
+    config = {"clips": current_calibrations, "identities": identities}
     base = jobs.job_dir(job_id)
     (base / "results" / "early.json").unlink(missing_ok=True)
+    (base / "results" / "progress.json").unlink(missing_ok=True)
     atomic_json(base / "radio_rois.json", config)
     # A list of paths supports local files without copying/linking multi-gigabyte media.
     atomic_json(
@@ -1024,11 +1183,12 @@ def _run_job(job_id, run_id):
     base = jobs.job_dir(job_id)
     command = [sys.executable, "-u", "-m", "fpv_matcher.worker", str(base), str(jobs.DATA / "cache")]
     try:
-        _execute("analysis:" + job_id + ":" + run_id, command, base / "results" / "analysis.log")
+        _execute("analysis:" + job_id + ":" + run_id, command, base / "results" / "analysis.log",
+                 timeout=min(72 * 3600, max(24 * 3600, len(job["inputs"]["radio"]) * 2 * 3600)))
         jobs.update(
             job_id,
             lambda current: (
-                current.update(status="complete", message="Analysis complete")
+                current.update(status="complete", message="Analysis complete", last_successful_at=time.time())
                 if current["status"] == "running" and current.get("run_id") == run_id
                 else None
             ),
@@ -1080,19 +1240,43 @@ def decide_early(job_id: str, body: dict = Body(...)):
             raise HTTPException(409, "That proposal already has a decision")
         if body["action"] == "confirm":
             row = pending["candidate"]
+            if pending.get("source_signatures") != _decision_signatures(job, row["radio_video"], row["fpv_video"]):
+                raise HTTPException(409, "A source changed while this proposal was waiting; continue scanning and rerun matching")
+            previous = job.get("pair_overrides", {}).get(row["fpv_video"])
+            if previous and previous["radio_video"] != row["radio_video"] and _decision_current(job, previous) and not previous.get("rejected"):
+                raise HTTPException(409, "This FPV file already has a reviewed owner. Continue scanning, then use explicit owner replacement in pair review.")
             def confirm(current):
                 current.setdefault("pair_overrides", {})[row["fpv_video"]] = {
                     "radio_video": row["radio_video"], "fpv_video": row["fpv_video"],
-                    "offset_seconds": row["offset_seconds"], "updated_at": time.time()}
+                    "offset_seconds": row["offset_seconds"], "source_signatures": _decision_signatures(job, row["radio_video"], row["fpv_video"]), "updated_at": time.time()}
             jobs.update(job_id, confirm)
         atomic_json(decision, {"action": body["action"]})
     return {"status": "accepted"}
 
 
 def _results(job):
-    if job["status"] != "complete":
-        raise HTTPException(409, "Analysis is not complete")
-    return json.loads((jobs.job_dir(job["id"]) / "results" / "results.json").read_text(encoding="utf-8"))
+    path = jobs.job_dir(job["id"]) / "results" / "results.json"
+    if not path.is_file():
+        raise HTTPException(409, "No completed matching results yet")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _decision_signatures(job, radio_name, fpv_name):
+    return {kind: [p.stat().st_size, p.stat().st_mtime_ns]
+            for kind, p in (("radio", _input_video(job, "radio", radio_name)),
+                            ("fpv", _input_video(job, "fpv", fpv_name)))}
+
+
+def _decision_current(job, decision):
+    # Legacy decisions lack evidence binding their offset to these source bytes.
+    # Keep them for review but never turn them into a current confirmed alignment.
+    expected = decision.get("source_signatures")
+    if not expected or not decision.get("fpv_video"):
+        return False
+    try:
+        return expected == _decision_signatures(job, decision["radio_video"], decision["fpv_video"])
+    except (OSError, HTTPException, KeyError):
+        return False
 
 
 def _effective_results(job):
@@ -1100,6 +1284,8 @@ def _effective_results(job):
     for radio_name, override in sorted(
         job.get("overrides", {}).items(), key=lambda item: item[1].get("updated_at", 0)
     ):
+        if not _decision_current(job, {**override, "radio_video": radio_name}):
+            continue
         for row in results["rows"]:
             if row["radio_video"] == radio_name or (
                 override.get("fpv_video") and row["fpv_video"] == override["fpv_video"]
@@ -1154,6 +1340,11 @@ def _effective_results(job):
         name, radio_name = addition["fpv_video"], addition["radio_video"]
         row = next((r for r in results["rows"] if r["radio_video"] == radio_name and r["fpv_video"] == name), None)
         if row is None:
+            radio_info = addition.get("radio_info")
+            if not any(c["name"] == radio_name for c in results["clips"]["radio"]):
+                if not radio_info or not _decision_current(job, addition):
+                    continue
+                results["clips"]["radio"].append(radio_info)
             if addition.get("row"):
                 row = dict(addition["row"])
             elif addition.get("segment"):
@@ -1175,7 +1366,10 @@ def _effective_results(job):
                        "fpv_filename_time": format_timestamp(filename_timestamp(name)),
                        "filename_start_delta_seconds": None if filename_timestamp(radio_name) is None else filename_timestamp(name) - filename_timestamp(radio_name),
                        "inferred_camera_clock_delta_seconds": candidate["clock_delta_seconds"], "clock_consensus_support": 1,
-                       "timing_only": True}
+                       "timing_only": True, "audio_first_proposal": False, "motion_deferred": False,
+                       "audio_correlated_sections": 0, "audio_usable_sections": 0, "audio_section_agreement": 0.,
+                       "audio_independent_sections": 0, "audio_trend_sections": 0,
+                       "audio_owner_margin": 0., "review_reasons": ["Filename timing only; verify shared content and offset"]}
             else:
                 continue
             results["rows"].append(row)
@@ -1185,6 +1379,12 @@ def _effective_results(job):
             if "considered_fpv" in results and name not in results["considered_fpv"]:
                 results["considered_fpv"].append(name)
     for override in sorted(job.get("pair_overrides", {}).values(), key=lambda o: o.get("updated_at", 0)):
+        if not _decision_current(job, override):
+            for row in results["rows"]:
+                if row["radio_video"] == override["radio_video"] and row["fpv_video"] == override["fpv_video"]:
+                    row.update(reviewed=False, review_invalidated=True, saved_offset_seconds=override["offset_seconds"],
+                               review_reason="Source changed or legacy decision has no source signature; review again")
+            continue
         for row in results["rows"]:
             if row["fpv_video"] != override["fpv_video"]:
                 continue
@@ -1199,6 +1399,8 @@ def _effective_results(job):
                            radio_common_start_seconds=max(0., offset), fpv_common_start_seconds=max(0., -offset),
                            overlap_seconds=max(0., min(rd - max(0., offset), fd - max(0., -offset))))
     for rejection in job.get("rejected_pairs", {}).values():
+        if not _decision_current(job, rejection):
+            continue
         for row in results["rows"]:
             if row["radio_video"] == rejection["radio_video"] and row["fpv_video"] == rejection["fpv_video"]:
                 row.update(global_assignment=False, reviewed=False, rejected=True)
@@ -1217,6 +1419,8 @@ def _effective_results(job):
         if r["name"] in results.get("considered_fpv", [item["name"] for item in job["inputs"]["fpv"]])
         and not any(p["fpv_video"] == r["name"] for p in assigned)
     ]
+    if "workflow" in results:
+        results["workflow"].update(unresolved_fpv=results["unmatched_fpv"], unresolved_radio=results["unmatched_radio"])
     return results
 
 
@@ -1232,6 +1436,10 @@ def _pair_info(job, radio_name, fpv_name, offset=None):
     )
     if row is None:
         raise HTTPException(404, "That pair has no matching analysis")
+    for kind, name in (("radio", radio_name), ("fpv", fpv_name)):
+        original = next((c for c in results["clips"][kind] if c["name"] == name), None)
+        if original is None or original.get("source_usable") is False:
+            raise HTTPException(409, "Restore this source and rerun matching before previewing or confirming it")
     rinfo, finfo = _metadata(job, "radio", radio_name), _metadata(job, "fpv", fpv_name)
     for kind, name in (("radio", radio_name), ("fpv", fpv_name)):
         original = next(c for c in results["clips"][kind] if c["name"] == name)
@@ -1265,6 +1473,8 @@ def _pair_info(job, radio_name, fpv_name, offset=None):
         "confidence": row["confidence"],
         "evidence": row["evidence"],
         "reviewed": row.get("reviewed", False) and abs(offset - row["offset_seconds"]) < 1e-7,
+        "review_reason": row.get("review_reason"),
+        "existing_owner": next((r["radio_video"] for r in results["rows"] if r["fpv_video"] == fpv_name and r.get("reviewed") and r["radio_video"] != radio_name), None),
         "source_signatures": {
             kind: [p.stat().st_size, p.stat().st_mtime_ns]
             for kind, p in (
@@ -1295,16 +1505,21 @@ def review_pair(job_id: str, radio_name: str, body: dict = Body(...)):
     if fpv_name:
         info = _pair_info(job, radio_name, fpv_name, body.get("offset_seconds"))
         offset = info["offset_seconds"]
+        if info.get("existing_owner") and not body.get("reject") and body.get("replace_owner") is not True:
+            raise HTTPException(409, f"This FPV file is already confirmed with {info['existing_owner']}. Select Replace saved owner to change it.")
     else:
         _results(job)
         offset = 0.0
 
     def mutate(current):
         if fpv_name:
-            results = _effective_results(job)
+            previous = current.get("pair_overrides", {}).get(fpv_name)
+            if previous and previous["radio_video"] != radio_name and _decision_current(current, previous) and not previous.get("rejected") and not body.get("reject") and body.get("replace_owner") is not True:
+                raise HTTPException(409, "Another reviewed StickCam owns this FPV file. Select Replace saved owner to change it.")
+            results = _effective_results(current)
             row = next(r for r in results["rows"] if r["radio_video"] == radio_name and r["fpv_video"] == fpv_name)
             entry = {"radio_video": radio_name, "fpv_video": fpv_name, "offset_seconds": offset, "row": row,
-                     "fpv_info": next(c for c in results["clips"]["fpv"] if c["name"] == fpv_name), "updated_at": time.time()}
+                     "fpv_info": next(c for c in results["clips"]["fpv"] if c["name"] == fpv_name), "radio_info": next(c for c in results["clips"]["radio"] if c["name"] == radio_name), "source_signatures": info["source_signatures"], "updated_at": time.time()}
             key = _layout_key(radio_name, fpv_name)
             if body.get("reject", False):
                 current.setdefault("rejected_pairs", {})[key] = entry
@@ -1538,6 +1753,28 @@ def save_portrait_layout(job_id: str, body: dict = Body(...)):
     return {"saved": True, "layout": layout}
 
 
+def _stabilization_descriptor(job, info):
+    from fpv_matcher.radio.derivation import cache_path
+    from fpv_matcher.video.radio_stabilization import VERSION
+    calibration = job["calibrations"].get(info["radio_video"])
+    expected_calibration = job.get("calibration_signatures", {}).get(info["radio_video"])
+    if expected_calibration and expected_calibration != info["source_signatures"]["radio"]:
+        raise HTTPException(409, "StickCam source changed; reconfirm calibration before stabilization")
+    if not calibration or calibration.get("exclude") or calibration.get("skip_motion") or "radio_outline" not in calibration:
+        raise HTTPException(409, "Save a visible radio outline and both tips, then prepare this StickCam before requesting a stabilized export")
+    record = _record(job, "radio", info["radio_video"])
+    source = _input_video(job, "radio", record["name"])
+    fps = tracking_fps(job["settings"].get("sample_fps", 30), job["settings"].get("stick_sampling_ratio"), info["source_metadata"]["radio"].get("fps"))
+    identity = _fpv_source_identity(record)
+    status = stick_cache_status(source, jobs.DATA / "cache", calibration, fps, identity)
+    if status["status"] != "cached" or status.get("outline_usable_percent", 0) <= 0:
+        raise HTTPException(409, "No current usable radio outline data. Prepare this StickCam for stabilization, or export the original")
+    return {"version": VERSION, "cache_path": str(cache_path(source, jobs.DATA / "cache", calibration, fps, identity)),
+            "calibration_signature": hashlib.sha256(json.dumps(calibration, sort_keys=True).encode()).hexdigest(),
+            "radio_rotation_deg": calibration.get("radio_rotation_deg", 0), "source_signature": info["source_signatures"]["radio"],
+            "sample_fps": fps}
+
+
 @app.post("/api/jobs/{job_id}/exports")
 def create_export(job_id: str, body: dict = Body(...)):
     job = get_job(job_id)
@@ -1551,10 +1788,20 @@ def create_export(job_id: str, body: dict = Body(...)):
     if profile not in {"h264", "dnxhr"}:
         raise HTTPException(400, "Export profile must be h264 or dnxhr")
     portrait = body.get("portrait")
+    stabilized = body.get("stabilize_radio", False)
+    if not isinstance(stabilized, bool):
+        raise HTTPException(400, "StickCam stabilization must be true or false")
+    if stabilized and portrait is not None:
+        raise HTTPException(400, "Stabilization currently applies to separate aligned clips; use the portrait editor for static pane framing")
     infos = [
         _pair_info(job, pair.get("radio_video"), pair.get("fpv_video"), pair.get("offset_seconds"))
         for pair in requested
     ]
+    if any(not info["reviewed"] for info in infos):
+        raise HTTPException(409, "Confirm every pair and its current offset before exporting")
+    if stabilized:
+        for info in infos:
+            info["radio_stabilization_request"] = _stabilization_descriptor(job, info)
     if portrait is not None:
         if len(infos) != 1 or profile != "h264":
             raise HTTPException(400, "Portrait export requires one pair and compact MP4")
@@ -1592,6 +1839,8 @@ def create_export(job_id: str, body: dict = Body(...)):
                 "fps": fps,
                 "profile": profile,
                 "portrait": portrait,
+                "stabilize_radio": stabilized,
+                "radio_stabilization": [info.get("radio_stabilization_request") for info in infos],
                 "pairs": [
                     {
                         key: info[key]
@@ -1644,6 +1893,9 @@ def _make_export(job_id, export_id, infos, fps, profile, portrait=None):
             if key in CANCELLED:
                 raise RuntimeError("Cancelled")
             job = get_job(job_id)
+            current_alignment = _pair_info(job, info["radio_video"], info["fpv_video"], info["offset_seconds"])
+            if not current_alignment["reviewed"]:
+                raise ValueError("Alignment changed or was rejected while export was queued; review it and request export again")
             sources = {kind: _input_video(job, kind, info[kind + "_video"]) for kind in ("radio", "fpv")}
             for kind, source in sources.items():
                 if [source.stat().st_size, source.stat().st_mtime_ns] != info["source_signatures"][kind]:
@@ -1658,18 +1910,32 @@ def _make_export(job_id, export_id, infos, fps, profile, portrait=None):
                     ),
                 )
 
+            radio_stabilization = None
+            descriptor = info.get("radio_stabilization_request")
+            if descriptor:
+                from fpv_matcher.video.radio_stabilization import stabilization_request
+                calibration = job["calibrations"].get(info["radio_video"])
+                if hashlib.sha256(json.dumps(calibration, sort_keys=True).encode()).hexdigest() != descriptor["calibration_signature"]:
+                    raise ValueError("Radio calibration changed while export was queued; request the export again")
+                with np.load(descriptor["cache_path"], allow_pickle=False) as values:
+                    data = dict(values)
+                radio_stabilization = stabilization_request(data, info["source_metadata"]["radio"],
+                    source_signature=descriptor["source_signature"], radio_rotation_deg=descriptor["radio_rotation_deg"])
             if portrait:
                 manifest = export_portrait(info, sources["radio"], sources["fpv"], pair_dir, fps, portrait,
                     run=lambda command, log: _execute(key, command, log, timeout=8 * 3600), progress=progress)
             else:
                 manifest = export_pair(info, sources["radio"], sources["fpv"], pair_dir, fps, profile,
-                    run=lambda command, log: _execute(key, command, log, timeout=8 * 3600), progress=progress)
+                    radio_stabilization=radio_stabilization, cancelled=lambda: key in CANCELLED, run=lambda command, log: _execute(key, command, log, timeout=8 * 3600), progress=progress)
             manifests.append((pair_dir, manifest))
             for kind, source in sources.items():
                 if [source.stat().st_size, source.stat().st_mtime_ns] != info["source_signatures"][kind]:
                     raise ValueError("Source changed during export; analyze it again")
         if key in CANCELLED:
             raise RuntimeError("Cancelled")
+        current_job = get_job(job_id)
+        if any(not _pair_info(current_job, info["radio_video"], info["fpv_video"], info["offset_seconds"])["reviewed"] for info in infos):
+            raise ValueError("An alignment changed during export; the output was not published. Review and request it again.")
         jobs.update(
             job_id,
             lambda current: (
@@ -1802,11 +2068,13 @@ def _chart_worker(job_id, chart_id):
                 stdout=log, stderr=log, start_new_session=True)
             PROCESSES[key] = process
         try:
-            code = process.wait(timeout=2 * 3600)
+            clip_count = max(1, len(request.get("clips", [])))
+            timeout = min(72 * 3600, max(2 * 3600, clip_count * 2 * 3600))
+            code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _stop_process(key)
             process.wait(timeout=10)
-            raise ValueError("Signal extraction exceeded two hours; inspect a shorter recording.")
+            raise ValueError(f"{kind} exceeded its {timeout / 3600:.0f}-hour workload limit. Completed clip caches are kept; retry to resume them.")
         finally:
             log.close()
         with PROCESS_LOCK:
@@ -1869,18 +2137,21 @@ def start_motion_review(job_id: str, body: dict = Body(...)):
         if decode_mode not in {"auto", "cpu", "cuda"}:
             raise ValueError("Choose automatic, CPU or CUDA decoding")
         _, uptilt, orientation, gyro_shift = validate_motion_settings(source, body.get("camera_uptilt_deg", 0), body.get("imu_orientation", "zXy"), body.get("gyro_video_offset", 0))
+        visual_camera = validate_visual_camera(body.get("visual_camera", job["settings"].get("visual_camera")))
+        visual_rate = visual_fps(body.get("fpv_sampling_mode", job["settings"].get("fpv_sampling_mode", "auto")), body.get("fpv_visual_fps", job["settings"].get("fpv_visual_fps", fps)), _metadata(job, "fpv", fpv_name).get("fps"))
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     request = {"fpv_video": fpv_name, "radio_video": radio_name, "fpv_path": str(fpv_path),
         "radio_path": str(radio_path) if radio_path else None, "source": source, "sample_fps": fps,
+        "fpv_sample_fps": visual_rate, "visual_camera": visual_camera,
         "stick_sample_fps": radio_fps, "stick_sampling_ratio": ratio,
         "match_fps": compare_fps, "min_overlap": minimum,
         "calibration": job["calibrations"].get(radio_name), "rate_profile": profile,
         "camera_uptilt_deg": uptilt, "imu_orientation": orientation, "gyro_video_offset": gyro_shift, "decode_mode": decode_mode,
         "fpv_identity": _fpv_source_identity(_record(job, "fpv", fpv_name)),
-        "radio_identity": _record(job, "radio", radio_name).get("sha256") if radio_name else None,
+        "radio_identity": _fpv_source_identity(_record(job, "radio", radio_name)) if radio_name else None,
         "signatures": {kind: [p.stat().st_size, p.stat().st_mtime_ns]
-                       for kind, p in (("fpv", fpv_path), ("radio", radio_path)) if p}, "version": 5, "telemetry_version": TELEMETRY_VERSION}
+                       for kind, p in (("fpv", fpv_path), ("radio", radio_path)) if p}, "version": 7, "visual_version": VISUAL_VERSION, "telemetry_version": TELEMETRY_VERSION, "stick_version": STICK_VERSION, "outline_version": OUTLINE_VERSION}
     if job["calibrations"].get(radio_name, {}).get("reference_time", 0) > 0:
         request["stick_span_version"] = FULL_SPAN_VERSION
     chart_id = hashlib.sha256(json.dumps(request, sort_keys=True, allow_nan=False).encode()).hexdigest()[:20]
@@ -1919,7 +2190,7 @@ def start_gyro_scan(job_id: str, chart_id: str):
     for record in job["inputs"]["fpv"]:
         path = _input_video(job, "fpv", record["name"])
         stat = path.stat()
-        clips.append({"name": record["name"], "path": str(path), "identity": record.get("sha256"),
+        clips.append({"name": record["name"], "path": str(path), "identity": _fpv_source_identity(record),
                       "signature": [stat.st_size, stat.st_mtime_ns]})
     settings = job["settings"]
     fps = float(original.get("match_fps", settings.get("match_fps", 30)))
@@ -1959,7 +2230,9 @@ def _review_sections(directory_name, offset, fpv_modified, radio_modified):
     request = json.loads((directory / "request.json").read_text())
     with np.load(directory / "fpv.npz", allow_pickle=False) as values:
         fpv = dict(values)
-    if str(fpv["kind"].item()) != "visual":
+    if str(fpv["kind"].item()) == "visual_rotation":
+        fpv = visual_body_rates(fpv, request.get("camera_uptilt_deg", 0))
+    elif str(fpv["kind"].item()) != "visual":
         fpv = body_rates(fpv, request.get("camera_uptilt_deg", 0), request.get("imu_orientation", "zXy"), request.get("gyro_video_offset", 0))
     with np.load(directory / "radio.npz", allow_pickle=False) as values:
         radio = dict(values)
@@ -2099,6 +2372,8 @@ def start_calibration_scan(job_id: str, body: dict = Body(...)):
         seconds, start = float(body.get("search_seconds", 60)), float(body.get("start", 0))
         if not math.isfinite(seconds) or not 5 <= seconds <= 600 or not math.isfinite(start) or start < 0:
             raise ValueError("Search 5–600 seconds, starting at a nonnegative time")
+        from fpv_matcher.radio.modes import validate_mode
+        validate_mode(body.get("stick_mode", job["settings"].get("stick_mode", 2)))
         mode = body.get("stickcam_mode", "wonky")
         if mode not in {"fixed", "wonky"}:
             raise ValueError("Choose Fixed or Wonky StickCam")
@@ -2116,6 +2391,7 @@ def start_calibration_scan(job_id: str, body: dict = Body(...)):
         path = _input_video(job, "radio", record["name"])
         clips.append({"name": record["name"], "path": str(path), "start": start if name else 0,
                       "stickcam_mode": config.get("stickcam_mode", mode if name else "wonky"),
+                      "stick_mode": config.get("stick_mode", body.get("stick_mode", job["settings"].get("stick_mode", 2))),
                       "signature": [path.stat().st_size, path.stat().st_mtime_ns]})
     if not clips:
         raise HTTPException(400, "All recordings already have saved calibrations. Use Find radio on one selected clip to propose a replacement.")
@@ -2158,9 +2434,12 @@ def _fpv_source_identity(record):
 
 
 @app.get("/api/jobs/{job_id}/fpv-data")
-def fpv_data_status(job_id: str, sample_fps: float | None = None):
+def fpv_data_status(job_id: str, sample_fps: float | None = None, sampling_mode: str | None = None):
     job = get_job(job_id)
-    fps = _extraction_fps(sample_fps if sample_fps is not None else job["settings"].get("sample_fps", 30))
+    fps = _extraction_fps(sample_fps if sample_fps is not None else job["settings"].get("fpv_visual_fps", 30))
+    mode = sampling_mode or job["settings"].get("fpv_sampling_mode", "auto")
+    if mode not in VISUAL_SAMPLING_MODES:
+        raise HTTPException(400, "Choose automatic, half, quarter or custom visual sampling")
     clips = []
     tasks = [{"id": key, **value} for key, value in job.get("charts", {}).items() if value.get("kind") == "fpv-preparation"]
     logs = []
@@ -2176,22 +2455,51 @@ def fpv_data_status(job_id: str, sample_fps: float | None = None):
         for row in log.get("clips", []):
             latest.setdefault(row["name"], {key: row.get(key) for key in ("status", "message", "elapsed_seconds", "reused", "sample_fps")})
     for record in job["inputs"]["fpv"]:
+        source_fps = (record.get("metadata") or {}).get("fps")
+        try:
+            requested_fps = visual_fps(mode, fps, source_fps)
+        except ValueError:
+            requested_fps = None
         embedded = embedded_status(record["path"], jobs.DATA / "cache", _fpv_source_identity(record))
-        visual = fpv_cache_status(record["path"], jobs.DATA / "cache", fps, _fpv_source_identity(record))
+        visual = fpv_cache_status(record["path"], jobs.DATA / "cache", requested_fps, _fpv_source_identity(record), job["settings"].get("visual_camera")) if requested_fps else {"status": "not_derived"}
         if visual["status"] == "not_derived":
             # Keep alternate sampling rates visible without loading every cached array.
             rates = {15., 30., float(job["settings"].get("sample_fps", 30))}
-            rates.update(float(log.get("sample_fps", fps)) for _, log in logs)
-            for rate in sorted(rates - {fps}, reverse=True):
-                saved = fpv_cache_status(record["path"], jobs.DATA / "cache", rate, _fpv_source_identity(record))
+            rates.update(float(row["sample_fps"]) for _, log in logs for row in log.get("clips", []) if row.get("name") == record["name"] and row.get("sample_fps"))
+            for rate in sorted(rates - {requested_fps}, reverse=True):
+                saved = fpv_cache_status(record["path"], jobs.DATA / "cache", rate, _fpv_source_identity(record), job["settings"].get("visual_camera"))
                 if saved["status"] == "cached":
                     visual = {**saved, "status": "other_rate"}
                     break
         clips.append({"name": record["name"], "metadata": record.get("metadata"), "embedded": embedded,
-                      "visual": visual, "last_preparation": latest.get(record["name"])})
-    return {"clips": clips, "sample_fps": fps, "tasks": tasks,
+                      "visual": visual, "source_fps": source_fps, "requested_fps": requested_fps,
+                      "last_preparation": latest.get(record["name"])})
+    return {"clips": clips, "sample_fps": fps, "sampling_mode": mode, "tasks": tasks,
             "cached": sum(c["visual"]["status"] == "cached" for c in clips),
             "embedded": sum(c["embedded"]["status"] == "available" for c in clips)}
+
+
+@app.get("/api/jobs/{job_id}/fpv-data/{filename}/visual")
+def saved_fpv_visual(job_id: str, filename: str, sample_fps: float,
+                     start: float | None = None, end: float | None = None):
+    job = get_job(job_id)
+    source = _input_video(job, "fpv", filename)
+    fps = _extraction_fps(sample_fps)
+    try:
+        data = load_saved_visual(source, jobs.DATA / "cache", fps, _fpv_source_identity(_record(job, "fpv", filename)), job["settings"].get("visual_camera"))
+    except (OSError, ValueError, KeyError, EOFError, BadZipFile) as exc:
+        raise HTTPException(409, "Saved visual motion is unavailable at this rate. Refresh the table or derive this clip first.") from exc
+    info = _metadata(job, "fpv", filename)
+    a, b = 0. if start is None else start, info["duration"] if end is None else end
+    if not all(math.isfinite(v) for v in (a, b)) or not 0 <= a < b <= info["duration"]:
+        raise HTTPException(400, "Choose a time window within the FPV video")
+    data = visual_body_rates(data, job["settings"].get("camera_uptilt_deg", 0))
+    channels = [(key, key.title() + " · visual estimate", "°/s") for key in ("roll", "pitch", "yaw")]
+    return {"fpv_video": filename, "sample_fps": fps, "window": [a, b], "duration": info["duration"],
+            "motion_kind": "visual_rotation", "note": str(data["note"].item()), "visual_camera": validate_visual_camera(job["settings"].get("visual_camera")),
+            "camera_uptilt_deg": job["settings"].get("camera_uptilt_deg", 0),
+            "traces": [chart_trace(data, key, label, unit, a, b) for key, label, unit in channels],
+            "usable_percent": round(float(np.mean(data["quality"] > .1)) * 100, 1)}
 
 
 @app.post("/api/jobs/{job_id}/prepare-fpv")
@@ -2210,7 +2518,15 @@ def prepare_session_fpv(job_id: str, body: dict = Body(...)):
     available = {r["name"] for r in job["inputs"]["fpv"]}
     if names is not None and not set(names).issubset(available):
         raise HTTPException(400, "An FPV recording is not part of this session")
-    fps = _extraction_fps(body.get("sample_fps", job["settings"].get("sample_fps", 30)))
+    try:
+        visual_camera = validate_visual_camera(body.get("visual_camera", job["settings"].get("visual_camera")))
+        _, uptilt, _, _ = validate_motion_settings("visual", body.get("camera_uptilt_deg", job["settings"].get("camera_uptilt_deg", 0)))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    fps = _extraction_fps(body.get("sample_fps", job["settings"].get("fpv_visual_fps", 30)))
+    mode = body.get("sampling_mode", job["settings"].get("fpv_sampling_mode", "auto"))
+    if mode not in VISUAL_SAMPLING_MODES:
+        raise HTTPException(400, "Choose automatic, half, quarter or custom visual sampling")
     decode = body.get("decode_mode", "auto")
     if decode not in {"auto", "cpu", "cuda"}:
         raise HTTPException(400, "Choose automatic, CPU or CUDA decoding")
@@ -2219,18 +2535,23 @@ def prepare_session_fpv(job_id: str, body: dict = Body(...)):
         if names is not None and record["name"] not in names:
             continue
         path = _input_video(job, "fpv", record["name"])
+        try:
+            rate = visual_fps(mode, fps, _metadata(job, "fpv", record["name"]).get("fps"))
+        except ValueError as exc:
+            raise HTTPException(400, f"{record['name']}: {exc}") from exc
         clips.append({"name": record["name"], "path": str(path), "identity": _fpv_source_identity(record),
-                      "signature": [path.stat().st_size, path.stat().st_mtime_ns]})
+                      "signature": [path.stat().st_size, path.stat().st_mtime_ns], "sample_fps": rate})
     if not clips:
         raise HTTPException(400, "Add FPV videos first")
     request = {"kind": "fpv-preparation", "action": action, "clips": clips, "sample_fps": fps,
+               "sampling_mode": mode, "visual_camera": visual_camera,
                "decode_mode": decode, "algorithm": VISUAL_VERSION, "telemetry_version": TELEMETRY_VERSION}
     # Re-run incomplete tasks or deleted/corrupt caches; keep successful results reusable.
     if any(embedded_status(c["path"], jobs.DATA / "cache", c["identity"])["status"] == "unknown" or
            (action == "derive" and embedded_status(c["path"], jobs.DATA / "cache", c["identity"])["status"] == "unavailable" and
-            fpv_cache_status(c["path"], jobs.DATA / "cache", fps, c["identity"])["status"] != "cached") for c in clips):
+            fpv_cache_status(c["path"], jobs.DATA / "cache", c["sample_fps"], c["identity"], visual_camera)["status"] != "cached") for c in clips):
         request["attempt"] = uuid.uuid4().hex
-    jobs.update(job_id, lambda current: current["settings"].update(sample_fps=fps))
+    jobs.update(job_id, lambda current: current["settings"].update(fpv_visual_fps=fps, fpv_sampling_mode=mode, visual_camera=visual_camera, camera_uptilt_deg=uptilt))
     return _queue_signal_task(job_id, request, "preparation.json")
 
 
@@ -2255,14 +2576,14 @@ def stick_data_status(job_id: str, sample_fps: float | None = None, stick_sampli
                           "sampling_error": str(exc.detail if isinstance(exc, HTTPException) else exc)})
             continue
         calibration = job["calibrations"].get(clip["name"])
-        status = stick_cache_status(clip["path"], jobs.DATA / "cache", calibration, requested, clip.get("sha256"))
+        status = stick_cache_status(clip["path"], jobs.DATA / "cache", calibration, requested, _fpv_source_identity(clip))
         # Other rates remain saved: switching back can reuse them immediately.
         if status["status"] == "not_derived":
             rates = {fps, previous_fps}
             if source_fps and math.isfinite(source_fps) and source_fps > 0:
                 rates.update(round(source_fps * r, 8) for r in (0.5, 0.25) if source_fps * r <= 60)
             for saved_fps in sorted(rates - {requested}, reverse=True):
-                previous = stick_cache_status(clip["path"], jobs.DATA / "cache", calibration, saved_fps, clip.get("sha256"))
+                previous = stick_cache_status(clip["path"], jobs.DATA / "cache", calibration, saved_fps, _fpv_source_identity(clip))
                 if previous["status"] == "cached":
                     status = {**previous, "status": "other_rate"}
                     break
@@ -2321,12 +2642,20 @@ def derive_session_sticks(job_id: str, body: dict = Body(...)):
     decode = body.get("decode_mode", "auto")
     if decode not in {"auto", "cpu", "cuda"}:
         raise HTTPException(400, "Choose automatic, CPU or CUDA decoding")
+    selected_names = body.get("radio_names")
+    if selected_names is not None and (not isinstance(selected_names, list) or not selected_names or any(not isinstance(n, str) for n in selected_names) or not set(selected_names) <= {r["name"] for r in job["inputs"]["radio"]}):
+        raise HTTPException(400, "Choose existing StickCam filenames to prepare")
     clips = []
     for record in job["inputs"]["radio"]:
+        if selected_names is not None and record["name"] not in selected_names:
+            continue
         calibration = job["calibrations"].get(record["name"])
         if not calibration or calibration.get("skip_motion") or calibration.get("exclude"):
             continue
         path = _input_video(job, "radio", record["name"])
+        expected_calibration = job.get("calibration_signatures", {}).get(record["name"])
+        if expected_calibration and expected_calibration != [path.stat().st_size, path.stat().st_mtime_ns]:
+            continue
         try:
             calibration = validate_calibration(calibration)
         except ValueError:
@@ -2335,7 +2664,7 @@ def derive_session_sticks(job_id: str, body: dict = Body(...)):
             radio_fps = tracking_fps(fps, ratio, _metadata(job, "radio", record["name"]).get("fps")) if ratio else fps
         except ValueError as exc:
             raise HTTPException(400, f"{record['name']}: {exc}") from exc
-        clips.append({"name": record["name"], "path": str(path), "identity": record.get("sha256"),
+        clips.append({"name": record["name"], "path": str(path), "identity": _fpv_source_identity(record),
                       "signature": [path.stat().st_size, path.stat().st_mtime_ns], "calibration": calibration,
                       "sample_fps": radio_fps})
     if not clips:
@@ -2350,25 +2679,35 @@ def derive_session_sticks(job_id: str, body: dict = Body(...)):
     return _queue_signal_task(job_id, request, "derivation.json")
 
 
-@app.post("/api/jobs/{job_id}/motion-review/{chart_id}/audio")
-def start_audio_review(job_id: str, chart_id: str):
+def _queue_audio_review(job_id, original):
     job = get_job(job_id)
-    parent = _chart_directory(job_id, chart_id)
-    if job.get("charts", {}).get(chart_id, {}).get("status") != "complete" or not (parent / "review.json").exists():
-        raise HTTPException(409, "Load the motion comparison first")
-    original = json.loads((parent / "request.json").read_text())
     from fpv_matcher.audio.fingerprint import ALGORITHM_VERSION as AUDIO_VERSION
-    request = {"kind": "audio-review", "version": WAVEFORM_VERSION, "fingerprint_version": AUDIO_VERSION}
-    request["signatures"] = {}
+    request = {"kind": "audio-review", "version": WAVEFORM_VERSION, "fingerprint_version": AUDIO_VERSION, "signatures": {}}
+    if not original.get("fpv_video"):
+        raise HTTPException(400, "Choose an FPV recording")
     for kind in ("fpv", "radio"):
         name = original.get(kind + "_video")
         request[kind + "_video"] = name
         if name:
             path = _input_video(job, kind, name)
             request[kind + "_path"] = str(path)
-            request[kind + "_identity"] = _record(job, kind, name).get("sha256")
+            request[kind + "_identity"] = _fpv_source_identity(_record(job, kind, name))
             request["signatures"][kind] = [path.stat().st_size, path.stat().st_mtime_ns]
     return _queue_signal_task(job_id, request, "audio-review.json")
+
+
+@app.post("/api/jobs/{job_id}/audio-review")
+def standalone_audio_review(job_id: str, body: dict = Body(...)):
+    return _queue_audio_review(job_id, body)
+
+
+@app.post("/api/jobs/{job_id}/motion-review/{chart_id}/audio")
+def start_audio_review(job_id: str, chart_id: str):
+    job = get_job(job_id)
+    parent = _chart_directory(job_id, chart_id)
+    if chart_id not in job.get("charts", {}) or not (parent / "request.json").exists():
+        raise HTTPException(404, "Signal comparison not found")
+    return _queue_audio_review(job_id, json.loads((parent / "request.json").read_text()))
 
 
 @lru_cache(maxsize=32)
@@ -2416,7 +2755,7 @@ def motion_review(job_id: str, chart_id: str, start: float | None = None, end: f
         result = json.loads((directory / "derivation.json").read_text())
         for row in result["clips"]:
             record = _record(job, "radio", row["name"])
-            row["current_cache"] = stick_cache_status(record["path"], jobs.DATA / "cache", job["calibrations"].get(row["name"]), row.get("sample_fps", request["sample_fps"]), record.get("sha256"))
+            row["current_cache"] = stick_cache_status(record["path"], jobs.DATA / "cache", job["calibrations"].get(row["name"]), row.get("sample_fps", request["sample_fps"]), _fpv_source_identity(record))
         return {**status, **result}
     if request.get("kind") == "audio-review":
         if not math.isfinite(offset):
@@ -2478,6 +2817,15 @@ def motion_review(job_id: str, chart_id: str, start: float | None = None, end: f
     shift = offset
     if meta["fpv_kind"] == "visual":
         channels = [("rotation", "Image rotation", "°/s"), ("dx", "Horizontal flow", "frame widths/s"), ("dy", "Vertical flow", "frame heights/s")]
+    elif meta["fpv_kind"] == "visual_rotation":
+        if mode == "body":
+            data = visual_body_rates(data, request.get("camera_uptilt_deg", 0))
+            channels = [(key, key.title() + " · visual estimate", "°/s") for key in ("roll", "pitch", "yaw")]
+        elif mode == "sensor":
+            channels = [(key, "Camera " + key.upper() + " · visual estimate", "°/s") for key in ("x", "y", "z")]
+        else:
+            channels = []
+            meta["warnings"].append("Visual relative rotation does not provide absolute attitude or gravity.")
     elif mode == "body":
         data = body_rates(data, request.get("camera_uptilt_deg", 0), request.get("imu_orientation", "zXy"), request.get("gyro_video_offset", 0))
         channels = [(k, k.title(), "°/s") for k in ("roll", "pitch", "yaw")]

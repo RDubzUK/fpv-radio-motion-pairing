@@ -43,3 +43,23 @@ h1{line-height:1.2;padding-bottom:.08em;overflow:visible;-webkit-background-clip
 .cal-stage.cal-rotated-180>img,.cal-stage.cal-rotated-180>video{transform:rotate(180deg)}
 #folder-picker{width:min(960px,calc(100vw - 32px));height:min(88dvh,880px);max-height:calc(100dvh - 32px);box-sizing:border-box;overflow:hidden}#folder-picker[open]{display:flex;flex-direction:column;gap:10px}#folder-picker>*{flex-shrink:0}#folder-picker .folder-entries{flex:1;min-height:0;max-height:none;overflow:auto}#folder-picker .folder-current,#folder-picker .folder-picker-footer{margin:0}#folder-picker p{margin:0}#folder-purpose{margin-left:10px}#folder-network-shares{max-height:120px;overflow:auto}
 .history button{width:224px;padding:10px}.session-thumbnail,.session-thumbnail-placeholder{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#070c1b;border-radius:6px;margin-bottom:9px}.session-thumbnail-placeholder{display:grid;place-items:center;font-size:11px;color:var(--muted)}.session-title{display:block;font-weight:650}#radio-shape-preview{display:block;max-width:100%;height:auto;border:1px solid var(--line);border-radius:8px;margin-top:10px;background:#0b1023}
+
+/* Guided workflow keeps preparation tools available on demand. */
+body:not(.show-technical) .technical-panel:not(.guided-open){display:none!important}
+.workflow-panel{border-color:#8a66c6;background:linear-gradient(140deg,#211c38,#11172d)}
+.workflow-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:18px 0}
+.workflow-stat{padding:12px;border:1px solid var(--line);border-radius:10px;background:#080e2199}
+.workflow-stat strong{display:block;font-size:23px;color:var(--cyan)}.workflow-stat span{font-size:12px;color:var(--muted)}
+.workflow-exception{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.workflow-exception>span{flex:1;min-width:0;overflow-wrap:anywhere;font-size:12px}
+#source-status{max-height:320px;overflow:auto}#workflow-progress{width:100%}
+@media(max-width:720px){.workflow-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.workflow-exception{flex-wrap:wrap}}
+
+#pair-cards{max-height:600px;overflow:auto;padding-right:4px}
+.calibration-frame-controls #calibration-message{flex:1 1 100%;padding:10px;border:1px solid var(--line);border-radius:8px;line-height:1.5;overflow-wrap:anywhere}
+.calibration-frame-controls #calibration-message:empty{display:none}
+#calibration-message.warning{color:#ffd166;border-color:#ffd16688;background:#ffd1660b}
+#fpv-visual-review{margin-top:24px;padding-top:18px;border-top:1px solid var(--line)}
+#fpv-visual-review-title{overflow-wrap:anywhere;min-width:0}
+#fpv-visual-review-video{display:block;width:100%;max-height:34vh;background:#050816;border-radius:8px;margin:12px 0}
+#fpv-visual-review-seek{width:100%;margin:12px 0}
+#fpv-visual-review-canvas{display:block;width:100%;height:390px;background:#080e21;border:1px solid var(--line);border-radius:8px;cursor:crosshair}

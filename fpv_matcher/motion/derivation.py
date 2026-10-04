@@ -13,14 +13,15 @@ import numpy as np
 
 from fpv_matcher.cache.fingerprints import _key, get_or_extract
 from fpv_matcher.motion.lucas_kanade import LucasKanadeEstimator
+from fpv_matcher.motion.visual_rotation import validate_profile
 from fpv_matcher.motion.telemetry import VERSION as TELEMETRY_VERSION, cached_telemetry
 
 VERSION = LucasKanadeEstimator.algorithm_version
 MAX_DIMENSION = 960
 
 
-def cache_path(path, cache, fps, identity=None):
-    config = {"sample_fps": float(fps), "max_dimension": MAX_DIMENSION}
+def cache_path(path, cache, fps, identity=None, camera_profile=None):
+    config = {"sample_fps": float(fps), "max_dimension": MAX_DIMENSION, "camera_profile": validate_profile(camera_profile)}
     target = Path(cache) / f"fpv.{_key(str(path), VERSION, config, identity)}.npz"
     if not target.exists() and float(fps).is_integer():
         prior = Path(cache) / f"fpv.{_key(str(path), VERSION, {**config, 'sample_fps': int(fps)}, identity)}.npz"
@@ -33,25 +34,42 @@ def _validate(data):
     times = np.asarray(data["time"], float)
     if len(times) < 3 or not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
         raise ValueError("Not enough valid visual motion samples")
-    for key in ("dx", "dy", "rotation", "quality", "magnitude"):
+    for key in ("dx", "dy", "rotation", "quality", "magnitude", "x", "y", "z"):
         values = np.asarray(data[key], float)
         if values.shape != times.shape or not np.isfinite(values).all():
             raise ValueError("Invalid visual motion cache")
 
 
-def cached_visual_motion(path, cache, fps, identity=None, progress=None):
+def cached_visual_motion(path, cache, fps, identity=None, progress=None, camera_profile=None):
     path = Path(path)
     signature = (path.stat().st_size, path.stat().st_mtime_ns)
-    config = {"sample_fps": float(fps), "max_dimension": MAX_DIMENSION}
-    if cache_path(path, cache, fps, identity).stem.split(".", 1)[1] != _key(str(path), VERSION, config, identity):
+    config = {"sample_fps": float(fps), "max_dimension": MAX_DIMENSION, "camera_profile": validate_profile(camera_profile)}
+    if cache_path(path, cache, fps, identity, camera_profile).stem.split(".", 1)[1] != _key(str(path), VERSION, config, identity):
         config["sample_fps"] = int(fps)
     def extract():
         started = time.perf_counter()
-        data = LucasKanadeEstimator(max_dimension=MAX_DIMENSION).extract(str(path), fps, progress=progress)
+        data = LucasKanadeEstimator(max_dimension=MAX_DIMENSION).extract(str(path), fps, progress=progress, camera_profile=camera_profile)
         if (path.stat().st_size, path.stat().st_mtime_ns) != signature:
             raise ValueError("Source changed during visual motion derivation")
         return {**data, "extraction_seconds": np.asarray(time.perf_counter() - started)}
     return get_or_extract(str(path), cache, "fpv", VERSION, config, extract, identity, validate=_validate)
+
+
+def load_saved_visual(path, cache, fps, identity=None, camera_profile=None):
+    """Inspect an existing cache only; playback must never start extraction."""
+    source = Path(path)
+    stat = source.stat()
+    signature = (stat.st_size, stat.st_mtime_ns)
+    target = cache_path(path, cache, fps, identity, camera_profile)
+    with np.load(target, allow_pickle=False) as values:
+        if str(values["cache_key"].item()) != target.stem.split(".", 1)[1]:
+            raise ValueError("Invalid visual motion cache identity")
+        data = {key: values[key] for key in values.files if key != "cache_key"}
+    _validate(data)
+    current = source.stat()
+    if (current.st_size, current.st_mtime_ns) != signature:
+        raise ValueError("FPV source changed while reading its saved motion")
+    return data
 
 
 @lru_cache(maxsize=256)
@@ -84,9 +102,9 @@ def embedded_status(path, cache, identity=None):
         return {"status": "unknown", "message": "Source or embedded motion cache could not be read"}
 
 
-def cache_status(path, cache, fps, identity=None):
+def cache_status(path, cache, fps, identity=None, camera_profile=None):
     try:
-        target = cache_path(path, cache, fps, identity)
+        target = cache_path(path, cache, fps, identity, camera_profile)
         if not target.exists():
             return {"status": "not_derived", "sample_fps": fps}
         stat = target.stat()
@@ -105,6 +123,7 @@ def run(request_path):
     rows, total, fps = [], len(request["clips"]), request["sample_fps"]
     for index, clip in enumerate(request["clips"]):
         path, started = Path(clip["path"]), time.perf_counter()
+        fps = clip.get("sample_fps", request["sample_fps"])
         def report(event=None, stage="embedded"):
             event = event or {}
             atomic_json(directory / "progress.json", {**event, "stage": stage, "name": clip["name"],
@@ -129,10 +148,10 @@ def run(request_path):
             elif embedded["status"] == "available":
                 row = {"status": "skipped", "embedded": embedded, "message": "Usable embedded motion is preferred"}
             else:
-                before = cache_status(path, request["cache"], fps, clip.get("identity"))
-                data = cached_visual_motion(path, request["cache"], fps, clip.get("identity"), lambda e: report(e, "visual"))
+                before = cache_status(path, request["cache"], fps, clip.get("identity"), request.get("visual_camera"))
+                data = cached_visual_motion(path, request["cache"], fps, clip.get("identity"), lambda e: report(e, "visual"), request.get("visual_camera"))
                 row = {"status": "cached", "embedded": embedded, "reused": before["status"] == "cached",
-                       "samples": len(data["time"]), **cache_status(path, request["cache"], fps, clip.get("identity"))}
+                       "samples": len(data["time"]), **cache_status(path, request["cache"], fps, clip.get("identity"), request.get("visual_camera"))}
             stat = path.stat()
             if [stat.st_size, stat.st_mtime_ns] != clip["signature"]:
                 raise ValueError("Source changed during preparation")

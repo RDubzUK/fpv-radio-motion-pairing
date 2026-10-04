@@ -15,12 +15,14 @@ def validate_calibration(config: dict, dimensions: tuple[int, int] | None = None
     if not isinstance(config, dict):
         raise ValueError("Calibration must be a JSON object")
     result = copy.deepcopy(config)
+    from fpv_matcher.radio.modes import validate_mode
+    result["stick_mode"] = validate_mode(result.get("stick_mode", 2))
     if "radio_rotation_deg" in result:
         rotation = finite(result["radio_rotation_deg"], "Radio reference orientation")
         if rotation not in {0, 180}:
             raise ValueError("Radio reference orientation must be upright (0) or upside down (180)")
         result["radio_rotation_deg"] = int(rotation)
-    mode = result.setdefault("stickcam_mode", "fixed")
+    mode = result.setdefault("stickcam_mode", "wonky")
     if mode not in {"fixed", "wonky"}:
         raise ValueError("StickCam mode must be fixed or wonky")
     result["reference_time"] = finite(result.get("reference_time", 0), "Reference time")
@@ -52,6 +54,12 @@ def validate_calibration(config: dict, dimensions: tuple[int, int] | None = None
             or not 0 <= spec["threshold"] <= 255
         ):
             raise ValueError("Invalid travel range, tip radius or threshold")
+        if not (0 <= spec["center_x"] < spec["width"] and 0 <= spec["center_y"] < spec["height"]):
+            raise ValueError("Neutral stick centres must be inside their gimbal region")
+        if spec["travel_x"] > spec["width"] or spec["travel_y"] > spec["height"]:
+            raise ValueError("Stick travel cannot exceed the gimbal region")
+        if spec["tip_radius"] >= min(spec["width"], spec["height"]) / 2:
+            raise ValueError("Stick tip radius must fit inside its gimbal region")
         if ("tip_x" in spec) != ("tip_y" in spec):
             raise ValueError("Both tip coordinates are required")
         for key, limit in (("tip_x", spec["width"]), ("tip_y", spec["height"])):
@@ -61,6 +69,15 @@ def validate_calibration(config: dict, dimensions: tuple[int, int] | None = None
                     raise ValueError("Stick tips must be inside their gimbal region")
         if spec.get("polarity", "dark") not in {"dark", "light"}:
             raise ValueError("Tip polarity must be dark or light")
+    left, right = result["left_gimbal"], result["right_gimbal"]
+    left_center = (left["x"] + left["center_x"], left["y"] + left["center_y"])
+    right_center = (right["x"] + right["center_x"], right["y"] + right["center_y"])
+    if math.hypot(right_center[0] - left_center[0], right_center[1] - left_center[1]) < 8:
+        raise ValueError("Mark two different gimbals; their neutral centres are too close")
+    if result.get("radio_orientation_confirmed"):
+        direction = -1 if result.get("radio_rotation_deg", 0) == 180 else 1
+        if direction * (right_center[0] - left_center[0]) <= 0:
+            raise ValueError("Physical left/right gimbal labels disagree with the confirmed radio orientation; correct the labels or orientation")
     if "radio_outline" in result:
         outline = result["radio_outline"]
         if not isinstance(outline, list) or len(outline) != 4:

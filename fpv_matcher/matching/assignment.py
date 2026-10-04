@@ -11,13 +11,14 @@ def assign(scores: np.ndarray, minimum_score: float = 0.55) -> list[tuple[int, i
     rows, columns = scores.shape
     utility = np.full((rows, columns + rows), -1e6, dtype=float)
     clean = np.nan_to_num(scores, nan=0, posinf=0, neginf=0)
-    utility[:, :columns] = np.where(clean >= minimum_score, clean - minimum_score + 1e-9, -1e6)
+    eligible = (clean > 0) & (clean >= minimum_score)
+    utility[:, :columns] = np.where(eligible, clean - minimum_score + 1e-9, -1e6)
     utility[np.arange(rows), columns + np.arange(rows)] = 0
     assigned_rows, assigned_columns = linear_sum_assignment(-utility)
     return [
         (int(r), int(c))
         for r, c in zip(assigned_rows, assigned_columns, strict=True)
-        if c < columns and clean[r, c] >= minimum_score
+        if c < columns and eligible[r, c]
     ]
 
 
@@ -33,16 +34,33 @@ def candidate_margin(scores: np.ndarray, row: int, column: int, multiple_fpv=Fal
 
 def assign_segments(scores, offsets, radio_durations, fpv_durations, minimum_score=.55):
     """Keep one FPV owner; allow independently supported, disjoint StickCam spans."""
-    selected = set(assign(scores, minimum_score))
-    used_fpv = {fi for _, fi in selected}
+    scores = np.asarray(scores, float)
+    if scores.ndim != 2 or not scores.size:
+        return []
+    if len(radio_durations) != scores.shape[0] or len(fpv_durations) != scores.shape[1]:
+        raise ValueError("Pairing durations must match the candidate matrix")
+    clean = np.nan_to_num(scores, nan=-1., posinf=-1., neginf=-1.)
+    intervals = {}
+    for ri in range(scores.shape[0]):
+        for fi in range(scores.shape[1]):
+            offset = offsets.get((ri, fi))
+            if offset is None or not np.isfinite(offset):
+                clean[ri, fi] = -1.
+                continue
+            start = max(0., float(offset))
+            end = start + max(0., min(radio_durations[ri] - start, fpv_durations[fi] - max(0., -float(offset))))
+            if not np.isfinite(end) or end <= start:
+                clean[ri, fi] = -1.
+                continue
+            intervals[ri, fi] = start, end
     def interval(ri, fi):
-        offset = offsets[ri, fi]
-        start = max(0., offset)
-        return start, start + max(0., min(radio_durations[ri] - start, fpv_durations[fi] - max(0., -offset)))
-    for fi in sorted(set(range(scores.shape[1])) - used_fpv, key=lambda f: float(np.max(scores[:, f])), reverse=True):
-        ri = int(np.argmax(scores[:, fi]))
-        other = np.delete(scores[:, fi], ri)
-        if scores[ri, fi] < minimum_score or scores[ri, fi] - (float(np.max(other)) if len(other) else 0.) < .04:
+        return intervals[ri, fi]
+    selected = set(assign(clean, minimum_score))
+    used_fpv = {fi for _, fi in selected}
+    for fi in sorted(set(range(scores.shape[1])) - used_fpv, key=lambda f: float(np.max(clean[:, f])), reverse=True):
+        ri = int(np.argmax(clean[:, fi]))
+        other = np.delete(clean[:, fi], ri)
+        if clean[ri, fi] <= 0 or clean[ri, fi] < minimum_score or clean[ri, fi] - max(0., float(np.max(other)) if len(other) else 0.) < .04:
             continue
         start, end = interval(ri, fi)
         if end <= start:

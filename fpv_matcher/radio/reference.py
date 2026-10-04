@@ -23,6 +23,11 @@ def suggest_from_reference(reference, frame, outline, regions, detect_tips=True)
         return None
     mask = np.zeros(reference.shape[:2], np.uint8)
     cv2.fillConvexPoly(mask, np.int32(outline), 255)
+    for region in regions.values():
+        # Preserve housing rims, excluding the moving sticks and most fingers.
+        center = (round(region["x"] + region["center_x"]), round(region["y"] + region["center_y"]))
+        cv2.ellipse(mask, center, (max(3, round(region["width"] * .34)), max(3, round(region["height"] * .34))),
+                    0, 0, 360, 0, -1)
     sift = cv2.SIFT_create(nfeatures=4000, contrastThreshold=0.02)
     source_keys, source_descriptors = sift.detectAndCompute(reference, mask)
     target_keys, target_descriptors = sift.detectAndCompute(frame, None)
@@ -32,14 +37,13 @@ def suggest_from_reference(reference, frame, outline, regions, detect_tips=True)
         return None
     matcher = cv2.BFMatcher()
     # Mutual matches prevent many repeated rim details voting for one pixel.
-    reverse = {
-        first.queryIdx: first.trainIdx
-        for first, second in matcher.knnMatch(target_descriptors, source_descriptors, k=2)
-        if first.distance < 0.75 * second.distance
-    }
+    reverse = {pair[0].queryIdx: pair[0].trainIdx
+               for pair in matcher.knnMatch(target_descriptors, source_descriptors, k=2)
+               if len(pair) == 2 and pair[0].distance < .75 * pair[1].distance}
     matches = [
-        first for first, second in matcher.knnMatch(source_descriptors, target_descriptors, k=2)
-        if first.distance < 0.75 * second.distance and reverse.get(first.trainIdx) == first.queryIdx
+        pair[0] for pair in matcher.knnMatch(source_descriptors, target_descriptors, k=2)
+        if len(pair) == 2 and pair[0].distance < .75 * pair[1].distance
+        and reverse.get(pair[0].trainIdx) == pair[0].queryIdx
     ]
     if len(matches) < 8:
         return None

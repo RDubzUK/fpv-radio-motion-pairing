@@ -5,17 +5,19 @@ const state = { job: null, results: null, source: 'upload', busy: false, uploadC
   calibration: null, metadata: null, tool: null, drag: null, pair: null, page: 0,
   playing: false, startingPlayback: false, animation: null, lastCorrection: 0,
   frameController: null, frameURL: null, frameToken: 0, offsetToken: 0, targets: {fpv: new Set(), radio: new Set()},
-  calibrationRotationOverride: null, calibrationName: null, calibrationProposalId: null, calibrationDrafts: {} };
+  calibrationRotationOverride: null, calibrationName: null, calibrationProposalId: null, calibrationDrafts: {}, calibrationFrameReady: false, suggesting: false, suggestionToken: 0, suggestionController: null };
+let calibrationLoad = null;
 const clone = value => JSON.parse(JSON.stringify(value));
 const calibrationScan = { id: null, jobId: null, token: 0, timer: null, running: false, rows: [] };
 const segmentScan = {token:0, timer:null, task:null, running:false};
 const fpvPreparation = {key:'', refreshed:0, token:0, task:null, jobId:null, timer:null, running:false, selected:new Set()};
+const fpvVisualReview = {token:0, windowToken:0, name:null, fps:null, data:null, duration:0, frame:null, pending:false};
 const radioOrientation = { token: 0, timer: null, task: null, running: false, result: null };
 const part = value => encodeURIComponent(value);
 const path = suffix => `/api/jobs/${state.job.id}${suffix}`;
 const show = (id, visible = true) => $(id).classList.toggle('hidden', !visible);
-function openPanel(id) { show(id); $(id).open = true; }
-const message = (id, text, error = false) => { $(id).textContent = text; $(id).classList.toggle('error', error); };
+function openPanel(id) { show(id); $(id).classList.add("guided-open"); $(id).open = true; }
+const message = (id, text, error = false) => { $(id).textContent = text; $(id).classList.toggle('error', error); $(id).classList.remove('warning'); };
 const bytes = value => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GiB` : `${(value / 1024 ** 2).toFixed(1)} MiB`;
 const time = (value, precise = false) => {
   value = Math.max(0, Number(value) || 0);
@@ -59,7 +61,7 @@ function evidenceMode(sources = readEvidenceSources()) {
 }
 function loadEvidenceSources(settings = {}) {
   const source = settings.motion_source || 'auto', audio = settings.audio_enabled !== false;
-  const defaults = {fpv_gyro: source !== 'visual', fpv_visual: source !== 'gyro', stick_inputs: true, fpv_audio: audio, stickcam_audio: audio, filename_timestamps: true};
+  const defaults = {fpv_gyro: source !== 'visual', fpv_visual: settings.matching_strategy === 'selected' && source !== 'gyro', stick_inputs: true, fpv_audio: audio, stickcam_audio: audio, filename_timestamps: true};
   for (const [key, id] of Object.entries(evidenceFields)) $(id).checked = settings.evidence_sources?.[key] ?? defaults[key];
   updateEvidenceSummary();
 }
@@ -73,12 +75,12 @@ function updateEvidenceSummary() {
   if (sources.filename_timestamps) notes.push('Filename clocks need an independent match; timestamps alone cannot sync footage.');
   const valid = mode.motion || mode.audio;
   if (!valid) notes.push('Choose a complete audio or motion comparison before analyzing.');
-  if (mode.motion && $('audio-only-unconfigured').checked && !mode.audio) notes.push('Unconfigured StickCam fallback requires both audio sources.');
-  message('evidence-summary', notes.join(' '), !valid || (mode.motion && $('audio-only-unconfigured').checked && !mode.audio));
+  if ($('matching-strategy').value !== 'automatic' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio) notes.push('Unconfigured StickCam fallback requires both audio sources.');
+  message('evidence-summary', notes.join(' '), !valid || ($('matching-strategy').value !== 'automatic' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio));
   $('audio-only-unconfigured').disabled = !mode.motion;
-  if (state.job) $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size) || !valid || (mode.motion && $('audio-only-unconfigured').checked && !mode.audio);
+  if (state.job) $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size) || !valid || ($('matching-strategy').value !== 'automatic' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio);
 }
-function calibrated(config) { return config && (config.exclude || config.skip_motion || ['left_gimbal', 'right_gimbal'].every(side => config[side]?.tip_x !== undefined)); }
+function calibrated(config) { return config && !config.source_changed && (config.exclude || config.skip_motion || ['left_gimbal', 'right_gimbal'].every(side => config[side]?.tip_x !== undefined)); }
 function updateMatchTargetOptions() {
   if (!state.job) return;
   const kind = $('match-target-kind').value, select = $('match-target-name'), previous = select.value;
@@ -103,7 +105,8 @@ function renderVideoLists() {
       check.disabled = mode !== kind || activeAnalysis() || (kind === 'radio' && state.job.calibrations[record.name]?.exclude);
       check.onchange = () => { if (check.checked) state.targets[kind].add(record.name); else state.targets[kind].delete(record.name); updateSelectionSummary(); };
       const cached = state.stickData?.clips.find(c => c.name === record.name);
-      const status = kind === 'radio' ? (cached?.status === 'cached' ? 'Movement cached' : cached?.status === 'other_rate' ? `Saved at ${cached.sample_fps} Hz · needs ${cached.requested_fps} Hz` : calibrated(state.job.calibrations[record.name]) ? 'Calibrated · needs derivation' : 'Needs calibration') : bytes(record.size);
+      const config = state.job.calibrations[record.name];
+      const status = kind === 'radio' ? (config?.exclude ? 'Excluded' : config?.skip_motion ? 'Audio only' : cached?.status === 'cached' ? 'Movement cached' : cached?.status === 'other_rate' ? `Saved at ${cached.sample_fps} Hz · needs ${cached.requested_fps} Hz` : calibrated(state.job.calibrations[record.name]) ? 'Calibrated · needs derivation' : 'Needs calibration') : bytes(record.size);
       const orientation = kind === 'radio' ? state.job.radio_orientation_checks?.[record.name] : null;
       const savedRotation = state.job.calibrations[record.name]?.radio_rotation_deg;
       const orientationText = savedRotation === 180 ? ' · inverted reference confirmed' : orientation ? ` · midpoint ${orientation.midpoint_rotation_deg === 180 ? 'inverted' : orientation.midpoint_rotation_deg === 0 ? 'upright' : 'unknown'}` : '';
@@ -122,7 +125,7 @@ function updateSelectionSummary() {
 function updateCalibrationCount() {
   if (!state.job) return;
   const count = state.job.inputs.radio.filter(record => calibrated(state.job.calibrations[record.name])).length;
-  $('calibrated-count').textContent = `${count} / ${state.job.inputs.radio.length} calibrated`;
+  $('calibrated-count').textContent = `${count} / ${state.job.inputs.radio.length} configured`;
   const selected = $('calibration-clip').value;
   $('calibration-clip').replaceChildren(...state.job.inputs.radio.map(record => {
     const config = state.job.calibrations[record.name];
@@ -139,6 +142,7 @@ function updateJobUI() {
   show('calibration-panel', completeInputs);
   show('analysis-panel', completeInputs);
   show('fpv-preparation-panel', completeInputs);
+  show('workflow-panel', true); renderWorkflow();
   if (completeInputs) refreshFPVData().catch(error => message('fpv-data-message', error.message, true));
   show('motion-panel', completeInputs);
   show('video-list-panel', completeInputs);
@@ -152,7 +156,7 @@ function updateJobUI() {
   $('analysis-bar').value = state.job.progress?.percent || 0;
   renderExtractionProgress();
   message('analysis-message', state.job.message, state.job.status === 'failed');
-  ['save-calibration', 'check-tracking', 'copy-regions'].forEach(id => $(id).disabled = activeAnalysis());
+  ['save-calibration', 'check-tracking', 'copy-regions'].forEach(id => $(id).disabled = activeAnalysis() || stickPreparation.running);
   updateRadioOrientationUI();
   $('stick-sampling-ratio').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running;
   updateMarkTools();
@@ -197,10 +201,13 @@ async function history() {
   }, 'session-message')));
 }
 function clearSession() {
+  rememberCalibrationDraft();
+  cancelGimbalSuggestion();
   segmentScan.token++; clearTimeout(segmentScan.timer); segmentScan.running = false; segmentScan.task = null;
   show('related-segments', false);
   fpvPreparation.token++; clearTimeout(fpvPreparation.timer); fpvPreparation.key = '';
   fpvPreparation.running = false; fpvPreparation.task = null; fpvPreparation.selected.clear(); state.fpvData = null;
+  resetFPVVisualReview();
   $('fpv-data-rows').replaceChildren(); $('fpv-data-log').replaceChildren();
   show('fpv-data-progress', false); show('fpv-preparation-cancel', false);
   resetMotionReview();
@@ -220,6 +227,9 @@ function clearSession() {
   clearTimeout(state.pollTimer); for (const timer of state.exportTimers.values()) clearTimeout(timer); state.exportTimers.clear();
   releaseAllPreviews(); pausePair(); $('cal-video').pause(); $('cal-video').removeAttribute('src'); $('cal-video').load();
   state.job = state.results = state.pair = state.calibration = state.metadata = null;
+  state.calibrationFrameReady = false;
+  show('workflow-panel', false);
+  for (const panel of document.querySelectorAll('.technical-panel')) { panel.classList.remove('guided-open'); panel.open = false; }
   state.targets = {fpv: new Set(), radio: new Set()};
   localStorage.removeItem('fpv-session');
   show('rename-session-controls', false); $('rename-session-label').value = ''; message('session-message', '');
@@ -290,7 +300,7 @@ async function selectJob(id) {
   clearSession(); const token = state.jobToken;
   const job = await api(`/api/jobs/${id}`); if (token !== state.jobToken) return;
   if (job.deleted_at) { await history(); message('session-message', 'This session was deleted from the frontend; use Deleted sessions to restore it.'); return; }
-  state.job = job; state.source = job.source; localStorage.setItem('fpv-session', id);
+  state.job = job; $('matching-strategy').value = job.settings.matching_strategy || 'automatic'; state.source = job.source; localStorage.setItem('fpv-session', id);
   $('session-radio-label').value = job.radio_profile?.model_id || (job.radio_profile ? 'other' : 'auto'); renderRadioShape();
   $('rename-session-label').value = job.label || ''; show('rename-session-controls');
   setSource(job.source); updateJobUI();
@@ -300,6 +310,11 @@ async function selectJob(id) {
     const input = $(key.replaceAll('_', '-')); if (input) { if (input.type === 'checkbox') input.checked = value; else input.value = value; }
   }
   $('stick-sampling-ratio').value = job.settings.stick_sampling_ratio == null ? '' : String(job.settings.stick_sampling_ratio);
+  $('fpv-preparation-mode').value = job.settings.fpv_sampling_mode || 'auto';
+  $('fpv-preparation-fps').value = job.settings.fpv_visual_fps || 30;
+  $('visual-horizontal-fov').value = job.settings.visual_camera?.horizontal_fov_deg || 110;
+  $('visual-projection').value = job.settings.visual_camera?.projection || 'rectilinear';
+  updateFPVSamplingUI();
   loadRateProfile(job.settings.rate_profile);
   selectSavedRatePreset(job.settings.rate_profile);
   loadEvidenceSources(job.settings);
@@ -308,9 +323,11 @@ async function selectJob(id) {
   refreshStickData(true).catch(error => message('stick-data-message', error.message, true));
   refreshFPVData(true).catch(error => message('fpv-data-message', error.message, true));
   await history();
-  if (job.status === 'complete') await loadResults();
+  $('sessions-panel').open = false; $('video-list-panel').open = false;
+  if (!job.settings.matching_strategy) $('use-fpv-visual').checked = false;
+  if (job.has_results) await loadResults();
   if (job.exports?.length) renderExports();
-  if (Object.values(job.inputs).flat().every(item => item.uploaded === item.size)) await loadCalibration($('calibration-clip').value);
+  if ($('technical-tools').checked && $('calibration-panel').open) await ensureCalibrationLoaded();
   if (activeAnalysis()) pollJob(id, token);
   loadClipDurations(id, token).catch(error => message('input-error', error.message, true));
 }
@@ -330,14 +347,15 @@ async function loadClipDurations(jobId, token) {
     }
   }
   await Promise.all([worker(),worker()]);
-  if (token === state.jobToken) render();
+  if (token === state.jobToken) { render(); await refreshFPVData(true); }
 }
 function setSource(source) {
   state.source = source; show('local-fields', source === 'local'); show('upload-fields', source === 'upload');
   $('source-local').classList.toggle('active', source === 'local'); $('source-upload').classList.toggle('active', source === 'upload');
 }
-let folderTarget = null, folderPath = null;
+let folderTarget = null, folderPath = null, folderRequestToken = 0;
 async function browseFolder(path) {
+  const token = ++folderRequestToken; folderPath = null; $('folder-select').disabled = true;
   $('folder-current-path').textContent = path || 'Your home folder';
   $('folder-parent').disabled = !path || path === '/';
   $('folder-video-count').textContent = '';
@@ -345,7 +363,8 @@ async function browseFolder(path) {
   message('folder-picker-message', 'Loading folder…');
   const query = path ? `?${new URLSearchParams({ path })}` : '';
   const listing = await api(`/api/browse${query}`);
-  folderPath = listing.path;
+  if (token !== folderRequestToken || !$('folder-picker').open) return;
+  folderPath = listing.path; $('folder-select').disabled = false;
   const shares = $('folder-network-buttons');
   shares.replaceChildren();
   for (const share of listing.network_shares || []) {
@@ -376,7 +395,7 @@ async function browseFolder(path) {
 }
 for (const button of document.querySelectorAll('.browse-folder')) button.onclick = guarded(async () => {
   folderTarget = $(button.dataset.folderField);
-  const purpose = folderTarget.id === 'fpv-path' ? 'FPV video' : 'StickCam video';
+  const purpose = folderTarget.id === 'fpv-path' || (folderTarget.id === 'relink-path' && $('relink-kind').value === 'fpv') ? 'FPV video' : 'StickCam video';
   $('folder-picker-title').textContent = `Choose ${purpose} source folder`;
   $('folder-purpose').textContent = `Selecting ${purpose} footage`;
   $('folder-picker').showModal();
@@ -460,7 +479,7 @@ $('pause-upload').onclick = () => state.uploadController?.abort();
 
 // Per-recording calibration uses a decoded still, including formats the browser
 // cannot play. Motion preview requests short compatible chunks when necessary.
-function emptyCalibration() { return { stickcam_mode: 'wonky', reference_time: 0, signs: { roll: 1, pitch: 1, yaw: 1, throttle: 1 } }; }
+function emptyCalibration() { return { stickcam_mode: 'wonky', stick_mode: state.job?.settings?.stick_mode || 2, reference_time: 0, signs: { roll: 1, pitch: 1, yaw: 1, throttle: 1 } }; }
 function rememberCalibrationDraft() {
   if (!state.calibrationName || !state.calibration) return;
   const config = clone(state.calibration);
@@ -468,11 +487,32 @@ function rememberCalibrationDraft() {
   if ($('skip-motion').checked) config.skip_motion = true; else delete config.skip_motion;
   for (const side of ['left_gimbal', 'right_gimbal']) if (config[side]) Object.assign(config[side], { threshold: Number($('tip-threshold').value), polarity: $('tip-polarity').value });
   state.calibrationDrafts[state.calibrationName] = { config, proposalId: state.calibrationProposalId };
+  const dirty = JSON.stringify(config) !== JSON.stringify(state.job?.calibrations[state.calibrationName] || emptyCalibration());
+  show('calibration-dirty', dirty); show('discard-calibration-draft', dirty);
+  try { const key = calibrationDraftKey(state.calibrationName); if (dirty && state.metadata?.source_signature) localStorage.setItem(key, JSON.stringify({config, proposalId:state.calibrationProposalId, signature:state.metadata.source_signature})); else if (!dirty) localStorage.removeItem(key); } catch {}
 }
 async function loadCalibration(name) {
+  if (!name || !state.job) return;
+  if (calibrationLoad?.name === name && calibrationLoad.jobToken === state.jobToken) return calibrationLoad.promise;
+  cancelGimbalSuggestion();
+  const loading = {name, jobToken: state.jobToken};
+  loading.promise = loadCalibrationFrame(name);
+  calibrationLoad = loading;
+  try { await loading.promise; }
+  finally { if (calibrationLoad === loading) { calibrationLoad = null; updateMarkTools(); } }
+}
+async function ensureCalibrationLoaded() {
+  if (!state.job || !state.job.inputs.radio.length) return;
+  let name = $('calibration-clip').value;
+  if (!state.calibrationName && state.job.calibrations[name]?.exclude) name = state.job.inputs.radio.find(r => !state.job.calibrations[r.name]?.exclude)?.name || name;
+  $('calibration-clip').value = name;
+  if (state.calibrationName !== name || !state.metadata || !state.calibrationFrameReady) await loadCalibration(name);
+}
+async function loadCalibrationFrame(name) {
   openPanel('calibration-panel');
   if (!name || !state.job) return;
   rememberCalibrationDraft();
+  $('calibration-clip').value = name;
   const token = ++state.calToken, jobToken = state.jobToken;
   state.frameController?.abort();
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas'); show('tracking-check', false);
@@ -480,6 +520,8 @@ async function loadCalibration(name) {
   state.tool = state.drag = null; state.calibration = clone(state.calibrationDrafts[name]?.config || state.job.calibrations[name] || emptyCalibration());
   state.calibrationRotationOverride = null;
   $('radio-rotation-deg').value = String(state.calibration.radio_rotation_deg || 0);
+  $('suggest-radio-orientation').checked = !state.calibration.radio_orientation_confirmed && !state.calibration.radio_orientation_manual;
+  renderStickMode();
   radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
   show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
   $('stickcam-mode').value = state.calibration.stickcam_mode === 'fixed' ? 'fixed' : 'wonky'; $('skip-motion').checked = !!state.calibration.skip_motion;
@@ -488,7 +530,7 @@ async function loadCalibration(name) {
   const spec = state.calibration.left_gimbal;
   $('tip-radius').value = spec?.tip_radius || 10; $('tip-threshold').value = spec?.threshold ?? 70; $('tip-polarity').value = spec?.polarity || 'dark';
   message('calibration-message', `Loading ${name}…`);
-  state.metadata = null; message('cal-duration', '');
+  state.metadata = null; state.calibrationFrameReady = false; message('cal-duration', '');
   updateMarkTools();
   let info;
   try { info = await api(path(`/metadata/radio/${part(name)}`)); }
@@ -498,7 +540,9 @@ async function loadCalibration(name) {
     message('calibration-message', `Could not read this clip: ${error.message}. Select “Exclude this clip” and save to continue with the rest of the batch.`, true); return;
   }
   if (token !== state.calToken || jobToken !== state.jobToken) return;
-  state.metadata = info; message('cal-duration', `Duration ${time(info.duration)} · ${info.fps.toFixed(2)} fps`);
+  state.metadata = info;
+  try { const saved = JSON.parse(localStorage.getItem(calibrationDraftKey(name)) || 'null'); if (saved && JSON.stringify(saved.signature) === JSON.stringify(info.source_signature) && !state.calibrationDrafts[name]) { state.calibrationDrafts[name] = saved; state.calibration = clone(saved.config); state.calibrationProposalId = saved.proposalId; $('reference-time').value = saved.config.reference_time || 0; $('stickcam-mode').value = saved.config.stickcam_mode || 'wonky'; $('radio-rotation-deg').value = String(saved.config.radio_rotation_deg || 0); $('skip-motion').checked = !!saved.config.skip_motion; $('exclude-clip').checked = !!saved.config.exclude; } else if (saved && JSON.stringify(saved.signature) !== JSON.stringify(info.source_signature)) localStorage.removeItem(calibrationDraftKey(name)); } catch {}
+  rememberCalibrationDraft(); message('cal-duration', `Duration ${time(info.duration)} · ${info.fps.toFixed(2)} fps`);
   const record = state.job.inputs.radio.find(r => r.name === name); if (record) record.metadata = info;
   updateStickSamplingPreview();
   show('cal-stage');
@@ -529,6 +573,7 @@ async function showFrame(reset = true, token = state.calToken) {
   const name = $('calibration-clip').value;
   const url = path(`/frame/radio/${part(name)}?at=${at}`);
   state.frameController?.abort();
+  state.calibrationFrameReady = false; updateMarkTools();
   const controller = new AbortController(), frameToken = ++state.frameToken;
   state.frameController = controller;
   let blob;
@@ -548,7 +593,9 @@ async function showFrame(reset = true, token = state.calToken) {
   state.frameURL = objectURL;
   if (token !== state.calToken || frameToken !== state.frameToken) return;
   state.calibration = nextCalibration;
+  state.calibrationFrameReady = true; updateMarkTools();
   $('radio-rotation-deg').value = String(nextCalibration.radio_rotation_deg || 0);
+  renderStickMode();
   drawRegions();
   updateRadioOrientationUI();
   if (state.job.radio_profile && !activeAnalysis()) checkRadioOrientation(false, true).catch(error => message('radio-orientation-message', error.message, true));
@@ -562,6 +609,35 @@ async function loadRadioModels() {
   for (const model of radioModels) { const option = el('option', `${model.label}${model.variants.length ? ` · ${model.variants.join(' / ')}` : ''}`); option.value = model.id; select.append(option); }
   select.value = previous || 'auto'; renderRadioShape();
 }
+const STICK_MODES = {
+  1: ['Yaw', 'Pitch', 'Roll', 'Throttle'], 2: ['Yaw', 'Throttle', 'Roll', 'Pitch'],
+  3: ['Roll', 'Pitch', 'Yaw', 'Throttle'], 4: ['Roll', 'Throttle', 'Yaw', 'Pitch']
+};
+function renderStickMode() {
+  const mode = state.calibration?.stick_mode || state.job?.settings?.stick_mode || 2;
+  $('radio-stick-mode').value = String(mode);
+  const [lx,ly,rx,ry] = STICK_MODES[mode];
+  message('radio-stick-mode-summary', `Physical left: ↔ ${lx}, ↕ ${ly}. Physical right: ↔ ${rx}, ↕ ${ry}. Saved inputs are Throttle / Yaw / Pitch / Roll. Up and right are positive before axis sign corrections.`);
+}
+$('radio-stick-mode').onchange = () => {
+  if (!state.calibration) return;
+  state.calibration.stick_mode = Number($('radio-stick-mode').value); renderStickMode(); rememberCalibrationDraft();
+  message('calibration-message', 'Stick assignments changed in this draft. Confirm calibration to save; saved tracking can be remapped without scanning the video again.');
+};
+$('apply-stick-mode-all').onclick = guarded(async () => {
+  const mode = Number($('radio-stick-mode').value), token = state.jobToken;
+  const result = await api(path('/stick-mode'), {method:'PUT', json:{stick_mode:mode}});
+  if (token !== state.jobToken) return;
+  state.job.settings.stick_mode = mode; state.job.calibrations = result.calibrations;
+  for (const [name,draft] of Object.entries(state.calibrationDrafts)) {
+    draft.config.stick_mode = mode;
+    try { const key = calibrationDraftKey(name), saved = JSON.parse(localStorage.getItem(key) || 'null'); if (saved) { saved.config.stick_mode = mode; localStorage.setItem(key,JSON.stringify(saved)); } } catch {}
+  }
+  if (state.calibration) state.calibration.stick_mode = mode;
+  renderStickMode(); rememberCalibrationDraft(); await refreshStickData(true);
+  message('calibration-message', `Mode ${mode} saved for the session and all existing StickCam calibrations. Stored tracking is reused; reopen motion charts or rerun motion matching to use the new assignments.`);
+}, 'calibration-message');
+
 function renderRadioShape() {
   const model = radioModels.find(row => row.id === $('session-radio-label').value), canvas = $('radio-shape-preview');
   show('radio-shape-preview', !!model);
@@ -580,9 +656,11 @@ function renderRadioShape() {
 $('session-radio-label').onchange = renderRadioShape;
 
 function updateRadioOrientationUI() {
-  const profile = state.job?.radio_profile, unavailable = !state.metadata || $('exclude-clip').checked || activeAnalysis();
+  const profile = state.job?.radio_profile, unavailable = !state.metadata || $('exclude-clip').checked || activeAnalysis() || state.suggesting;
   message('session-radio-message', profile ? `Confirmed: ${profile.label} · reference ${profile.name} at ${time(profile.reference_time)}. Predictions identify this saved appearance; the model label can be corrected above.` : 'Confirm one clear, calibrated radio view to establish the expected appearance for this session.');
   $('radio-rotation-deg').disabled = unavailable;
+  $('radio-stick-mode').disabled = unavailable; $('apply-stick-mode-all').disabled = unavailable;
+  $('suggest-radio-orientation').disabled = unavailable;
   $('confirm-session-radio').textContent = profile ? 'Change session radio using this frame' : 'Confirm radio & use this frame as reference';
   $('cal-rotate-180').disabled = unavailable;
   $('confirm-session-radio').disabled = unavailable || $('skip-motion').checked || radioOrientation.running;
@@ -601,7 +679,7 @@ function applyRadioRotation(rotation) {
       [state.calibration.left_gimbal, state.calibration.right_gimbal] = [right, left];
   }
   state.calibrationRotationOverride = null; state.drag = null;
-  state.calibration.radio_rotation_deg = rotation; state.calibration.radio_orientation_confirmed = false;
+  state.calibration.radio_rotation_deg = rotation; state.calibration.radio_orientation_confirmed = false; state.calibration.radio_orientation_manual = true;
   $('radio-rotation-deg').value = String(rotation); drawRegions();
   message('radio-orientation-message', `${rotation === 180 ? 'Upside down' : 'Upright'} at this calibration frame. Check physical left/right regions and tips, then confirm calibration to save. Corrected stick directions require movement data derived with this orientation.`);
   updateRadioOrientationUI();
@@ -657,7 +735,8 @@ async function checkRadioOrientation(all = false, automatic = false) {
     await poll();
   } catch(error) { if (token === radioOrientation.token) { radioOrientation.running = false; updateRadioOrientationUI(); } throw error; }
 }
-$('radio-rotation-deg').onchange = () => applyRadioRotation(Number($('radio-rotation-deg').value));
+$('suggest-radio-orientation').onchange = () => { if (state.calibration) { state.calibration.radio_orientation_manual = !$('suggest-radio-orientation').checked; rememberCalibrationDraft(); } };
+$('radio-rotation-deg').onchange = () => { $('suggest-radio-orientation').checked = false; applyRadioRotation(Number($('radio-rotation-deg').value)); rememberCalibrationDraft(); };
 $('apply-radio-orientation').onclick = () => applyRadioRotation(radioOrientation.result.calibration_rotation_deg);
 $('check-radio-midpoint').onclick = guarded(() => checkRadioOrientation(), 'radio-orientation-message');
 $('check-radio-all').onclick = guarded(() => checkRadioOrientation(true), 'radio-orientation-message');
@@ -706,6 +785,7 @@ async function openCalibrationProposal(row) {
   state.calibration = clone(row.calibration); state.calibrationProposalId = scanId;
   $('stickcam-mode').value = state.calibration.stickcam_mode === 'fixed' ? 'fixed' : 'wonky';
   $('skip-motion').checked = false; $('exclude-clip').checked = false; $('reference-time').value = row.at;
+  renderStickMode();
   $('tip-radius').value = state.calibration.left_gimbal.tip_radius; $('tip-threshold').value = state.calibration.left_gimbal.threshold; $('tip-polarity').value = state.calibration.left_gimbal.polarity;
   await showFrame(false);
   if (jobToken !== state.jobToken) return;
@@ -727,7 +807,7 @@ async function startCalibrationSearch(all = false) {
   const jobId = state.job.id, jobToken = state.jobToken;
   const task = await api(`/api/jobs/${jobId}/calibration-scan`, {method:'POST', json: {
     radio_video: all ? null : $('calibration-clip').value, start: all ? 0 : Number($('reference-time').value),
-    radio_model: $('session-radio-label').value, search_seconds: Number($('auto-search-seconds').value), stickcam_mode: all ? 'wonky' : $('stickcam-mode').value
+    radio_model: $('session-radio-label').value, stick_mode: Number($('radio-stick-mode').value), search_seconds: Number($('auto-search-seconds').value), stickcam_mode: all ? 'wonky' : $('stickcam-mode').value
   }});
   if (jobToken !== state.jobToken) return;
   watchCalibrationScan(task.id, jobId, jobToken);
@@ -769,15 +849,23 @@ for (const [id, step] of [['cal-frame-back', -5], ['cal-frame-forward', 5]]) $(i
   await showFrame();
 }, 'calibration-message');
 $('auto-regions').onclick = guarded(async () => {
+  await ensureCalibrationLoaded();
   if (!state.metadata || !state.calibration) throw new Error('Load a reference frame first.');
   const name = $('calibration-clip').value, referenceTime = Number($('reference-time').value);
-  if (Math.abs(referenceTime - state.calibration.reference_time) > .01) throw new Error('Click Show frame before suggesting regions at the new time.');
+  if (Math.abs(referenceTime - state.calibration.reference_time) > .01) await showFrame();
+  if (state.suggesting) return;
+  const requestToken = ++state.suggestionToken, controller = new AbortController();
+  state.suggestionController = controller; state.suggesting = true; updateMarkTools();
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 30000);
+  try {
   const token = state.calToken, jobToken = state.jobToken, frameToken = state.frameToken;
   const previousCalibration = JSON.stringify(state.calibration);
   const outlined = state.calibration.radio_outline?.length === 4;
   message('calibration-message', outlined ? 'Checking gimbal rims inside the radio outline…' : 'Checking saved radio references and visible gimbal rims…');
-  const proposal = await api(path(`/calibration/${part(name)}/suggest?at=${referenceTime}`), { method: 'POST', json: { radio_model: $('session-radio-label').value, radio_outline: state.calibration.radio_outline || [], radio_rotation_deg: state.calibration.radio_rotation_deg || 0 } });
-  if (token !== state.calToken || jobToken !== state.jobToken || frameToken !== state.frameToken || previousCalibration !== JSON.stringify(state.calibration)) return;
+  const proposal = await api(path(`/calibration/${part(name)}/suggest?at=${referenceTime}`), { method: 'POST', signal: controller.signal, json: { radio_model: $('session-radio-label').value, radio_outline: state.calibration.radio_outline || [], radio_rotation_deg: state.calibration.radio_rotation_deg || 0, suggest_orientation: $('suggest-radio-orientation').checked } });
+  if (requestToken !== state.suggestionToken || token !== state.calToken || jobToken !== state.jobToken || frameToken !== state.frameToken) return;
+  if (previousCalibration !== JSON.stringify(state.calibration)) { message('calibration-message', 'The calibration changed while checking. Click Suggest again for the current markers.', true); return; }
   const sx = state.metadata.width / proposal.frame_width, sy = state.metadata.height / proposal.frame_height;
   if (proposal.radio_rotation_deg !== undefined) {
     state.calibration.radio_rotation_deg = proposal.radio_rotation_deg; state.calibration.radio_orientation_confirmed = false;
@@ -788,7 +876,7 @@ $('auto-regions').onclick = guarded(async () => {
     const spec = proposal.regions[side];
     state.calibration[side] = { ...spec, x: spec.x * sx, y: spec.y * sy, width: spec.width * sx, height: spec.height * sy,
       center_x: spec.center_x * sx, center_y: spec.center_y * sy, travel_x: spec.travel_x * sx, travel_y: spec.travel_y * sy,
-      tip_radius: spec.tip_radius * Math.min(sx, sy) };
+      tip_radius: (spec.tip_radius || 10) * Math.min(sx, sy) };
     if (Number.isFinite(spec.tip_x) && Number.isFinite(spec.tip_y)) {
       state.calibration[side].tip_x = spec.tip_x * sx;
       state.calibration[side].tip_y = spec.tip_y * sy;
@@ -799,22 +887,39 @@ $('auto-regions').onclick = guarded(async () => {
   $('tip-radius').value = Number(state.calibration.left_gimbal.tip_radius.toFixed(1));
   state.tool = null; document.querySelectorAll('[data-tool]').forEach(button => button.classList.remove('active'));
   drawRegions();
+  rememberCalibrationDraft();
   const missingTips = ['left_gimbal', 'right_gimbal'].filter(side => state.calibration[side].tip_x === undefined);
   const tipMessage = missingTips.length ? `Could not reliably locate the ${missingTips.map(side => side.startsWith('left') ? 'left' : 'right').join(' and ')} tip${missingTips.length > 1 ? 's' : ''}; click the corresponding tip tool to mark ${missingTips.length > 1 ? 'them' : 'it'}.` : 'Both current stick tips are suggested. Review all markers, adjust any point, then save or check tracking.';
-  message('calibration-message', `${proposal.reference_clip ? `Located a saved radio reference from ${proposal.reference_clip}.` : `Suggested gimbal housings${outlined ? ' inside the marked outline' : ''}.`} ${proposal.shape_matches?.length ? `Shape candidates: ${proposal.shape_matches.map(row => row.label).join(', ')}. ` : ''}${proposal.shape_message || ''} ${tipMessage} Circles mark tips; crosses mark estimated neutral centres.`);
+  message('calibration-message', `${proposal.needs_review ? 'Uncertain suggestion — review before confirming. ' : ''}${proposal.reference_clip ? `Located a saved radio reference from ${proposal.reference_clip}.` : `Suggested gimbal housings${outlined ? ' inside the marked outline' : ''}.`} ${(proposal.review_reasons || []).join(' ')} ${proposal.shape_matches?.length ? `Shape candidates: ${proposal.shape_matches.map(row => row.label).join(', ')}. ` : ''}${proposal.shape_message || ''} ${tipMessage} Circles mark tips; crosses mark estimated neutral centres.`);
+  $('calibration-message').classList.toggle('warning', !!proposal.needs_review);
+  } catch (error) {
+    if (requestToken !== state.suggestionToken) return;
+    if (timedOut) message('calibration-message', 'Suggestion timed out after 30 seconds. Try another frame or mark the outline, then retry.', true);
+    else throw error;
+  } finally {
+    clearTimeout(timeout);
+    if (requestToken === state.suggestionToken) { state.suggesting = false; state.suggestionController = null; updateMarkTools(); }
+  }
 }, 'calibration-message');
+function cancelGimbalSuggestion() {
+  state.suggestionToken++; state.suggestionController?.abort(); state.suggestionController = null; state.suggesting = false;
+}
 $('stickcam-mode').onchange = () => {
   if (!state.calibration) return;
   state.calibration.stickcam_mode = $('stickcam-mode').value;
   message('calibration-message', $('stickcam-mode').value === 'fixed' ? 'Fixed mode tracks tips inside these regions.' : 'Wonky mode also tracks the housing. Include detailed housing edges around each gimbal.');
 };
 function updateMarkTools() {
-  const unavailable = $('skip-motion').checked || $('exclude-clip').checked || !state.metadata;
+  const unavailable = $('skip-motion').checked || $('exclude-clip').checked || !state.metadata || !state.calibrationFrameReady;
   $('cal-stage').classList.toggle('disabled', unavailable);
-  document.querySelectorAll('[data-tool]').forEach(button => button.disabled = unavailable || activeAnalysis());
+  document.querySelectorAll('[data-tool]').forEach(button => button.disabled = unavailable || activeAnalysis() || state.suggesting);
   $('check-tracking').disabled = unavailable || activeAnalysis();
-  $('auto-regions').disabled = unavailable || activeAnalysis();
-  $('load-frame').disabled = $('cal-preview').disabled = !state.metadata || $('exclude-clip').checked;
+  $('auto-regions').disabled = unavailable || activeAnalysis() || state.suggesting;
+  $('auto-regions').textContent = state.suggesting ? 'Finding gimbal regions…' : 'Suggest gimbal regions';
+  $('auto-regions').setAttribute('aria-busy', String(state.suggesting));
+  $('save-calibration').disabled = !state.calibration || activeAnalysis() || stickPreparation.running || state.suggesting || !!calibrationLoad;
+  for (const id of ['load-frame', 'cal-preview', 'cal-frame-back', 'cal-frame-forward', 'reference-time']) $(id).disabled = !state.metadata || $('exclude-clip').checked || activeAnalysis() || state.suggesting;
+  for (const id of ['skip-motion', 'exclude-clip', 'stickcam-mode', 'session-radio-label']) $(id).disabled = activeAnalysis() || state.suggesting;
   updateRadioOrientationUI();
 }
 $('skip-motion').onchange = updateMarkTools;
@@ -826,7 +931,7 @@ for (const button of document.querySelectorAll('[data-tool]')) button.onclick = 
   message('calibration-message', state.tool === 'radio-outline' ? 'Click the radio body corners in order: top left, top right, bottom right, bottom left. Stay on the shell and avoid including your hands.' : state.tool.startsWith('box') ? 'Drag a rectangle around the complete gimbal and its housing.' : state.tool.startsWith('tip') ? 'Click the centre of the visible stick tip.' : 'Click the neutral gimbal centre (where the tip would be at rest).');
 };
 function calibrationViewRotated() { return state.calibrationRotationOverride ?? state.calibration?.radio_rotation_deg === 180; }
-$('cal-rotate-180').onchange = () => { state.calibrationRotationOverride = $('cal-rotate-180').checked; state.drag = null; drawRegions(); };
+$('cal-rotate-180').onchange = () => { $('suggest-radio-orientation').checked = false; applyRadioRotation($('cal-rotate-180').checked ? 180 : 0); rememberCalibrationDraft(); };
 function coordinates(event) {
   const bounds = $('roi-canvas').getBoundingClientRect();
   const x = (event.clientX - bounds.left) / bounds.width * state.metadata.width;
@@ -836,7 +941,7 @@ function coordinates(event) {
     y: Math.max(0, Math.min(state.metadata.height - 1, rotated ? state.metadata.height - y : y)) };
 }
 $('roi-canvas').onpointerdown = event => {
-  if (!state.metadata || !state.tool || $('skip-motion').checked || $('exclude-clip').checked || activeAnalysis()) return;
+  if (!state.metadata || !state.tool || $('skip-motion').checked || $('exclude-clip').checked || activeAnalysis() || state.suggesting) return;
   const [kind, side] = state.tool.split(':');
   if (kind !== 'radio-outline' && !state.calibration[side] && kind !== 'box') { message('calibration-message', 'Draw that gimbal region first.', true); return; }
   $('roi-canvas').setPointerCapture(event.pointerId); state.drag = { start: coordinates(event), current: coordinates(event), kind, side }; event.preventDefault();
@@ -922,6 +1027,7 @@ function currentCalibrationConfig() {
   else if ($('skip-motion').checked) config = { skip_motion: true, stickcam_mode: $('stickcam-mode').value };
   else {
     config.stickcam_mode = $('stickcam-mode').value;
+    config.stick_mode = Number($('radio-stick-mode').value);
     config.radio_rotation_deg = Number($('radio-rotation-deg').value); config.radio_orientation_confirmed = true;
     if (!calibrated(config)) throw new Error('Draw both regions and click both tips, or choose audio-only matching.');
     if (config.radio_outline && config.radio_outline.length !== 4) throw new Error('Mark all four radio outline corners, or click the outline tool again to start over.');
@@ -939,7 +1045,8 @@ async function saveCalibration(next = false) {
   const saved = await api(path(`/calibration/${part(name)}${proposalId ? `?proposal_id=${proposalId}` : ''}`), { method: 'PUT', json: config });
   if (jobToken !== state.jobToken) return;
   state.job.calibrations[name] = saved.config;
-  delete state.calibrationDrafts[name];
+  delete state.calibrationDrafts[name]; try { localStorage.removeItem(calibrationDraftKey(name)); } catch {}
+  show('calibration-dirty', false); show('discard-calibration-draft', false); renderWorkflow();
   if (proposalId) { state.job.calibration_reviews ??= {}; state.job.calibration_reviews[name] = {proposal_id: proposalId, status:'confirmed'}; }
   renderCalibrationProposals();
   if (token !== state.calToken) { updateCalibrationCount(); return; }
@@ -951,7 +1058,7 @@ async function saveCalibration(next = false) {
     const records = state.job.inputs.radio, current = records.findIndex(record => record.name === name);
     const pending = [...records.slice(current + 1), ...records.slice(0, current)].find(record => !calibrated(state.job.calibrations[record.name]));
     if (pending) { $('calibration-clip').value = pending.name; await loadCalibration(pending.name); }
-    else message('calibration-message', 'All StickCam clips are calibrated. Derive the movement data to prepare them for matching.');
+    else message('calibration-message', 'Saved calibrations are ready. Run automatic matching to reuse audio and derive only the unresolved inputs needed.');
   }
 }
 $('save-calibration').onclick = guarded(() => saveCalibration(true), 'calibration-message');
@@ -1040,27 +1147,30 @@ $('cal-preview').onclick = guarded(async () => {
 $('cal-pause').onclick = guarded(async () => { $('cal-video').pause(); $('reference-time').value = $('cal-video').currentTime.toFixed(3); await showFrame(); }, 'calibration-message');
 
 // Analysis, recovery and result review.
-$('analyze').onclick = guarded(async () => {
+async function startMatching() {
+  const automatic = $('matching-strategy').value === 'automatic';
   const targetKind = $('match-target-kind').value, targetNames = targetKind === 'all' ? [] : [...state.targets[targetKind]], targetName = targetNames.length === 1 ? targetNames[0] : '';
   if (targetKind !== 'all' && !targetNames.length) throw new Error('Select one or more targets in the video lists.');
   const radioInputs = targetKind === 'radio' ? state.job.inputs.radio.filter(record => targetNames.includes(record.name)) : state.job.inputs.radio;
   const evidenceSources = readEvidenceSources(), mode = evidenceMode(evidenceSources);
   if (!mode.motion && !mode.audio) throw new Error('Select both audio sources, or StickCam inputs and an FPV motion source.');
-  const allowUnconfigured = mode.motion && $('audio-only-unconfigured').checked;
-  if (allowUnconfigured && !mode.audio) throw new Error('Unconfigured StickCam fallback requires both audio sources.');
-  const pending = mode.motion && radioInputs.find(record => {
+  const allowUnconfigured = automatic || (mode.motion && $('audio-only-unconfigured').checked);
+  if (!automatic && allowUnconfigured && !mode.audio) throw new Error('Unconfigured StickCam fallback requires both audio sources.');
+  const pending = !automatic && mode.motion && radioInputs.find(record => {
     const config = state.job.calibrations[record.name];
     return !config ? !allowUnconfigured : !calibrated(config);
   });
   if (pending) { $('calibration-clip').value = pending.name; await loadCalibration(pending.name); throw new Error(`Finish the calibration for ${pending.name}, or enable audio + filename-clock matching for unconfigured StickCam.`); }
-  const settings = { sample_fps: Number($('sample-fps').value), match_fps: Number($('match-fps').value), min_overlap: Number($('min-overlap').value),
+  const settings = { matching_strategy: automatic ? 'automatic' : 'selected', sample_fps: Number($('sample-fps').value), match_fps: Number($('match-fps').value), min_overlap: Number($('min-overlap').value),
     workers: Number($('workers').value), minimum_score: Number($('minimum-score').value), audio_enabled: mode.audio, evidence_sources: evidenceSources,
     match_target_kind: targetKind, match_target_name: targetName, match_target_names: targetNames, stop_on_confident_match: $('stop-on-confident-match').checked, allow_unconfigured_radio: allowUnconfigured, rate_profile: mode.motion ? readRateProfile() : null, ...readMotionSettings() };
   await api(path('/run'), { method: 'POST', json: settings });
   state.job.status = 'queued'; state.job.message = 'Queued for analysis'; state.job.progress = null;
-  state.results = null; pausePair(); show('results-panel', false); show('viewer-panel', false); show('diagnostics-panel', false);
+  pausePair(); show('viewer-panel', false); show('diagnostics-panel', false);
   updateJobUI(); await history(); pollJob(state.job.id, state.jobToken);
-}, 'analysis-message');
+}
+$('analyze').onclick = guarded(startMatching, 'analysis-message');
+$('workflow-find').onclick = guarded(startMatching, 'workflow-message');
 $('match-target-kind').onchange = updateMatchTargetOptions;
 $('match-target-name').onchange = () => { const kind = $('match-target-kind').value; if (kind !== 'all') { state.targets[kind] = new Set([$('match-target-name').value]); renderVideoLists(); } };
 $('targets-select-all').onclick = () => { const kind = $('match-target-kind').value; if (kind !== 'all') { state.targets[kind] = new Set(state.job.inputs[kind].filter(r => !state.job.calibrations[r.name]?.exclude).map(r => r.name)); renderVideoLists(); } };
@@ -1073,7 +1183,7 @@ for (const actionName of ['confirm', 'continue']) $(`early-${actionName}`).oncli
 $('early-preview').onclick = guarded(async () => {
   const candidate = state.job.early_proposal?.candidate; if (!candidate) return;
   updateMotionOptions(); $('motion-fpv').value = candidate.fpv_video; $('motion-radio').value = candidate.radio_video; $('motion-offset').value = candidate.offset_seconds.toFixed(6);
-  motion.autoPreview = true; await loadMotionSignals(); $('motion-panel').scrollIntoView({behavior:'smooth'});
+  await previewSelectedVideos(); $('motion-panel').scrollIntoView({behavior:'smooth'});
 }, 'analysis-message');
 $('audio-only-unconfigured').onchange = updateEvidenceSummary;
 for (const id of Object.values(evidenceFields)) $(id).onchange = updateEvidenceSummary;
@@ -1100,7 +1210,8 @@ async function pollJob(id, token) {
 }
 async function loadResults() {
   const token = state.jobToken, results = await api(path('/matches')); if (token !== state.jobToken) return;
-  state.results = results; renderResults(); renderExports();
+  state.results = results; renderResults(); renderExports(); renderWorkflow();
+  if (state.job.status !== 'complete') return;
   const plots = await api(path('/plots')); if (token !== state.jobToken) return;
   $('plots').replaceChildren(...plots.files.map(filename => { const link = el('a'); link.href = path(`/file/${part(filename)}`); link.target = '_blank'; link.rel = 'noopener';
     const image = el('img'); image.src = link.href; image.alt = 'Aligned motion and tracking quality diagnostics'; image.loading = 'lazy'; link.append(image); return link; }));
@@ -1121,8 +1232,9 @@ function renderResults() {
     const names = el('div', undefined, 'names'); names.append(el('span', clipLabel(state.job.inputs.radio.find(r => r.name === row.radio_video) || {name:row.radio_video})), el('span', '↔ ' + clipLabel(state.job.inputs.fpv.find(r => r.name === row.fpv_video) || {name:row.fpv_video}))); button.append(names);
     button.append(el('small', `Score ${row.combined_score.toFixed(3)} · offset ${offsetText(row.offset_seconds)} · ${time(row.overlap_seconds)} shared`));
     button.append(el('small', row.evidence));
-    if (row.motion_included === false) button.append(el('small', 'Motion comparison not used'));
-    else if (row.usable_sections !== undefined) button.append(el('small', `${row.correlated_sections}/${row.usable_sections} usable 3s sections agree · ${Math.round(row.section_agreement * 100)}% support`));
+    if (row.audio_usable_sections != null) button.append(el('small', `Audio: ${row.audio_correlated_sections}/${row.audio_usable_sections} sections agree · ${row.audio_joint_sections || 0} agree in landmarks + trends`));
+    if (row.motion_included === false) button.append(el('small', 'Motion skipped'));
+    else if (row.usable_sections !== undefined) button.append(el('small', `Motion: ${row.correlated_sections}/${row.usable_sections} usable sections agree · ${Math.round(row.section_agreement * 100)}% support`));
     const siblings = assigned.filter(item => item.radio_video === row.radio_video);
     if (siblings.length > 1) button.append(el('small', `FPV segment ${siblings.indexOf(row) + 1}/${siblings.length} for this StickCam`));
     $('pair-cards').append(button);
@@ -1197,7 +1309,9 @@ async function openPair(radioName, fpvName, customOffset = null) {
   state.pair = info;
   selectMotionPair(info);
   $('radio-heading').textContent = radioName; $('fpv-heading').textContent = fpvName; $('review-offset').value = info.offset_seconds.toFixed(6);
-  $('review-state').textContent = info.reviewed ? 'Reviewed alignment' : 'Automatic estimate · review';
+  $('review-state').textContent = info.reviewed ? 'Reviewed alignment' : info.review_reason || 'Automatic estimate · review';
+  $('replace-owner').checked = false; show('replace-owner-wrap', !!info.existing_owner); $('replace-owner-wrap').title = info.existing_owner ? `Currently saved with ${info.existing_owner}` : '';
+  $('pair-audio-toggle').checked = false; show('pair-audio-charts', false);
   const candidate = candidates.find(row => row.fpv_video === fpvName);
   if (customOffset !== null && Math.abs(customOffset - candidate.offset_seconds) > 1e-7) $('review-state').textContent = 'Unsaved alignment adjustment';
   const motionEvidence = candidate.motion_included === false ? 'motion not used' : `${candidate.reliable_axes} motion axes · timing peak margin ${candidate.peak_margin.toFixed(3)}`;
@@ -1206,7 +1320,7 @@ async function openPair(radioName, fpvName, customOffset = null) {
   await Promise.all([loadVideo($('radio-preview'), 'radio', radioName, () => token === state.viewerToken && jobToken === state.jobToken, 'viewer-message', $('playback-proxy').checked, info.radio_start),
     loadVideo($('fpv-preview'), 'fpv', fpvName, () => token === state.viewerToken && jobToken === state.jobToken, 'viewer-message', $('playback-proxy').checked, info.fpv_start)]);
   if (token !== state.viewerToken || jobToken !== state.jobToken) return;
-  seekPair(0); $('pair-play').disabled = $('save-alignment').disabled = $('export-pair').disabled = false;
+  seekPair(0); $('pair-play').disabled = $('save-alignment').disabled = false; $('export-pair').disabled = !info.reviewed;
   message('viewer-message', `Shared interval: ${time(info.overlap_duration)}. Check the beginning and end, then save your alignment.`);
   $('open-portrait').disabled = false;
   renderResults();
@@ -1222,7 +1336,7 @@ async function updateOffset() {
   pausePair();
   const info = await api(path('/pair-info'), { method: 'POST', json: { radio_video: old.radio_video, fpv_video: old.fpv_video, offset_seconds: Number($('review-offset').value) } });
   if (token !== state.viewerToken || offsetToken !== state.offsetToken) return;
-  state.pair = info; $('pair-seek').max = info.overlap_duration; intervalBars(); seekPair(at - info.radio_start);
+  state.pair = info; $('export-pair').disabled = !info.reviewed; $('pair-audio-toggle').checked = false; show('pair-audio-charts', false); $('pair-seek').max = info.overlap_duration; intervalBars(); seekPair(at - info.radio_start);
   $('review-state').textContent = 'Unsaved alignment adjustment'; message('viewer-message', 'Offset adjusted. Save pairing & alignment to keep it.');
 }
 $('review-offset').onchange = guarded(updateOffset, 'viewer-message');
@@ -1274,9 +1388,9 @@ async function saveAlignment() {
   if (Math.abs(Number($('review-offset').value) - state.pair.offset_seconds) > 1e-7) await updateOffset();
   if (initialToken !== state.viewerToken || !state.pair) return;
   const current = state.pair, token = state.viewerToken;
-  await api(path(`/pairs/${part(current.radio_video)}`), { method: 'PUT', json: { fpv_video: current.fpv_video, offset_seconds: current.offset_seconds } });
+  await api(path(`/pairs/${part(current.radio_video)}`), { method: 'PUT', json: { fpv_video: current.fpv_video, offset_seconds: current.offset_seconds, replace_owner: $('replace-owner').checked } });
   if (token !== state.viewerToken) return;
-  current.reviewed = true; $('review-state').textContent = 'Reviewed alignment'; message('viewer-message', 'Segment pairing and offset saved. Other segments for this StickCam are kept.'); await loadResults();
+  current.reviewed = true; $('export-pair').disabled = false; show('replace-owner-wrap', false); $('review-state').textContent = 'Reviewed alignment'; message('viewer-message', 'Segment pairing and offset saved. Other segments for this StickCam are kept.'); await loadResults();
   if ($('auto-find-segments').checked) await startRelatedSegments(current);
   return token === state.viewerToken ? current : null;
 }
@@ -1284,7 +1398,7 @@ $('save-alignment').onclick = guarded(saveAlignment, 'viewer-message');
 $('reject-pair').onclick = guarded(async () => {
   if (!state.pair) return; pausePair();
   await api(path(`/pairs/${part(state.pair.radio_video)}`), { method: 'PUT', json: { fpv_video: state.pair.fpv_video, reject:true } });
-  await loadResults(); $('review-state').textContent = 'Segment rejected'; message('viewer-message', 'This FPV segment is unmatched. Other saved segments for this StickCam are kept.');
+  state.pair.reviewed = false; $('export-pair').disabled = true; await loadResults(); $('review-state').textContent = 'Segment rejected'; message('viewer-message', 'This FPV segment is unmatched. Other saved segments for this StickCam are kept.');
 }, 'viewer-message');
 
 function renderRelatedSegments() {
@@ -1353,12 +1467,12 @@ function renderExports() {
 }
 async function requestExport(pairs) {
   const id = state.job.id, token = state.jobToken;
-  const result = await api(`/api/jobs/${id}/exports`, { method: 'POST', json: { pairs, fps: Number($('export-fps').value), profile: $('export-profile').value } });
+  const result = await api(`/api/jobs/${id}/exports`, { method: 'POST', json: { pairs, fps: Number($('export-fps').value), profile: $('export-profile').value, stabilize_radio: $('export-radio-framing').value === 'stabilized' } });
   if (token !== state.jobToken) return;
   state.job.exports ||= []; if (!state.job.exports.some(item => item.id === result.id)) state.job.exports.push({ id: result.id, status: 'queued', message: 'Preparing aligned clips' }); renderExports();
   openPanel('exports-panel'); $('exports-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
-$('export-pair').onclick = guarded(async () => { const saved = await saveAlignment(); if (saved) await requestExport([{ radio_video: saved.radio_video, fpv_video: saved.fpv_video, offset_seconds: saved.offset_seconds }]); }, 'viewer-message');
+$('export-pair').onclick = guarded(async () => { const pair = state.pair; if (!pair?.reviewed || Math.abs(Number($('review-offset').value) - pair.offset_seconds) > 1e-7) throw new Error('Save the current alignment before exporting.'); await requestExport([{radio_video:pair.radio_video, fpv_video:pair.fpv_video, offset_seconds:pair.offset_seconds}]); }, 'viewer-message');
 $('export-batch').onclick = guarded(async () => {
   const pairs = state.results.rows.filter(row => row.global_assignment && row.reviewed).map(row => ({ radio_video: row.radio_video, fpv_video: row.fpv_video, offset_seconds: row.offset_seconds }));
   if (pairs.length) await requestExport(pairs);
@@ -1466,7 +1580,7 @@ async function loadMotionSignals() {
           show('motion-charts'); renderMotionLegends(); updateMotionWindowFields(); drawMotion();
           message('motion-message', result.warnings.join(' ') || 'Signals ready. Compare manoeuvres and inspect the timing.');
           $('motion-fpv-title').textContent = result.fpv_label;
-          $('motion-radio-title').textContent = result.radio_available ? `StickCam · ${result.rate_profile ? 'requested rates + throttle position' : 'detected stick positions'}` : 'StickCam · no calibrated motion';
+          $('motion-radio-title').textContent = result.radio_available ? `StickCam · Mode ${result.stick_mode || 2} · ${result.rate_profile ? 'requested rates + throttle position' : 'detected stick positions'}` : 'StickCam · no calibrated motion';
           message('motion-note', result.fpv_note + ' Normalisation scales each trace by its full-recording 95th percentile; colours do not imply sensor-to-drone axis calibration.');
           if (motion.autoPreview) { motion.autoPreview = false; $('motion-preview-load').click(); }
           if ($('motion-audio-toggle').checked) loadAudioReview().catch(error => message('motion-audio-message', error.message, true));
@@ -1766,13 +1880,18 @@ $('motion-audio-toggle').onchange = guarded(async () => {
 }, 'motion-audio-message');
 
 function readMotionSettings() {
-  return { stick_sampling_ratio: readStickSamplingRatio(), motion_source: $('use-fpv-gyro').checked ? ($('use-fpv-visual').checked ? 'auto' : 'gyro') : 'visual', camera_uptilt_deg: Number($('camera-uptilt-deg').value), imu_orientation: $('imu-orientation').value, gyro_video_offset: Number($('gyro-video-offset').value), decode_mode: $('decode-mode').value };
+  return { visual_camera: readVisualCamera(), fpv_sampling_mode: $('fpv-preparation-mode').value, fpv_visual_fps: Number($('fpv-preparation-fps').value), stick_sampling_ratio: readStickSamplingRatio(), motion_source: $('use-fpv-gyro').checked ? ($('use-fpv-visual').checked ? 'auto' : 'gyro') : 'visual', camera_uptilt_deg: Number($('camera-uptilt-deg').value), imu_orientation: $('imu-orientation').value, gyro_video_offset: Number($('gyro-video-offset').value), decode_mode: $('decode-mode').value };
 }
 function sectionsText(value) {
-  if (value?.motion_included === false) return 'Motion comparison was not used for this pair.';
-  if (!value || value.usable_sections === undefined) return 'Load signals or rerun analysis to calculate section agreement.';
-  return `${value.correlated_sections}/${value.usable_sections} usable ${value.section_seconds}s sections correlate (${Math.round(value.section_agreement * 100)}% agreement). Requires ≥0.60 correlation on at least two active axes, using a fixed timing offset and polarity. Quiet sections and tracking gaps are excluded. This is evidence support, not a match probability.`;
+  if (!value) return 'Load signals or rerun matching to inspect section agreement.';
+  const notes=[];
+  if (value.audio_usable_sections != null) notes.push(`Audio: ${value.audio_correlated_sections}/${value.audio_usable_sections} usable 3-second sections agree; ${value.audio_joint_sections || 0} have both landmarks and trends.`);
+  if (value.motion_included === false) notes.push('Motion comparison was skipped for this pair.');
+  else if (value.usable_sections !== undefined) notes.push(`Motion: ${value.correlated_sections}/${value.usable_sections} usable ${value.section_seconds || 3}-second sections correlate (${Math.round((value.section_agreement || 0)*100)}% agreement). Quiet sections and tracking gaps are excluded.`);
+  if (value.review_reasons?.length) notes.push(value.review_reasons.join(' '));
+  return notes.join(' ') + ' Section agreement is supporting evidence, not a match probability.';
 }
+
 function pauseMotionPreview() {
   motionPreview.playing = false; cancelAnimationFrame(motionPreview.frame);
   for (const kind of ['radio', 'fpv']) { $(`motion-preview-${kind}`).pause(); $(`motion-preview-${kind}`).playbackRate = 1; }
@@ -1781,8 +1900,8 @@ function pauseMotionPreview() {
 function resetMotionPreview() {
   pauseMotionPreview(); motionPreview.token++; motionPreview.pair = null; motionPreview.pending = false;
   for (const kind of ['radio', 'fpv']) { const video = $(`motion-preview-${kind}`); releasePreview(video); video.removeAttribute('src'); video.load(); }
-  show('motion-preview-media', false); $('motion-preview-load').disabled = true;
-  message('motion-preview-message', 'Choose both recordings and load their signals to enable a synced preview.');
+  show('motion-preview-media', false); $('motion-preview-load').disabled = !state.job;
+  message('motion-preview-message', 'Choose both recordings to preview them. Motion extraction is optional.');
 }
 function updateMotionPreviewOffset() {
   if (!motionPreview.pair) return;
@@ -1802,12 +1921,14 @@ function seekMotionPreview(at) {
   $('motion-preview-seek').value = value; message('motion-preview-time', `${time(value, true)} / ${time(pair.duration)}`);
   motion.cursor = pair.radio_start + value; drawMotion();
 }
-$('motion-preview-load').onclick = guarded(async () => {
-  if (!motion.data?.radio_video) throw new Error('Choose both recordings and load their signals first.');
+async function previewSelectedVideos() {
+  const fpvName = $('motion-fpv').value, radioName = $('motion-radio').value;
+  if (!fpvName || !radioName) throw new Error('Choose both recordings.');
   pausePair(); $('radio-stabilize-video').pause(); pauseMotionPreview();
   const token = ++motionPreview.token, chartToken = motion.token, jobToken = state.jobToken;
   const current = () => token === motionPreview.token && chartToken === motion.token && jobToken === state.jobToken;
-  const names = { radio: motion.data.radio_video, fpv: motion.data.fpv_video };
+  openPanel("motion-panel"); show("motion-charts");
+  const names = { radio: radioName, fpv: fpvName };
   $('motion-preview-load').disabled = true; message('motion-preview-message', 'Loading synced videos…');
   try {
     const [r, f] = await Promise.all(['radio', 'fpv'].map(kind => api(path(`/metadata/${kind}/${part(names[kind])}`))));
@@ -1818,7 +1939,8 @@ $('motion-preview-load').onclick = guarded(async () => {
     $('motion-preview-fpv-label').textContent = `FPV · ${names.fpv}`; $('motion-preview-radio-label').textContent = `StickCam · ${names.radio}`;
     show('motion-preview-media'); updateMotionPreviewOffset(); seekMotionPreview(0); applyMotionPreviewAudio();
   } finally { if (current()) $('motion-preview-load').disabled = false; }
-}, 'motion-preview-message');
+}
+$('motion-preview-load').onclick = guarded(previewSelectedVideos, 'motion-preview-message');
 function applyMotionPreviewAudio() {
   for (const kind of ['radio', 'fpv']) $(`motion-preview-${kind}`).muted = $('motion-preview-audio').value !== kind;
 }
@@ -1983,14 +2105,14 @@ async function refreshStickData(force = false) {
   const list = $('stick-data-rows'); list.replaceChildren();
   for (const clip of result.clips) {
     const row = el('tr'), status = el('td', clip.sampling_error || stickStatusLabel(clip.status));
-    if (clip.status === 'cached') status.className = 'cache-ready';
+    if (clip.status === 'cached') { status.className = 'cache-ready'; if (clip.usable_percent !== undefined) status.append(el('small',` · ${clip.usable_percent}% jointly observed${clip.quality_warning ? ' · inspect tracking' : ''}`)); }
     row.append(el('td', clip.name), status,
       el('td', `${Number.isFinite(clip.source_fps) ? `${rateText(clip.source_fps)} fps → ` : ''}${Number.isFinite(clip.requested_fps) ? `${rateText(clip.requested_fps)} Hz requested` : 'Rate unavailable'}${clip.samples !== undefined ? ` · ${clip.samples.toLocaleString()} saved samples at ${rateText(clip.sample_fps)} Hz` : ''}${clip.range ? ` · ${time(clip.range[0], true)}–${time(clip.range[1], true)}` : ''}`),
       el('td', derivationTimeLabel(clip.last_derivation)),
       el('td', clip.cached_at ? new Date(clip.cached_at * 1000).toLocaleString() : '—'));
     list.append(row);
   }
-  renderVideoLists();
+  renderVideoLists(); renderWorkflow();
   const active = result.tasks.find(task => ['queued', 'running'].includes(task.status));
   if (active && (!stickPreparation.running || stickPreparation.jobId !== jobId || stickPreparation.task !== active.id)) watchStickPreparation(active.id, jobId, jobToken);
   if (!active && !stickPreparation.running) {
@@ -2071,7 +2193,7 @@ for (const id of ['sample-fps', 'stick-sampling-ratio']) $(id).onchange = guarde
 
 function updateFPVPreparationUI() {
   const busy = activeAnalysis() || fpvPreparation.running || stickPreparation.running;
-  for (const id of ['fpv-check-all', 'fpv-derive-all', 'fpv-select-eligible', 'fpv-preparation-fps', 'fpv-preparation-decode']) $(id).disabled = busy;
+  for (const id of ['fpv-check-all', 'fpv-derive-all', 'fpv-select-eligible', 'fpv-preparation-mode', 'fpv-preparation-fps', 'fpv-preparation-decode']) $(id).disabled = busy;
   for (const id of ['fpv-check-selected', 'fpv-derive-selected']) $(id).disabled = busy || !fpvPreparation.selected.size;
   $('fpv-selection-count').textContent = `${fpvPreparation.selected.size} selected`;
   $('analyze').disabled = busy || !state.job || Object.values(state.job.inputs).flat().some(r => r.uploaded !== r.size);
@@ -2087,7 +2209,7 @@ function embeddedMotionLabel(data) {
 function renderFPVData() {
   const result = state.fpvData;
   if (!result || !state.job) return;
-  $('fpv-data-count').textContent = `${result.embedded} embedded · ${result.cached} visual caches at ${rateText(result.sample_fps)} Hz`;
+  $('fpv-data-count').textContent = `${result.embedded} embedded · ${result.cached} visual caches at requested rates`;
   const list = $('fpv-data-rows'); list.replaceChildren();
   for (const clip of result.clips) {
     const record = state.job.inputs.fpv.find(r => r.name === clip.name);
@@ -2101,14 +2223,12 @@ function renderFPVData() {
     if (clip.embedded.status === 'available') embedded.className = 'cache-ready';
     const visual = clip.visual, status = el('td', {cached:'Derived · saved', other_rate:'Saved at another rate', not_derived:'Not derived', unavailable:'Source or cache unavailable'}[visual.status] || visual.status);
     if (visual.status === 'cached') status.className = 'cache-ready';
-    const details = el('td', visual.samples !== undefined ? `${visual.samples.toLocaleString()} samples · ${rateText(visual.sample_fps)} Hz · ${visual.usable_percent}% usable tracking${visual.range ? ` · ${time(visual.range[0])}–${time(visual.range[1])}` : ''}` : '—');
+    const requested = `${Number.isFinite(clip.source_fps) ? `${rateText(clip.source_fps)} fps → ` : ''}${Number.isFinite(clip.requested_fps) ? `${rateText(clip.requested_fps)} Hz requested` : 'Detecting frame rate…'}`;
+    const details = el('td', `${requested}${visual.samples !== undefined ? ` · ${visual.samples.toLocaleString()} saved samples at ${rateText(visual.sample_fps)} Hz · ${visual.usable_percent}% usable tracking${visual.range ? ` · ${time(visual.range[0])}–${time(visual.range[1])}` : ''}` : ''}`);
     const elapsed = visual.extraction_seconds != null ? `${Number(visual.extraction_seconds).toFixed(2)} s extraction` : clip.last_preparation ? `${clip.last_preparation.status} · ${Number(clip.last_preparation.elapsed_seconds || 0).toFixed(2)} s` : 'Not recorded';
     const inspect = el('td');
-    if (visual.status === 'cached') {
-      const button = action('View motion', guarded(async () => {
-        resetMotionReview(); $('motion-fpv').value = clip.name; $('motion-radio').value = ''; $('motion-source').value = 'visual';
-        $('motion-panel').scrollIntoView({behavior:'smooth', block:'start'}); await loadMotionSignals();
-      }, 'fpv-data-message'));
+    if (['cached', 'other_rate'].includes(visual.status)) {
+      const button = action('Review video + motion', guarded(() => openFPVVisualReview(clip.name, visual.sample_fps), 'fpv-data-message'));
       button.disabled = fpvPreparation.running; inspect.append(button);
     }
     row.append(selectCell, el('td', clip.name), el('td', clipDuration(record)), embedded, status, details, el('td', elapsed), inspect);
@@ -2118,12 +2238,12 @@ function renderFPVData() {
 }
 async function refreshFPVData(force = false) {
   if (!state.job || state.job.inputs.fpv.some(r => r.uploaded !== r.size)) return;
-  const jobId = state.job.id, jobToken = state.jobToken, fps = Number($('sample-fps').value);
-  const key = `${jobId}:${fps}`;
+  const jobId = state.job.id, jobToken = state.jobToken, fps = Number($('fpv-preparation-fps').value), mode = $('fpv-preparation-mode').value;
+  const key = `${jobId}:${mode}:${fps}`;
   if (!force && key === fpvPreparation.key && Date.now() - fpvPreparation.refreshed < 3000) return;
   fpvPreparation.key = key; fpvPreparation.refreshed = Date.now();
-  $('fpv-preparation-fps').value = fps; $('fpv-preparation-decode').value = $('decode-mode').value;
-  const result = await api(`/api/jobs/${jobId}/fpv-data?${new URLSearchParams({sample_fps:fps})}`);
+  $('fpv-preparation-decode').value = $('decode-mode').value;
+  const result = await api(`/api/jobs/${jobId}/fpv-data?${new URLSearchParams({sample_fps:fps,sampling_mode:mode})}`);
   if (jobToken !== state.jobToken || key !== fpvPreparation.key) return;
   state.fpvData = result; renderFPVData();
   const active = result.tasks.find(task => ['queued','running'].includes(task.status));
@@ -2171,13 +2291,12 @@ function watchFPVPreparation(task, jobId, jobToken) {
 }
 async function startFPVPreparation(action, selected) {
   const jobId = state.job.id, jobToken = state.jobToken;
-  const fps = Number($('fpv-preparation-fps').value), decode = $('fpv-preparation-decode').value;
+  const fps = Number($('fpv-preparation-fps').value), mode = $('fpv-preparation-mode').value, decode = $('fpv-preparation-decode').value;
   const task = await api(`/api/jobs/${jobId}/prepare-fpv`, {method:'POST', json:{action, sample_fps:fps, decode_mode:decode,
+    sampling_mode:mode, visual_camera:readVisualCamera(), camera_uptilt_deg:Number($('camera-uptilt-deg').value),
     ...(selected ? {names:[...fpvPreparation.selected]} : {})}});
   if (jobToken !== state.jobToken) return;
-  $('sample-fps').value = fps; $('decode-mode').value = decode; state.job.settings.sample_fps = fps;
-  if (Number($('match-fps').value) > fps) $('match-fps').value = fps;
-  updateStickSamplingPreview(); refreshStickData(true).catch(error => message('stick-data-message', error.message, true));
+  $('decode-mode').value = decode; state.job.settings.fpv_visual_fps = fps; state.job.settings.fpv_sampling_mode = mode; state.job.settings.visual_camera = readVisualCamera(); state.job.settings.camera_uptilt_deg = Number($('camera-uptilt-deg').value);
   watchFPVPreparation(task.id, jobId, jobToken);
 }
 for (const [id, action, selected] of [['fpv-check-all','check',false], ['fpv-check-selected','check',true], ['fpv-derive-all','derive',false], ['fpv-derive-selected','derive',true]])
@@ -2190,14 +2309,112 @@ $('fpv-clear-selection').onclick = () => { fpvPreparation.selected.clear(); rend
 $('fpv-preparation-cancel').onclick = guarded(async () => {
   if (fpvPreparation.task) await api(`/api/jobs/${fpvPreparation.jobId}/motion-review/${fpvPreparation.task}/cancel`, {method:'POST'});
 }, 'fpv-data-message');
-$('fpv-preparation-fps').onchange = guarded(async () => {
-  $('sample-fps').value = $('fpv-preparation-fps').value;
-  if (Number($('match-fps').value) > Number($('sample-fps').value)) $('match-fps').value = $('sample-fps').value;
-  resetMotionReview(); updateStickSamplingPreview();
-  await refreshFPVData(true); await refreshStickData(true);
+function readVisualCamera() { return {horizontal_fov_deg:Number($('visual-horizontal-fov').value), projection:$('visual-projection').value}; }
+for (const id of ['visual-horizontal-fov','visual-projection']) $(id).onchange = guarded(async () => {
+  const token = state.jobToken;
+  const result = await api(path('/visual-camera'), {method:'PUT', json:readVisualCamera()});
+  if (token !== state.jobToken) return;
+  state.job.settings.visual_camera = result.visual_camera;
+  resetFPVVisualReview(); resetMotionReview(); await refreshFPVData(true);
+  message('visual-camera-message', 'Lens approximation saved. Existing caches from different geometry are retained; derive again to use these settings.');
+}, 'visual-camera-message');
+function updateFPVSamplingUI() { show('fpv-preparation-custom', $('fpv-preparation-mode').value === 'custom'); }
+for (const id of ['fpv-preparation-fps', 'fpv-preparation-mode']) $(id).onchange = guarded(async () => {
+  updateFPVSamplingUI(); resetMotionReview(); await refreshFPVData(true);
 }, 'fpv-data-message');
 $('fpv-preparation-decode').onchange = () => { $('decode-mode').value = $('fpv-preparation-decode').value; };
 $('decode-mode').addEventListener('change', () => { $('fpv-preparation-decode').value = $('decode-mode').value; });
+
+// Playback inspection reads the saved cache directly and cannot trigger extraction.
+function resetFPVVisualReview() {
+  fpvVisualReview.token++; fpvVisualReview.windowToken++; fpvVisualReview.data = null;
+  fpvVisualReview.name = null; fpvVisualReview.pending = false;
+  cancelAnimationFrame(fpvVisualReview.frame);
+  const video = $('fpv-visual-review-video'); video.pause(); releasePreview(video); video.removeAttribute('src'); video.load();
+  show('fpv-visual-review', false);
+}
+async function openFPVVisualReview(name, fps) {
+  resetFPVVisualReview(); const token = fpvVisualReview.token, jobToken = state.jobToken;
+  fpvVisualReview.name = name; fpvVisualReview.fps = fps;
+  const current = () => token === fpvVisualReview.token && jobToken === state.jobToken;
+  show('fpv-visual-review'); $('fpv-visual-review-title').textContent = name;
+  message('fpv-visual-review-message', 'Reading saved visual estimates…');
+  const metadata = await api(path(`/metadata/fpv/${part(name)}`));
+  if (!current()) return;
+  fpvVisualReview.duration = metadata.duration;
+  $('fpv-visual-review-seek').max = Math.max(0, metadata.duration - 1 / (metadata.fps || 30));
+  $('fpv-visual-review-seek').value = 0;
+  await refreshFPVVisualWindow(0);
+  if (!current()) return;
+  $('fpv-visual-review').scrollIntoView({behavior:'smooth', block:'start'});
+  await loadVideo($('fpv-visual-review-video'), 'fpv', name, current, 'fpv-visual-review-message', false, 0);
+  if (!current()) return;
+  message('fpv-visual-review-message', `Saved ${rateText(fps)} Hz angular estimates · ${fpvVisualReview.data.usable_percent}% usable rotation tracking · FOV ${fpvVisualReview.data.visual_camera?.horizontal_fov_deg}° · camera uptilt ${fpvVisualReview.data.camera_uptilt_deg}°. Approximate lens geometry; compare the estimated Roll/Pitch/Yaw with playback.`);
+  syncFPVVisualPlayback();
+}
+async function refreshFPVVisualWindow(at = $('fpv-visual-review-video').currentTime) {
+  if (!fpvVisualReview.name || !state.job) return;
+  const token = fpvVisualReview.token, jobToken = state.jobToken, windowToken = ++fpvVisualReview.windowToken;
+  const width = Number($('fpv-visual-review-window').value) || fpvVisualReview.duration;
+  const start = Math.max(0, Math.min(at - width * .25, fpvVisualReview.duration - width));
+  const end = Math.min(fpvVisualReview.duration, start + width);
+  if (!(end > start)) return;
+  fpvVisualReview.pending = true;
+  try {
+    const query = new URLSearchParams({sample_fps:fpvVisualReview.fps, start, end});
+    const data = await api(path(`/fpv-data/${part(fpvVisualReview.name)}/visual?${query}`));
+    if (token !== fpvVisualReview.token || jobToken !== state.jobToken || windowToken !== fpvVisualReview.windowToken) return;
+    fpvVisualReview.data = data; drawFPVVisualReview();
+  } finally { if (windowToken === fpvVisualReview.windowToken) fpvVisualReview.pending = false; }
+}
+function drawFPVVisualReview() {
+  const data = fpvVisualReview.data, canvas = $('fpv-visual-review-canvas'); if (!data) return;
+  const rect = canvas.getBoundingClientRect(); if (!rect.width) return;
+  const ratio = devicePixelRatio || 1; canvas.width = Math.round(rect.width * ratio); canvas.height = Math.round(rect.height * ratio);
+  const ctx = canvas.getContext('2d'); ctx.scale(ratio, ratio);
+  const left = 65, right = rect.width - 18, [start,end] = data.window, at = $('fpv-visual-review-video').currentTime;
+  const x = value => left + (value - start) / (end - start) * (right - left);
+  const laneHeight = (rect.height - 30) / data.traces.length;
+  ctx.font = '11px system-ui';
+  for (const [index, trace] of data.traces.entries()) {
+    const top = index * laneHeight + 27, bottom = (index + 1) * laneHeight - 12, middle = (top + bottom) / 2;
+    let maximum = 1e-6;
+    for (const [, value] of trace.points) if (value !== null) maximum = Math.max(maximum, Math.abs(value));
+    maximum *= 1.1;
+    const y = value => middle - value / maximum * (bottom - top) / 2;
+    ctx.fillStyle = '#a8aec9'; ctx.fillText(`${trace.label} · ${trace.unit}`, left, top - 9);
+    ctx.strokeStyle = '#ffffff18';
+    for (const v of [-maximum,0,maximum]) { ctx.beginPath(); ctx.moveTo(left,y(v)); ctx.lineTo(right,y(v)); ctx.stroke(); ctx.fillText(v.toFixed(Math.abs(v) < 10 ? 2 : 0),2,y(v)+4); }
+    ctx.save(); ctx.beginPath(); ctx.rect(left,top,right-left,bottom-top); ctx.clip();
+    ctx.strokeStyle = ['#fbc35c','#b794ff','#62d9e5'][index]; ctx.lineWidth = 1.4; ctx.beginPath(); let pen = false;
+    for (const [t,value] of trace.points) { if (value === null) { pen = false; continue; } if (pen) ctx.lineTo(x(t),y(value)); else ctx.moveTo(x(t),y(value)); pen = true; }
+    ctx.stroke();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x(at),top); ctx.lineTo(x(at),bottom); ctx.stroke(); ctx.restore();
+    if (!trace.points.some(p=>p[1] !== null)) { ctx.fillStyle = '#a8aec9'; ctx.fillText('Tracking unavailable in this window',left+8,middle); }
+  }
+  ctx.fillStyle = '#a8aec9'; for (let i=0;i<=5;i++) { const t=start+(end-start)*i/5; ctx.fillText(time(t),Math.min(x(t)-9,right-38),rect.height-7); }
+  $('fpv-visual-review-position').textContent = `${time(at,true)} / ${time(fpvVisualReview.duration)} · ${time(start)}–${time(end)} shown`;
+}
+function syncFPVVisualPlayback() {
+  if (!fpvVisualReview.data) return;
+  const video = $('fpv-visual-review-video'), at = video.currentTime, [start,end] = fpvVisualReview.data.window;
+  $('fpv-visual-review-seek').value = at; drawFPVVisualReview();
+  if ($('fpv-visual-review-follow').checked && !fpvVisualReview.pending && (at < start || at > end - .1) && at < fpvVisualReview.duration - .1)
+    refreshFPVVisualWindow(at).catch(error=>message('fpv-visual-review-message',error.message,true));
+}
+function animateFPVVisualReview() {
+  syncFPVVisualPlayback(); if (!$('fpv-visual-review-video').paused && fpvVisualReview.name) fpvVisualReview.frame = requestAnimationFrame(animateFPVVisualReview);
+}
+$('fpv-visual-review-video').addEventListener('play',()=>{cancelAnimationFrame(fpvVisualReview.frame); animateFPVVisualReview();});
+for (const event of ['timeupdate','seeked','pause']) $('fpv-visual-review-video').addEventListener(event,syncFPVVisualPlayback);
+$('fpv-visual-review-close').onclick = resetFPVVisualReview;
+$('fpv-visual-review-window').onchange = guarded(()=>refreshFPVVisualWindow(),'fpv-visual-review-message');
+$('fpv-visual-review-follow').onchange = syncFPVVisualPlayback;
+function seekFPVVisual(at) { const video=$('fpv-visual-review-video'); video.pause(); video.currentTime=Math.max(0,Math.min(at,Number($('fpv-visual-review-seek').max))); syncFPVVisualPlayback(); }
+$('fpv-visual-review-seek').oninput = ()=>seekFPVVisual(Number($('fpv-visual-review-seek').value));
+$('fpv-visual-review-canvas').onclick = event=>{if(!fpvVisualReview.data)return;const rect=event.currentTarget.getBoundingClientRect(),[a,b]=fpvVisualReview.data.window;seekFPVVisual(a+Math.max(0,Math.min(1,(event.clientX-rect.left-65)/(rect.width-83)))*(b-a));};
+$('fpv-visual-review-canvas').onkeydown = event=>{if(['ArrowLeft','ArrowRight'].includes(event.key)){event.preventDefault();seekFPVVisual($('fpv-visual-review-video').currentTime+(event.key==='ArrowRight'?1:-1));}};
+new ResizeObserver(drawFPVVisualReview).observe($('fpv-visual-review-canvas'));
 
 let ratePresets = { presets: {}, default: null };
 async function loadRatePresets(selected = '') {
@@ -2331,3 +2548,63 @@ $('confirm-delete-session').onclick = guarded(async () => {
   state.uploadController?.abort(); clearSession(); await history();
   message('session-message', 'Session deleted from the frontend. Exports and source footage were kept; use Deleted sessions to restore.');
 }, 'session-message');
+
+
+// A single main path; technical tools and evidence remain available on demand.
+function renderWorkflow() {
+  if (!state.job) return;
+  const job = state.job, rows = state.results?.rows || [], proposed = rows.filter(r => r.global_assignment && !r.rejected), reviewed = rows.filter(r => r.reviewed && !r.rejected);
+  const ready = Object.values(job.inputs).flat().every(r => r.uploaded === r.size);
+  const running = activeAnalysis() || stickPreparation.running || fpvPreparation.running;
+  $('workflow-title').textContent = job.label;
+  $('workflow-stats').replaceChildren(...[[job.inputs.fpv.length,'FPV files'],[job.inputs.radio.length,'StickCam files'],[proposed.length,'proposed pairs'],[reviewed.length,'confirmed alignments']].map(([count,label]) => {const tile=el('div',undefined,'workflow-stat');tile.append(el('strong',String(count)),el('span',label));return tile;}));
+  $('workflow-find').disabled = !ready || running || (!evidenceMode().motion && !evidenceMode().audio);
+  $('workflow-find').textContent = state.results ? 'Find / refine matches · reuse saved data' : 'Find matching flights';
+  $('workflow-review').disabled = !proposed.some(r => !r.reviewed);
+  $('workflow-calibrate').disabled = !ready || running;
+  show('workflow-cancel', activeAnalysis()); show('workflow-progress', activeAnalysis()); $('workflow-progress').value = job.progress?.percent || 0;
+  let advice = !ready ? 'Finish uploading your recordings first.' : running ? job.message : !state.results ? 'Start automatic matching. Audio is tried before motion; calibration is only needed for unresolved flights.' : proposed.some(r => !r.reviewed) ? 'Review a proposed pair, check its shared events and timing, then confirm the alignment.' : reviewed.length ? `${reviewed.length} confirmed alignment(s) ready for export or the portrait editor. Unresolved clips can be examined below.` : 'No pair is confirmed. Inspect the exceptions and evidence; uncertain results stay available for review.';
+  if (state.results && job.status !== 'complete') advice += ' Last completed results remain available while this run is pending, cancelled or failed.';
+  const activeClips = job.progress?.active_clips || []; if (running && activeClips.length) advice += ' ' + activeClips.map(c=>`${c.name}: ${Number(c.percent || c.fraction * 100 || 0).toFixed(1)}%${c.eta_seconds == null ? '' : ` · about ${time(c.eta_seconds)} remaining`}`).join(' · ');
+  message('workflow-message', advice, job.status === 'failed');
+  const exceptions = [], workflow = state.results?.workflow || {};
+  for (const item of workflow.unavailable_sources || []) exceptions.push({text:`${item.name}: ${item.reason}`,action:'Check sources',run:checkSources});
+  const calibrationNames = [...(workflow.needs_calibration || [])];
+  for (const name of job.inputs.radio.filter(r=>job.calibrations[r.name]?.source_changed).map(r=>r.name)) if (!calibrationNames.includes(name)) calibrationNames.push(name);
+  for (const name of calibrationNames) if (!calibrated(job.calibrations[name])) exceptions.push({text:`${name}: motion fallback needs a confirmed calibration. Audio remains available.`,action:'Calibrate',run:() => loadCalibration(name)});
+  for (const clip of state.stickData?.clips || []) if (clip.quality_warning) exceptions.push({text:`${clip.name}: ${clip.quality_warning}`,action:'Inspect calibration',run:() => loadCalibration(clip.name)});
+  for (const row of rows.filter(r => r.review_invalidated)) exceptions.push({text:`${row.fpv_video}: ${row.review_reason}`,action:'Review again',run:() => openPair(row.radio_video,row.fpv_video,row.saved_offset_seconds)});
+  for (const name of state.results?.unmatched_fpv || []) exceptions.push({text:`${name}: no confirmed content match. Review candidate evidence or refine the unresolved set.`,action:'Candidates',run:() => {openPanel('results-panel'); $('results-panel').scrollIntoView({behavior:'smooth'});}});
+  $('workflow-exception-count').textContent = String(exceptions.length);
+  $('workflow-exception-list').replaceChildren(...exceptions.map(item => {const row=el('div',undefined,'workflow-exception');row.append(el('span',item.text),action(item.action,guarded(item.run,'workflow-message')));return row;}));
+  if (!exceptions.length) $('workflow-exception-list').append(el('p',state.results ? 'No outstanding exceptions reported by the last run.' : 'Matching will report unreadable sources, calibration needs and uncertain results here.','hint'));
+  message('source-summary', Object.entries(job.source_folders || {}).map(([kind,roots]) => `${kind==='radio'?'StickCam':'FPV'}: ${roots.join(', ')}`).join(' · ')); show('source-relink',job.source==='local');
+}
+function setTechnicalTools(enabled) { $('technical-tools').checked=enabled;document.body.classList.toggle('show-technical',enabled);localStorage.setItem('fpv-technical-tools',enabled?'1':'0'); }
+setTechnicalTools(localStorage.getItem('fpv-technical-tools')==='1');
+$('technical-tools').onchange=()=>setTechnicalTools($('technical-tools').checked);
+$('matching-strategy').onchange=()=>{if ($('matching-strategy').value==='selected'){setTechnicalTools(true);openPanel('analysis-panel');}renderWorkflow();};
+$('workflow-review').onclick=guarded(async()=>{const row=(state.results?.rows||[]).filter(r=>r.global_assignment&&!r.reviewed&&!r.rejected).sort((a,b)=>(b.confidence==='strong')-(a.confidence==='strong') || b.combined_score-a.combined_score)[0];if(row)await openPair(row.radio_video,row.fpv_video);},'workflow-message');
+$('workflow-calibrate').onclick=guarded(async()=>{const pending=state.job.inputs.radio.find(r=>!calibrated(state.job.calibrations[r.name]));const name=pending?.name || $('calibration-clip').value,proposal=calibrationScan.rows.find(r=>r.name===name&&!r.confirmed&&r.calibration);if(proposal)await openCalibrationProposal(proposal);else await loadCalibration(name);$('calibration-panel').scrollIntoView({behavior:'smooth'});},'workflow-message');
+$('workflow-scope').onclick=()=>{openPanel('video-list-panel');$('video-list-panel').scrollIntoView({behavior:'smooth'});};
+$('workflow-cancel').onclick=()=>$('cancel-analysis').click();
+async function checkSources(){message('source-message','Checking source files…');const token=state.jobToken,result=await api(path('/sources'));if(token!==state.jobToken)return;$('source-status').replaceChildren(...result.clips.map(r=>el('p',`${r.kind==='radio'?'StickCam':'FPV'} · ${r.name} · ${r.status}${r.reason ? ` · ${r.reason}`:''}`,r.status==='ready'?'hint':'error')));$('session-sources').open=true;message('source-message',`${result.clips.filter(r=>r.status==='ready').length}/${result.clips.length} source files ready.`);}
+$('source-check').onclick=guarded(checkSources,'source-message');
+$('relink-source').onclick=guarded(async()=>{const id=state.job.id,result=await api(path('/sources'),{method:'PUT',json:{kind:$('relink-kind').value,path:$('relink-path').value}});await selectJob(id);$('session-sources').open=true;message('source-message',`${result.relinked} existing files relinked. ${result.missing.length} filenames not found; their previous paths are kept.`);await checkSources();},'source-message');
+function calibrationDraftKey(name){return `fpv-calibration-draft:${state.job?.id}:${name}`;}
+$('discard-calibration-draft').onclick=guarded(async()=>{const name=state.calibrationName;localStorage.removeItem(calibrationDraftKey(name));delete state.calibrationDrafts[name];state.calibration=null;await loadCalibration(name);},'calibration-message');
+let calibrationDraftTimer=null;
+$('calibration-panel').addEventListener('input',()=>{clearTimeout(calibrationDraftTimer);calibrationDraftTimer=setTimeout(rememberCalibrationDraft,200);});
+$('calibration-panel').addEventListener('toggle', guarded(async () => {
+  if ($('calibration-panel').open && !calibrationLoad) await ensureCalibrationLoaded();
+}, 'calibration-message'));
+window.addEventListener('pagehide',rememberCalibrationDraft);
+$('prepare-stabilization').onclick=guarded(async()=>{if(!state.pair)return;const pair=state.pair,name=pair.radio_video,config=state.job.calibrations[name];if(!config?.radio_outline||config.skip_motion||config.exclude){await loadCalibration(name);throw new Error('Save a clear radio outline and both tips, then prepare this clip.');}const jobId=state.job.id,jobToken=state.jobToken,task=await api(path('/derive-sticks'),{method:'POST',json:{radio_names:[name],sample_fps:Number($('sample-fps').value),stick_sampling_ratio:readStickSamplingRatio(),decode_mode:$('decode-mode').value}});openPanel('calibration-panel');watchStickPreparation(task.id,jobId,jobToken);message('viewer-message','Preparing saved outline data for this StickCam only. When complete, choose Centered & level and export. Unsafe or lost-outline intervals retain original framing.');},'viewer-message');
+
+// Audio review is independent of optical motion and calibration.
+let pairAudioToken=0, pairAudioData=null;
+function drawPairAudio(){if(!pairAudioData||!state.pair)return;for(const kind of ['fpv','radio']){const canvas=$(`pair-audio-${kind}`),rect=canvas.getBoundingClientRect(),ratio=devicePixelRatio||1;if(!rect.width)continue;canvas.width=rect.width*ratio;canvas.height=rect.height*ratio;const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const [start,end]=pairAudioData.window,left=45,right=rect.width-15,top=12,bottom=rect.height-25,center=(top+bottom)/2,x=t=>left+(t-start)/(end-start)*(right-left);ctx.fillStyle='#72cf6b22';for(const w of pairAudioData.sections?.windows||[])if(w.matched)ctx.fillRect(x(w.start),top,x(w.end)-x(w.start),bottom-top);ctx.strokeStyle='#90baff';for(const [t,low,high] of pairAudioData[kind]?.points||[]){ctx.beginPath();ctx.moveTo(x(t),center-low*(bottom-top)/2);ctx.lineTo(x(t),center-high*(bottom-top)/2);ctx.stroke();}ctx.fillStyle='#a8aec9';ctx.font='11px system-ui';for(let i=0;i<=5;i++){const t=start+(end-start)*i/5;ctx.fillText(time(t,true),Math.min(x(t),right-48),rect.height-7);}if(!pairAudioData[kind]?.available)ctx.fillText('No audio track',left,center);}}
+$('pair-audio-toggle').onchange=guarded(async()=>{const enabled=$('pair-audio-toggle').checked;show('pair-audio-charts',enabled);const token=++pairAudioToken,viewerToken=state.viewerToken;if(!enabled||!state.pair)return;const pair=state.pair;pairAudioData=null;message('pair-audio-message','Reading cached audio waveforms…');const task=await api(path('/audio-review'),{method:'POST',json:{fpv_video:pair.fpv_video,radio_video:pair.radio_video}});while(token===pairAudioToken&&viewerToken===state.viewerToken&&$('pair-audio-toggle').checked){const query=new URLSearchParams({offset:pair.offset_seconds,start:pair.radio_start,end:pair.radio_start+pair.overlap_duration}),result=await api(path(`/motion-review/${task.id}?${query}`));if(token!==pairAudioToken||viewerToken!==state.viewerToken)return;if(['queued','running'].includes(result.status)){message('pair-audio-message',result.message);await sleep(1200);continue;}if(result.status!=='complete')throw new Error(result.message);pairAudioData=result;drawPairAudio();message('pair-audio-message',`${result.sections?.correlated_sections||0}/${result.sections?.usable_sections||0} usable 3-second boundary sections agree at this offset. Green bands show supporting content, not a probability. Click a waveform to seek both videos.`);break;}},'pair-audio-message');
+for(const kind of ['fpv','radio'])$(`pair-audio-${kind}`).onclick=event=>{if(!pairAudioData||!state.pair)return;const rect=event.currentTarget.getBoundingClientRect(),[start,end]=pairAudioData.window,t=start+Math.max(0,Math.min(1,(event.clientX-rect.left-45)/(rect.width-60)))*(end-start);pausePair();seekPair(t-state.pair.radio_start);};
+window.addEventListener('resize',drawPairAudio);
+$('pair-motion-tools').onclick=guarded(async()=>{if(!state.pair)return;selectMotionPair(state.pair);openPanel('motion-panel');$('motion-panel').scrollIntoView({behavior:'smooth'});message('motion-message','Motion is loaded only when you choose Load motion signals. Experimental estimates require inspection.');},'viewer-message');

@@ -19,10 +19,16 @@ def _rim_support(blurred, gradient_x, gradient_y, x, y, radius):
     map_y = (y + radii * sine).astype(np.float32)
     gx = cv2.remap(gradient_x, map_x, map_y, cv2.INTER_LINEAR)
     gy = cv2.remap(gradient_y, map_x, map_y, cv2.INTER_LINEAR)
-    radial = np.abs(gx * cosine + gy * sine)
+    signed_radial = gx * cosine + gy * sine
+    radial = np.abs(signed_radial)
     magnitude = np.hypot(gx, gy)
     evidence = ((radial > 45) & (radial / (magnitude + 1e-5) > 0.85)).any(axis=0)
-    coverage = float(evidence.mean())
+    best = radial.argmax(axis=0)
+    rim_edges = signed_radial[best, np.arange(len(angles))]
+    # A housing boundary generally keeps its edge polarity around the rim.
+    # Grass supplies unrelated positive/negative edges in almost every sector.
+    coherent = max(float((rim_edges > 60).mean()), float((rim_edges < -60).mean()))
+    coverage = min(float(evidence.mean()), coherent * 1.25)
     # Reward housings whose interior differs from the surrounding face, using
     # either polarity so metal gimbals in black cases remain eligible.
     inner_radii = np.linspace(radius * 0.15, radius * 0.75, 7)[:, None]
@@ -68,7 +74,7 @@ def _rectify(gray, outline):
     return cv2.warpPerspective(gray, forward, (target_width, target_height)), inverse
 
 
-def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None, radio_model="other") -> dict:
+def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None, radio_model="other", *, allow_uncertain=False, layout_rotation=0) -> dict:
     """Require visible paired rim evidence; leave ambiguous frames for marking."""
     if frame is None or frame.size == 0:
         raise ValueError("Could not read the reference frame")
@@ -89,15 +95,22 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None,
     gradient_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
     top, bottom = round(height * 0.08), round(height * 0.96)
     minimum_radius = max(12, round(min(height, width) * 0.025))
-    circles = cv2.HoughCircles(
-        blurred[top:bottom], cv2.HOUGH_GRADIENT, dp=1.2,
-        minDist=max(18, round(width * 0.045)), param1=120, param2=40,
-        minRadius=minimum_radius, maxRadius=max(minimum_radius + 1, round(min(height, width) * 0.19)),
-    )
-    if circles is None:
+    # Search scales separately: large background circles otherwise suppress
+    # a partly hand-covered housing at the same position in Hough's minDist.
+    maximum_radius = max(minimum_radius + 1, round(min(height, width) * 0.19))
+    detected = []
+    for low, high in ((minimum_radius, minimum_radius * 2), (minimum_radius * 2, minimum_radius * 4), (minimum_radius * 4, maximum_radius)):
+        if low >= maximum_radius:
+            continue
+        circles = cv2.HoughCircles(blurred[top:bottom], cv2.HOUGH_GRADIENT, dp=1.2,
+            minDist=max(18, round(width * 0.035)), param1=120, param2=30,
+            minRadius=low, maxRadius=min(high, maximum_radius))
+        if circles is not None:
+            detected.extend(circles[0].astype(float))
+    if not detected:
         raise ValueError("No visible gimbal rims found. Mark the radio outline or draw both regions.")
     candidates = []
-    for x, y, radius in circles[0].astype(float):
+    for x, y, radius in detected:
         y += top
         # A marked face can clip a housing's outside edge where the hand
         # obscures the shell. Its centre must remain on the face, but requiring
@@ -106,7 +119,7 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None,
         if min(x, width - x, y, height - y) < radius * border_factor:
             continue
         coverage, contrast = _rim_support(blurred, gradient_x, gradient_y, x, y, radius)
-        if coverage >= 0.55:
+        if coverage >= 0.55 and not any(np.hypot(x-c[0],y-c[1]) < radius*.25 and abs(radius-c[2]) < radius*.3 for c in candidates):
             candidates.append((x, y, radius, coverage, contrast))
     pairs = []
     for index, first in enumerate(candidates):
@@ -115,13 +128,13 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None,
             radius = (left[2] + right[2]) / 2
             spacing = (right[0] - left[0]) / radius
             similarity = min(left[2], right[2]) / max(left[2], right[2])
-            if not 2.3 <= spacing <= 7 or similarity < 0.65 or abs(left[1] - right[1]) > radius:
+            if not 2.3 <= spacing <= 7 or similarity < 0.60 or abs(left[1] - right[1]) > radius:
                 continue
             # One exposed rim must be clear; the other may be partly covered
             # by a thumb or pinch grip. Pair geometry is supporting evidence.
             if max(left[3], right[3]) < 0.72:
                 continue
-            alignment = np.exp(-abs(left[1] - right[1]) / radius)
+            alignment = np.exp(-.5 * (abs(left[1] - right[1]) / radius) ** 2)
             spacing_score = np.exp(-abs(spacing - 4.0) / 3.0)
             rim_score = np.sqrt(left[3] * right[3]) * np.sqrt(left[4] * right[4])
             score = float(similarity * alignment * spacing_score * rim_score)
@@ -130,44 +143,59 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None,
             pairs.append((score, left, right))
     if not pairs:
         raise ValueError("No pair has enough visible housing-rim evidence. Mark the radio outline or draw both regions.")
-    pairs.sort(key=lambda pair: pair[0], reverse=True)
-    score, left, right = pairs[0]
-    if score < 0.48:
-        raise ValueError("The gimbal regions are uncertain. Mark the radio outline or draw both regions.")
-    for rival_score, rival_left, rival_right in pairs[1:]:
-        distinct = any(
-            np.hypot(a[0] - b[0], a[1] - b[1]) > max(a[2], b[2])
-            for a, b in ((left, rival_left), (right, rival_right))
-        )
-        if distinct and score - rival_score < 0.08:
-            raise ValueError("Several different gimbal pairs look plausible. Mark the radio outline to constrain the search.")
-    regions = []
-    for x, y, radius, coverage, _ in (left, right):
-        # Enclose the housing with modest padding. Oversized boxes placed the
-        # neutral centre on hands and also inflated the estimated stick travel.
-        side = min(round(radius * 2.5), 2 * int(min(x, width - x, y, height - y)))
-        x0, y0 = round(x - side / 2), round(y - side / 2)
-        x1, y1 = x0 + side, y0 + side
-        center = np.asarray([[[x, y]]], dtype=np.float32)
-        corners = np.asarray([[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]], dtype=np.float32)
-        if inverse is not None:
-            corners = cv2.perspectiveTransform(corners, inverse)
-            center = cv2.perspectiveTransform(center, inverse)
-        low, high = corners[0].min(axis=0), corners[0].max(axis=0)
-        x0, y0 = max(0, int(np.floor(low[0]))), max(0, int(np.floor(low[1])))
-        x1, y1 = min(source_width, int(np.ceil(high[0]))), min(source_height, int(np.ceil(high[1])))
-        region_width, region_height = x1 - x0, y1 - y0
-        if min(region_width, region_height) < 24:
-            raise ValueError("Gimbal regions are too small or leave the frame. Draw both regions manually.")
-        regions.append({
-            "x": x0, "y": y0, "width": region_width, "height": region_height,
-            "center_x": float(center[0, 0, 0] - x0), "center_y": float(center[0, 0, 1] - y0),
-            "travel_x": region_width * 0.4, "travel_y": region_height * 0.4,
-            "tip_radius": max(3.0, min(region_width, region_height) * 0.035),
-            "threshold": 70, "polarity": "dark", "rim_edge_support": coverage,
-        })
-    proposal = {
-        "regions": {"left_gimbal": regions[0], "right_gimbal": regions[1]},
-        "geometry_score": score, "detection_method": "paired housing rims",
-    }
-    return suggest_shell(frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), proposal, radio_model) if not radio_outline else proposal
+    def proposal_for(pair):
+        rim_score, left, right = pair
+        regions = []
+        for x, y, radius, coverage, _ in ((right, left) if layout_rotation == 180 else (left, right)):
+            # Enclose the housing with modest padding.
+            side = min(round(radius * 2.5), 2 * int(min(x, width - x, y, height - y)))
+            x0, y0 = round(x - side / 2), round(y - side / 2)
+            x1, y1 = x0 + side, y0 + side
+            center = np.asarray([[[x, y]]], dtype=np.float32)
+            corners = np.asarray([[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]], dtype=np.float32)
+            if inverse is not None:
+                corners = cv2.perspectiveTransform(corners, inverse)
+                center = cv2.perspectiveTransform(center, inverse)
+            low, high = corners[0].min(axis=0), corners[0].max(axis=0)
+            x0, y0 = max(0, int(np.floor(low[0]))), max(0, int(np.floor(low[1])))
+            x1, y1 = min(source_width, int(np.ceil(high[0]))), min(source_height, int(np.ceil(high[1])))
+            region_width, region_height = x1 - x0, y1 - y0
+            if min(region_width, region_height) < 24:
+                raise ValueError("Gimbal regions are too small or leave the frame. Draw both regions manually.")
+            regions.append({
+                "x": x0, "y": y0, "width": region_width, "height": region_height,
+                "center_x": float(center[0, 0, 0] - x0), "center_y": float(center[0, 0, 1] - y0),
+                "travel_x": region_width * 0.4, "travel_y": region_height * 0.4,
+                "tip_radius": max(3.0, min(region_width, region_height) * 0.035),
+                "threshold": 70, "polarity": "dark", "rim_edge_support": coverage,
+            })
+        proposal = {"regions": {"left_gimbal": regions[0], "right_gimbal": regions[1]},
+                    "geometry_score": rim_score, "detection_method": "paired housing rims"}
+        return suggest_shell(frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), proposal, radio_model, allow_outline_draft=allow_uncertain) if not radio_outline else proposal
+
+    # Consider the visible body for several rim pairs before choosing one.
+    # The known model is a soft score; no valid pair is excluded by its label.
+    ranked = []
+    for pair in sorted(pairs, key=lambda p:p[0], reverse=True)[:160]:
+        try:
+            candidate = proposal_for(pair)
+        except ValueError:
+            continue
+        ranked.append((pair[0] + candidate.get("shell_layout_score", 0.), pair, candidate))
+    if not ranked:
+        raise ValueError("No usable gimbal regions fit inside this frame. Mark the radio outline.")
+    ranked.sort(key=lambda p:p[0], reverse=True)
+    joint_score, (score, left, right), proposal = ranked[0]
+    review_reasons = list(proposal.get("review_reasons", []))
+    if score < .48:
+        if not allow_uncertain or score < .30:
+            raise ValueError("The gimbal regions are uncertain. Mark the radio outline or draw both regions.")
+        review_reasons.append("The housing evidence is weak. Check both regions and mark the radio outline if either is misplaced.")
+    for rival_score, (_, rival_left, rival_right), _ in ranked[1:]:
+        distinct = any(np.hypot(a[0]-b[0], a[1]-b[1]) > max(a[2],b[2]) for a,b in ((left,rival_left),(right,rival_right)))
+        if distinct and joint_score-rival_score < .08:
+            if not allow_uncertain:
+                raise ValueError("Several different gimbal pairs look plausible. Mark the radio outline to constrain the search.")
+            review_reasons.append("Several gimbal pairs look plausible. Showing an editable draft; constrain it with a radio outline if misplaced.")
+            break
+    return {**proposal, "joint_layout_score": joint_score, "needs_review": bool(review_reasons), "review_reasons": review_reasons}

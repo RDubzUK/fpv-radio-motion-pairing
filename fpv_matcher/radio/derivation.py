@@ -20,7 +20,9 @@ FULL_SPAN_VERSION = "reference-backward-tracking-v1"
 
 def specification(calibration, fps):
     calibration = validate_calibration(calibration)
+    calibration.pop("stick_mode", None)  # Canonical Mode 2 observations are remapped cheaply after loading.
     calibration.pop("radio_orientation_confirmed", None)
+    calibration.pop("radio_orientation_manual", None)
     if calibration.get("radio_rotation_deg") == 0:
         calibration.pop("radio_rotation_deg")  # Preserve existing upright caches.
     outline = "radio_outline" in calibration
@@ -47,21 +49,56 @@ def cached_sticks(path, cache, calibration, fps, identity=None, progress=None):
     if target.stem.split(".", 1)[1] != _key(str(path), algorithm, config, identity):
         config["sample_fps"] = int(fps)
     extractor = extract_review_sticks if "radio_outline" in config["config"] else extract_sticks
-    return get_or_extract(str(path), cache, kind, algorithm, config,
-                          lambda: extractor(str(path), fps, config["config"], progress=progress), identity, validate=_validate)
+    from fpv_matcher.radio.modes import remap_cached_inputs
+    def extract():
+        data = extractor(str(path), fps, config["config"], progress=progress)
+        return remap_cached_inputs(data, 2, config["config"].get("signs"))
+    data = get_or_extract(str(path), cache, kind, algorithm, config, extract, identity, validate=_validate)
+    return remap_cached_inputs(data, calibration.get("stick_mode", 2), calibration.get("signs"))
 
 
 def _validate(data):
     times = data["time"]
-    if len(times) < 3 or not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
+    if times.ndim != 1 or len(times) < 3 or not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
         raise ValueError("Invalid saved StickCam timeline")
-    if any(len(data[k]) != len(times) for k in ("roll", "pitch", "yaw", "throttle", "quality")):
-        raise ValueError("Incomplete saved StickCam inputs")
+    for key in ("roll", "pitch", "yaw", "throttle", "quality"):
+        values = np.asarray(data[key])
+        if values.shape != times.shape or not np.isfinite(values).all():
+            raise ValueError("Incomplete or invalid saved StickCam inputs")
+    for key in ("quality", "roll_quality", "pitch_quality", "yaw_quality", "throttle_quality", "radio_orientation_quality"):
+        if key in data:
+            quality = np.asarray(data[key])
+            if quality.shape != times.shape or not np.isfinite(quality).all() or ((quality < 0) | (quality > 1)).any():
+                raise ValueError("Invalid saved StickCam observation quality")
+
+
+def observation_status(data):
+    """Describe valid coverage; a saved file is not proof of usable controls."""
+    times = np.asarray(data["time"])
+    per_axis = {}
+    observed = np.ones(len(times), bool)
+    for axis in ("roll", "pitch", "yaw"):
+        key = axis + "_quality"
+        quality = np.asarray(data[key] if key in data else data["quality"])
+        usable = np.isfinite(quality) & (quality > .1)
+        per_axis[axis] = round(float(usable.mean() * 100), 1) if len(times) else 0
+        observed &= usable
+    step = float(np.median(np.diff(times))) if len(times) > 1 else 0
+    percent = round(float(observed.mean() * 100), 1) if len(times) else 0
+    result = {"usable_percent": percent, "per_axis_usable_percent": per_axis,
+              "usable_seconds": round(min(float(times[-1] - times[0]) if len(times) else 0,
+                                          float(observed.sum() * step)), 2),
+              "observation_state": "no_observations" if not observed.any() else "partial" if percent < 99 else "observed"}
+    if "radio_orientation_quality" in data:
+        result["outline_usable_percent"] = round(float((np.asarray(data["radio_orientation_quality"]) >= .35).mean() * 100), 1)
+    if percent < 10:
+        result["quality_warning"] = "Saved inputs contain very little jointly observed stick data. Review tracking or use audio; repeated extraction with the same calibration will not fix covered tips."
+    return result
 
 
 @lru_cache(maxsize=256)
 def _inspect(filename, modified, size):
-    # Read only the time axis and cache key, not every motion array on each UI poll.
+    # Validate/read once per cache signature; repeated UI polls reuse the summary.
     with np.load(filename, allow_pickle=False) as data:
         expected = Path(filename).stem.split(".", 1)[1]
         if str(data["cache_key"].item()) != expected or not {"time", "roll", "pitch", "yaw", "throttle", "quality"}.issubset(data.files):
@@ -69,9 +106,10 @@ def _inspect(filename, modified, size):
         times = data["time"]
         if len(times) < 3 or not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
             raise ValueError("Invalid saved timeline")
+        _validate(data)
         return {"samples": len(times), "duration": float(times[-1] - times[0]) if len(times) else 0,
                 "range": [float(times[0]), float(times[-1])] if len(times) else None,
-                "cached_at": modified / 1e9, "bytes": size}
+                "cached_at": modified / 1e9, "bytes": size, **observation_status(data)}
 
 
 def cache_status(path, cache, calibration, fps, identity=None):
@@ -84,7 +122,15 @@ def cache_status(path, cache, calibration, fps, identity=None):
         if not target.exists():
             return {"status": "not_derived", "sample_fps": fps}
         stat = target.stat()
-        return {"status": "cached", "sample_fps": fps, **_inspect(str(target), stat.st_mtime_ns, stat.st_size)}
+        from fpv_matcher.radio.modes import MODES, validate_mode
+        mode = validate_mode(calibration.get("stick_mode", 2))
+        summary = _inspect(str(target), stat.st_mtime_ns, stat.st_size)
+        old = summary["per_axis_usable_percent"]
+        # Mode changes can exchange pitch with throttle; both share their
+        # physical gimbal's observation quality in the canonical cache.
+        physical_quality = {p: old.get(a, old["yaw"]) for p, a in MODES[2].items()}
+        per_axis = {axis: physical_quality[p] for p, axis in MODES[mode].items() if axis != "throttle"}
+        return {"status": "cached", "sample_fps": fps, **summary, "stick_mode": mode, "per_axis_usable_percent": per_axis}
     except (OSError, ValueError, KeyError, EOFError, BadZipFile):
         return {"status": "unavailable"}
 
@@ -118,8 +164,8 @@ def run(request_path):
             elapsed = round(time.perf_counter() - started, 2)
             rows.append({"name": clip["name"], "status": "cached", "reused": reused,
                          "elapsed_seconds": elapsed, "extraction_seconds": None if reused else elapsed,
-                         "sample_fps": fps, "samples": len(data["time"])})
-        except (ValueError, RuntimeError, OSError) as exc:
+                         "sample_fps": fps, "samples": len(data["time"]), **observation_status(data)})
+        except (ValueError, RuntimeError, OSError, cv2.error) as exc:
             rows.append({"name": clip["name"], "status": "failed", "elapsed_seconds": round(time.perf_counter() - started, 2),
                          "sample_fps": fps, "message": str(exc)})
         report({"percent": 100, "eta_seconds": 0})

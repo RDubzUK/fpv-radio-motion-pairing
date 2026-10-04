@@ -1,5 +1,9 @@
-"""Follow a user-marked radio body and estimate its camera-relative orientation."""
+"""Track a confirmed radio face, preserving explicit gaps when it is not visible.
 
+Flow is fitted against immutable reference coordinates rather than composed
+indefinitely. Sparse appearance matches reacquire the same face; neither a
+catalogue silhouette nor agreement between background features is an anchor.
+"""
 from __future__ import annotations
 
 import cv2
@@ -7,101 +11,208 @@ import numpy as np
 
 
 class RadioOutlineTracker:
-    def __init__(self, outline, gimbals):
+    def __init__(self, outline, gimbals, sample_fps=30):
         self.outline = np.asarray(outline, np.float32).reshape(-1, 2)
         self.gimbals = gimbals
         self.transform = np.eye(3, dtype=np.float32)
-        self.points = None
+        self.points = self.reference_points = None
         self.quality = 0.0
+        self.reference = self.mask = None
+        self.keys = self.descriptors = None
+        self.detector = cv2.SIFT_create(nfeatures=1200, contrastThreshold=0.025)
+        self.anchor_interval = max(1, round(float(sample_fps) * 0.75))
+        self.retry_interval = max(1, round(float(sample_fps) * 0.3))
+        self.index = 0
+        self.reason = "not initialized"
 
-    def _features(self, frame):
-        mask = np.zeros(frame.shape, np.uint8)
-        polygon = cv2.transform(self.outline[None, ...], self.transform[:2])[0].astype(np.int32)
-        cv2.fillConvexPoly(mask, polygon, 255)
+    def _reference_mask(self, frame):
+        mask = np.zeros(frame.shape[:2], np.uint8)
+        cv2.fillConvexPoly(mask, self.outline.astype(np.int32), 255)
+        mask = cv2.erode(mask, np.ones((5, 5), np.uint8))
         for spec in self.gimbals:
-            box = np.array(
-                [
-                    [
-                        [spec["x"], spec["y"]],
-                        [spec["x"] + spec["width"], spec["y"]],
-                        [spec["x"] + spec["width"], spec["y"] + spec["height"]],
-                        [spec["x"], spec["y"] + spec["height"]],
-                    ]
-                ],
-                np.float32,
-            )
-            moved = cv2.transform(box, self.transform[:2])[0].astype(np.int32)
-            cv2.fillConvexPoly(mask, moved, 0)
-        return cv2.goodFeaturesToTrack(
-            frame, maxCorners=500, qualityLevel=0.008, minDistance=6, mask=mask, blockSize=7
-        )
+            # Moving sticks/fingers inside the housing cannot anchor its pose.
+            x, y, width, height = [int(round(spec[k])) for k in ("x", "y", "width", "height")]
+            mask[max(0, y):y + height, max(0, x):x + width] = 0
+        return mask
+
+    def _geometry(self, transform, frame):
+        if transform is None or not np.isfinite(transform).all() or abs(float(transform[2, 2])) < 1e-8:
+            return False
+        moved = cv2.perspectiveTransform(self.outline[None], transform)[0]
+        height, width = frame.shape[:2]
+        if (
+            not np.isfinite(moved).all() or not cv2.isContourConvex(moved)
+            or cv2.contourArea(self.outline, oriented=True) * cv2.contourArea(moved, oriented=True) <= 0
+            or (moved < 0).any() or (moved[:, 0] >= width).any() or (moved[:, 1] >= height).any()
+        ):
+            return False
+        area = abs(cv2.contourArea(moved))
+        ratio = area / max(1, abs(cv2.contourArea(self.outline)))
+        edges = np.linalg.norm(np.roll(moved, -1, axis=0) - moved, axis=1)
+        edges /= np.maximum(1, np.linalg.norm(np.roll(self.outline, -1, axis=0) - self.outline, axis=1))
+        return bool(.01 * width * height < area < .85 * width * height
+                    and .18 < ratio < 5 and min(edges) > .15 and max(edges) / min(edges) < 3)
+
+    def _coverage(self, source):
+        if len(source) < 8:
+            return 0.0
+        span = np.ptp(source, axis=0) / np.maximum(1, np.ptp(self.outline, axis=0))
+        area = cv2.contourArea(cv2.convexHull(np.float32(source))) / max(1, abs(cv2.contourArea(self.outline)))
+        if min(span) < .25 or max(span) < .4 or area < .06:
+            return 0.0
+        return min(1.0, area / .18)
+
+    def _appearance(self, frame, transform):
+        """Check distributed shell patches against the original marked face."""
+        local_to_frame = transform @ self.local_to_reference
+        crop = cv2.warpPerspective(frame, local_to_frame, self.reference.shape[::-1],
+                                   flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderValue=127)
+        crop = cv2.GaussianBlur(crop, (3, 3), 0)
+        scores, sectors = [], []
+        height, width = crop.shape
+        for row in range(3):
+            for column in range(4):
+                y1, y2 = row * height // 3, (row + 1) * height // 3
+                x1, x2 = column * width // 4, (column + 1) * width // 4
+                mask = self.appearance_mask[y1:y2, x1:x2] > 0
+                if mask.sum() < 30:
+                    continue
+                reference = self.reference[y1:y2, x1:x2][mask].astype(float)
+                current = crop[y1:y2, x1:x2][mask].astype(float)
+                if min(float(reference.std()), float(current.std())) < 6:
+                    continue
+                reference -= reference.mean()
+                current -= current.mean()
+                correlation = float(np.dot(reference, current) /
+                                    max(1, np.linalg.norm(reference) * np.linalg.norm(current)))
+                scores.append(correlation)
+                if correlation >= .5:
+                    sectors.append((row, column))
+        # Hands can hide part of the face, but one logo/patch cannot validate it.
+        if (len(scores) < 3 or len(sectors) < 3 or len(sectors) / len(scores) < .35
+                or len({row for row, _ in sectors}) < 2 or len({col for _, col in sectors}) < 2):
+            return 0.0
+        return float(np.clip(np.mean([score for score in scores if score >= .5]), 0, 1))
 
     def initialize(self, frame):
-        self.points = self._features(frame)
-        self.quality = min(1.0, (0 if self.points is None else len(self.points)) / 60)
+        self.mask = self._reference_mask(frame)
+        low = np.maximum(0, np.floor(self.outline.min(axis=0))).astype(int)
+        high = np.minimum(frame.shape[::-1], np.ceil(self.outline.max(axis=0)) + 1).astype(int)
+        crop = frame[low[1]:high[1], low[0]:high[0]]
+        if not crop.size:
+            return self._lost("radio outside frame")
+        resize = min(1, 320 / max(crop.shape))
+        size = (max(2, round(crop.shape[1] * resize)), max(2, round(crop.shape[0] * resize)))
+        self.reference = cv2.GaussianBlur(cv2.resize(crop, size, interpolation=cv2.INTER_AREA), (3, 3), 0)
+        self.appearance_mask = cv2.resize(self.mask[low[1]:high[1], low[0]:high[0]], size,
+                                          interpolation=cv2.INTER_NEAREST)
+        self.local_to_reference = np.float64([[crop.shape[1] / size[0], 0, low[0]],
+                                              [0, crop.shape[0] / size[1], low[1]], [0, 0, 1]])
+        self.keys, self.descriptors = self.detector.detectAndCompute(frame, self.mask)
+        points = cv2.goodFeaturesToTrack(frame, maxCorners=300, qualityLevel=.01,
+                                        minDistance=6, mask=self.mask, blockSize=7)
+        if points is None or not self._geometry(self.transform, frame):
+            return self._lost("insufficient visible shell landmarks")
+        self.points = points
+        self.reference_points = points.reshape(-1, 2).copy()
+        coverage = self._coverage(self.reference_points)
+        appearance = self._appearance(frame, self.transform)
+        self.quality = min(1, len(points) / 40) * coverage * appearance
+        if self.quality < .35:
+            return self._lost("insufficient distributed shell appearance")
+        self.reason = "reference face"
         return self.transform.copy(), self.quality
 
-    def update(self, previous, current):
-        if self.points is None or len(self.points) < 8:
-            self.points = self._features(previous)
-        if self.points is None or len(self.points) < 8:
-            self.quality = 0.0
-            return None, 0.0
-        moved, status, error = cv2.calcOpticalFlowPyrLK(
-            previous, current, self.points, None, winSize=(25, 25), maxLevel=3
-        )
-        if moved is None:
-            self.points, self.quality = None, 0.0
-            return None, 0.0
-        backward, reverse_status, _ = cv2.calcOpticalFlowPyrLK(
-            current, previous, moved, None, winSize=(25, 25), maxLevel=3
-        )
-        if backward is None or reverse_status is None:
-            self.points, self.quality = None, 0.0
-            return None, 0.0
-        good = (
-            status.ravel().astype(bool)
-            & reverse_status.ravel().astype(bool)
-            & (error.ravel() < 30)
-            & (np.linalg.norm(backward.reshape(-1, 2) - self.points.reshape(-1, 2), axis=1) < 1.5)
-        )
-        source = self.points.reshape(-1, 2)[good]
-        target = moved.reshape(-1, 2)[good]
-        if len(source) >= 8:
-            affine, inliers = cv2.estimateAffinePartial2D(
-                source, target, method=cv2.RANSAC, ransacReprojThreshold=2.5
-            )
-            if affine is not None and inliers is not None and np.isfinite(affine).all():
-                scale = float(np.hypot(affine[0, 0], affine[1, 0]))
-                selected = inliers.ravel().astype(bool)
-                if 0.75 < scale < 1.33 and selected.sum() >= 8 and selected.mean() >= 0.45:
-                    self.transform = np.vstack([affine, [0, 0, 1]]).astype(np.float32) @ self.transform
-                    self.points = target[selected].reshape(-1, 1, 2)
-                    self.quality = min(1.0, len(source[selected]) / 40) * float(selected.mean())
-                    if len(self.points) < 30:
-                        added = self._features(current)
-                        if added is not None:
-                            self.points = np.concatenate([self.points, added])[:500]
-                    return self.transform.copy(), self.quality
-        self.points = self._features(current)
-        self.quality = 0.0
+    def _lost(self, reason):
+        self.points = self.reference_points = None
+        self.quality, self.reason = 0.0, reason
         return None, 0.0
 
+    def _accept(self, transform, source, target, inliers, frame, method):
+        if transform is None or inliers is None or not self._geometry(transform, frame):
+            return None
+        selected = inliers.ravel().astype(bool)
+        if selected.sum() < 8 or selected.mean() < .5:
+            return None
+        coverage = self._coverage(source[selected])
+        projected = cv2.perspectiveTransform(source[selected, None].astype(np.float32), transform)[:, 0]
+        error = np.linalg.norm(projected - target[selected], axis=1)
+        if coverage == 0 or np.percentile(error, 90) > 2.5:
+            return None
+        appearance = self._appearance(frame, transform)
+        quality = min(1, selected.sum() / 35) * float(selected.mean()) * coverage * appearance
+        if quality < .35:
+            return None
+        self.transform = (transform / transform[2, 2]).astype(np.float32)
+        self.reference_points = source[selected].astype(np.float32)
+        self.points = target[selected].astype(np.float32).reshape(-1, 1, 2)
+        self.quality, self.reason = float(quality), method
+        return self.transform.copy(), self.quality
+
+    def _reacquire(self, frame):
+        if self.descriptors is None or len(self.descriptors) < 8:
+            return None
+        keys, descriptors = self.detector.detectAndCompute(frame, None)
+        if descriptors is None or len(descriptors) < 8:
+            return None
+        matcher = cv2.BFMatcher()
+        reverse = {pair[0].queryIdx: pair[0].trainIdx
+                   for pair in matcher.knnMatch(descriptors, self.descriptors, k=2)
+                   if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance}
+        matches = [pair[0] for pair in matcher.knnMatch(self.descriptors, descriptors, k=2)
+                   if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance
+                   and reverse.get(pair[0].trainIdx) == pair[0].queryIdx]
+        if len(matches) < 8:
+            return None
+        source = np.float32([self.keys[match.queryIdx].pt for match in matches])
+        target = np.float32([keys[match.trainIdx].pt for match in matches])
+        transform, inliers = cv2.findHomography(source, target, cv2.RANSAC, 2.5)
+        return self._accept(transform, source, target, inliers, frame, "reference reacquired")
+
+    def update(self, previous, current):
+        self.index += 1
+        # Sparse absolute anchors complement cheaper flow. Failure to find an
+        # anchor never promotes arbitrary current-frame features to references.
+        if self.index % self.anchor_interval == 0 or (
+            self.points is None and self.index % self.retry_interval == 0
+        ):
+            anchored = self._reacquire(current)
+            if anchored is not None:
+                return anchored
+        if self.points is None or len(self.points) < 8:
+            return self._lost("radio not reacquired")
+        moved, status, error = cv2.calcOpticalFlowPyrLK(previous, current, self.points, None,
+                                                     winSize=(25, 25), maxLevel=3)
+        if moved is None or status is None or error is None:
+            return self._lost("shell flow lost")
+        backward, reverse_status, _ = cv2.calcOpticalFlowPyrLK(current, previous, moved, None,
+                                                             winSize=(25, 25), maxLevel=3)
+        if backward is None or reverse_status is None:
+            return self._lost("shell reverse flow lost")
+        good = (status.ravel().astype(bool) & reverse_status.ravel().astype(bool)
+                & (error.ravel() < 25) & np.isfinite(moved.reshape(-1, 2)).all(axis=1)
+                & (np.linalg.norm(backward.reshape(-1, 2) - self.points.reshape(-1, 2), axis=1) < 1.2))
+        source, target = self.reference_points[good], moved.reshape(-1, 2)[good]
+        if len(source) >= 8:
+            transform, inliers = cv2.findHomography(source, target, cv2.RANSAC, 2.5)
+            accepted = self._accept(transform, source, target, inliers, current, "reference flow")
+            if accepted is not None:
+                return accepted
+        return self._lost("shell geometry or appearance failed")
+
     def orientation(self):
-        return float(np.degrees(np.arctan2(self.transform[1, 0], self.transform[0, 0])))
+        polygon = cv2.perspectiveTransform(self.outline[None], self.transform)[0]
+        vector = polygon[1] - polygon[0]
+        original = self.outline[1] - self.outline[0]
+        return float(np.degrees(np.arctan2(vector[1], vector[0]) - np.arctan2(original[1], original[0])))
 
     def annotate(self, frame):
-        polygon = cv2.transform(self.outline[None, ...], self.transform[:2])[0].astype(np.int32)
-        color = (50, 210, 255) if self.quality >= 0.35 else (80, 115, 255)
-        cv2.polylines(frame, [polygon], True, color, 3)
-        angle = self.orientation()
-        cv2.putText(
-            frame,
-            f"Radio {angle:+.1f} deg · {self.quality:.2f}",
-            (max(8, polygon[0, 0]), max(24, polygon[0, 1] - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+        if self.quality < .35:
+            cv2.putText(frame, "Radio lost - inputs unobserved", (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, .65, (80, 115, 255), 2, cv2.LINE_AA)
+            return
+        polygon = cv2.perspectiveTransform(self.outline[None], self.transform)[0].astype(np.int32)
+        cv2.polylines(frame, [polygon], True, (50, 210, 255), 3)
+        cv2.putText(frame, f"Radio {self.orientation():+.1f} deg / {self.quality:.2f}",
+                    (max(8, polygon[0, 0]), max(24, polygon[0, 1] - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, .65, (50, 210, 255), 2, cv2.LINE_AA)

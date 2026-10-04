@@ -1,6 +1,6 @@
 # Freestyle motion matching
 
-Status: embedded FPV telemetry is now integrated into matching and review. Camera gyro rates, or local angular rates derived from fused quaternion attitude, are transformed using an explicit sensor mapping and camera uptilt. Visual fallback remains a 2D affine proxy. World-gravity estimation, calibrated visual 3D pose and gravity-aware throttle matching remain planned and unvalidated.
+Status: embedded FPV telemetry is now integrated into matching and review. Camera gyro rates, or local angular rates derived from fused quaternion attitude, are transformed using an explicit sensor mapping and camera uptilt. Visual fallback now includes experimental relative camera rotation from FOV-based viewing rays / essential pose with explicit projection and mount correction. Full measured lens calibration, source-adjacent high-rate tracking, world gravity and throttle dynamics remain planned and unvalidated.
 
 ## Intended footage
 
@@ -24,13 +24,11 @@ The Motion comparison section plots FPV body rates, sensor rates or available qu
 
 ## What the current code does
 
-`motion/lucas_kanade.py` tracks features between frames already sampled at the selected extraction rate. It fits a partial affine transform and stores image-centre horizontal/vertical displacement rates, in-plane image rotation rate and one quality value. It rejects inconsistent tracks; the transform is still an image model rather than a full camera/drone pose.
+`motion/lucas_kanade.py` tracks forward/backward-consistent features at the selected sampling rate. `motion/visual_rotation.py` turns pixels into viewing rays using recorded horizontal FOV and a rectilinear/equidistant approximation. A robust rotation-only fit handles low-parallax intervals; essential-matrix recovery handles translation with cheirality, distributed-support and planar-degeneracy checks. Unsupported intervals have zero quality. SO(3) rotation vectors and elapsed time give camera angular velocity, inverted from scene motion, then camera uptilt maps it into body Roll/Pitch/Yaw. The fingerprint retains 2D affine flow as separate diagnostics.
 
-`matching/correlation.py` compares roll with image rotation, yaw with horizontal flow and pitch with vertical flow. It tries stick positions or their derivatives, sign inversion and activity changes. Optional rates convert stick positions to requested angular rates before normalisation. Good statistical correlation can supply timing evidence, but these axis mappings are approximations.
+This is experimental, with FOV-based geometry rather than calibrated intrinsics/distortion. The initial 110° is an explicit approximation. Visual rates are not embedded gyro, absolute attitude or gravity. Estimate accuracy, polarity, degeneracy rejection and timing require known-gyro evaluation. Sampling still occurs before tracking, so rapid motion between sparse samples can be lost; no interpolation restores it.
 
-Throttle is extracted from the StickCam but does not contribute to motion correlation. The visual fallback has no camera calibration, mount-angle correction, gravity estimate, drone attitude estimate or separate 3D translation/rotation model. The embedded path above supplies measured 3D rates with mount correction and optionally fused attitude; this does not establish a reliable world gravity vector. The current default 15 Hz extraction can discard the intermediate frames needed to track fast rotations; later correlation refinement cannot recover motion lost during extraction.
-
-The original specification acknowledges camera-dependent mappings and sign inversions. It does not provide the full geometry/dynamics needed for inverted freestyle. Sky/ground classification alone would not fill this gap.
+`matching/correlation.py` compares corresponding body axes and rates-derived stick commands when available, rather than equating horizontal/vertical image flow with yaw/pitch. Legacy 2D review data retains its original labels. Radio Mode 1–4 assignments are explicit; Mode 2 remains the default. Cached canonical/physical observations are remapped without rescanning. Throttle remains normalized pilot input and does not contribute as a rotation axis.
 
 ## Primary fingerprint: rotation in drone axes
 
@@ -43,18 +41,18 @@ flowchart LR
     S[StickCam tips] --> P[Normalised stick positions]
     P --> R[Rates curve: requested roll / pitch / yaw rates]
     G[Embedded FPV gyro or quaternion attitude] --> B[Sensor mapping and camera mount: measured body rotation rates]
-    F[Adjacent FPV frames: planned 3D fallback] --> C[Lens calibration and relative 3D camera rotation]
+    F[FPV tracked frames: experimental 3D fallback] --> C[Lens calibration and relative 3D camera rotation]
     C --> B
     R --> M[Compare sequences at candidate time offsets]
     B --> M
     M --> V[Check independent windows, quality and audio anchors]
 ```
 
-Remaining visual 3D fallback requirements:
+Visual 3D implementation and remaining requirements:
 
 1. Decode adjacent source frames with presentation timestamps at a reduced spatial resolution. Estimate motion before reducing the fingerprint rate. Adapt tracking/keypoint matching for large rotations; reject blur, lost overlap, feature-poor views and inconsistent models. A 900 degrees/second turn spans 60 degrees between 15 Hz samples, versus 15 degrees at 60 fps. Higher source frame rate helps; interpolation or duplicated frames cannot recreate missing observations.
 2. Use camera intrinsics, the correct lens distortion model and the actual video crop/resolution to turn pixels into viewing rays. Wide-angle/fisheye footage requires its appropriate model. A field-of-view approximation may support an experimental estimate with reduced confidence, but cannot be advertised as calibrated geometry.
-3. Estimate relative 3D camera rotation while accounting for translation/parallax. Evaluate robust essential-matrix pose recovery alongside a rotation-only fit for low-parallax intervals. Pure rotation, planar scenes and translation through nearby obstacles are degeneracies that need explicit checks. Require distributed feature support, consistent residuals and physically plausible motion. A large inlier count alone is insufficient.
+3. The FOV-based experimental implementation estimates relative 3D camera rotation while accounting for translation/parallax. Evaluate robust essential-matrix pose recovery alongside a rotation-only fit for low-parallax intervals. Pure rotation, planar scenes and translation through nearby obstacles are degeneracies that need explicit checks. Require distributed feature support, consistent residuals and physically plausible motion. A large inlier count alone is insufficient.
 4. Express increments using rotation matrices or quaternions; derive local angular velocity from the rotation increment and elapsed time. Do not differentiate wrapped Euler angles or bridge tracking gaps by integrating invented zero-motion samples. Verify the image/scene-versus-camera rotation sign convention on known rotations.
 5. Transform camera angular velocity into drone body axes using the fixed mount orientation. Camera uptilt mixes axes even during upright flight. Store the camera mount transform per camera/clip profile; correct optical-flow units and physical coordinate conventions explicitly. A single mount-pitch parameter is a convenient UI option for a normally mounted camera, with a full transform available where needed.
 6. Compare the measured body rates with rates derived from the tracked stick positions. Use signed axis sequences and several independent manoeuvre windows. Stick derivatives may be compared with measured angular acceleration as supplementary change evidence, rather than substituted indiscriminately for requested angular velocity. Unknown rates can use normalised signals with reduced amplitude claims.

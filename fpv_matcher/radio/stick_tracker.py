@@ -12,7 +12,7 @@ from fpv_matcher.radio.outline import RadioOutlineTracker
 from fpv_matcher.video.metadata import probe_video
 from fpv_matcher.video.reader import sampled_frames, reverse_sampled_frames
 
-ALGORITHM_VERSION = "stick-tip-shared-outline-ratecurve-v6"
+ALGORITHM_VERSION = "stick-reference-perspective-visible-tip-v7"
 MAX_DIMENSION = 1280
 
 
@@ -60,13 +60,15 @@ class GimbalTracker:
         self.last_quality = 0.0
         self.locked = True
         self.lost_frames = 0
+        self.tip_lost_frames = 0
+        self.reason = "not initialized"
 
     def _crop(self, frame):
         # Only warp the gimbal crop, never a full 4K frame for each stick.
         crop_transform = self.transform @ np.array([[1, 0, self.x], [0, 1, self.y], [0, 0, 1]], np.float32)
-        return cv2.warpAffine(
+        return cv2.warpPerspective(
             frame,
-            crop_transform[:2],
+            crop_transform,
             (self.width, self.height),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
             borderValue=127,
@@ -85,10 +87,10 @@ class GimbalTracker:
             ],
             np.float32,
         )
-        moved = cv2.transform(corners, self.transform[:2])[0].astype(np.int32)
+        moved = cv2.perspectiveTransform(corners, self.transform)[0].astype(np.int32)
         cv2.fillConvexPoly(mask, moved, 255)
-        center = cv2.transform(
-            np.array([[[self.x + self.width / 2, self.y + self.height / 2]]], np.float32), self.transform[:2]
+        center = cv2.perspectiveTransform(
+            np.array([[[self.x + self.width / 2, self.y + self.height / 2]]], np.float32), self.transform
         )[0, 0]
         scale = float(np.hypot(self.transform[0, 0], self.transform[1, 0]))
         cv2.ellipse(
@@ -116,7 +118,38 @@ class GimbalTracker:
                 self.template = self.reference[
                     ty - radius : ty + radius + 1, tx - radius : tx + radius + 1
                 ].copy()
-        return self.detect(frame, 1.0, body_transform, body_quality)
+        if body_transform is not None:
+            self.transform = body_transform.copy()
+        return self.detect(frame, body_quality if body_transform is not None else 1.0)
+
+    def _visible(self, frame):
+        corners = np.float32([[[self.x, self.y], [self.x + self.width - 1, self.y],
+                              [self.x + self.width - 1, self.y + self.height - 1],
+                              [self.x, self.y + self.height - 1]]])
+        moved = cv2.perspectiveTransform(corners, self.transform)[0]
+        return bool(np.isfinite(moved).all() and cv2.isContourConvex(moved)
+                    and (moved >= 0).all() and (moved[:, 0] < frame.shape[1]).all()
+                    and (moved[:, 1] < frame.shape[0]).all())
+
+    def _housing_agreement(self, frame):
+        if self.reference is None or not self._visible(frame):
+            return 0.0
+        crop = self._crop(frame)
+        yy, xx = np.indices(crop.shape)
+        shell = (((xx - self.width / 2) / max(1, self.width * .36)) ** 2
+                 + ((yy - self.height / 2) / max(1, self.height * .36)) ** 2) > 1
+        reference, current = self.reference[shell].astype(float), crop[shell].astype(float)
+        if len(reference) < 50 or min(reference.std(), current.std()) < 6:
+            return 0.0
+        reference -= reference.mean()
+        current -= current.mean()
+        return float(np.dot(reference, current) / max(1, np.linalg.norm(reference) * np.linalg.norm(current)))
+
+    def gap(self, reason):
+        self.last_quality = 0.0
+        self.tip_lost_frames += 1
+        self.reason = reason
+        return 0.0, 0.0, 0.0
 
     def _reacquire(self, frame):
         # Match the housing, with the mobile middle of each gimbal masked out.
@@ -145,22 +178,27 @@ class GimbalTracker:
         ] = -1
         if score - float(np.max(alternative)) < 0.04:
             return False
-        self.transform = np.array(
+        proposed = np.array(
             [[1, 0, location[0] - self.x], [0, 1, location[1] - self.y], [0, 0, 1]], np.float32
         )
+        previous = self.transform
+        self.transform = proposed
+        if self._housing_agreement(frame) < .6:
+            self.transform = previous
+            return False
         self.points = self._features(frame)
         self.locked = True
         return True
 
     def update(self, previous, current, body_transform=None, body_quality=1.0):
-        if self.wonky and body_transform is not None and body_quality >= .5:
+        if body_transform is not None and body_quality >= .35:
             # The shell and gimbals share one rigid transform. Avoid rebuilding
             # two extra full-frame LK pyramids while the outline is trustworthy.
             self.transform = body_transform.copy()
             self.points = None
             self.locked = True
             self.lost_frames = 0
-            return self.detect(current, body_quality, body_transform, body_quality)
+            return self.detect(current, body_quality)
         housing_quality = 1.0
         if self.wonky:
             housing_quality = 0.0
@@ -176,14 +214,22 @@ class GimbalTracker:
                     tracked, status, error = cv2.calcOpticalFlowPyrLK(
                         previous, current, self.points, None, winSize=(25, 25), maxLevel=3
                     )
-                    if tracked is not None:
-                        good = status.ravel().astype(bool) & (error.ravel() < 30)
+                    if tracked is not None and status is not None and error is not None:
+                        backward, reverse_status, _ = cv2.calcOpticalFlowPyrLK(
+                            current, previous, tracked, None, winSize=(25, 25), maxLevel=3
+                        )
+                        good = status.ravel().astype(bool) & (error.ravel() < 25)
+                        if backward is None or reverse_status is None:
+                            good[:] = False
+                        else:
+                            good &= reverse_status.ravel().astype(bool)
+                            good &= np.linalg.norm(backward.reshape(-1, 2) - self.points.reshape(-1, 2), axis=1) < 1.2
                         source, target = self.points.reshape(-1, 2)[good], tracked.reshape(-1, 2)[good]
                         if len(source) >= 6:
                             affine, inliers = cv2.estimateAffinePartial2D(
                                 source, target, method=cv2.RANSAC, ransacReprojThreshold=2.5
                             )
-                            if affine is not None:
+                            if affine is not None and inliers is not None and np.isfinite(affine).all():
                                 scale = float(np.hypot(affine[0, 0], affine[1, 0]))
                                 mask = inliers.ravel().astype(bool)
                                 if 0.8 < scale < 1.25 and mask.sum() >= 6 and mask.mean() >= 0.5:
@@ -192,90 +238,65 @@ class GimbalTracker:
                                     )
                                     self.points = target[mask].reshape(-1, 1, 2)
                                     housing_quality = min(1.0, int(mask.sum()) / 20) * float(mask.mean())
+                if housing_quality > 0 and self._housing_agreement(current) < .55:
+                    housing_quality = 0.0
                 if housing_quality == 0:
                     self.locked = False
                     self.points = None
                 elif self.points is None or len(self.points) < 30:
                     self.points = self._features(current)
-        return self.detect(current, housing_quality, body_transform, body_quality)
+        return self.detect(current, housing_quality)
 
     def detect(self, frame, housing_quality, body_transform=None, body_quality=1.0):
+        if housing_quality < .35 or not self._visible(frame):
+            return self.gap("housing unobserved or outside frame")
+        if self.template is None or float(self.template.std()) < 6:
+            # An unspecified/flat tip cannot be inferred from a dark housing
+            # blob. It remains a gap until a visible distinctive tip is marked.
+            return self.gap("distinctive calibrated tip required")
         crop = self._crop(frame)
-        position, visual_quality = None, 0.0
-        if (
-            self.template is not None
-            and min(crop.shape) >= max(self.template.shape)
-            and np.std(self.template) > 3
-        ):
-            response = cv2.matchTemplate(crop, self.template, cv2.TM_CCOEFF_NORMED)
-            # Resolve repeated housing features using proximity to the preceding tip.
-            if self.last_tip is not None:
-                yy, xx = np.indices(response.shape)
-                dist = np.hypot(
-                    xx + self.template.shape[1] / 2 - self.last_tip[0],
-                    yy + self.template.shape[0] / 2 - self.last_tip[1],
-                )
-                response = response - 0.08 * np.minimum(dist / max(self.width, self.height), 1)
-            _, score, _, location = cv2.minMaxLoc(response)
-            if score >= 0.5:
-                position = np.array(
-                    [
-                        location[0] + (self.template.shape[1] - 1) / 2,
-                        location[1] + (self.template.shape[0] - 1) / 2,
-                    ]
-                )
-                visual_quality = float(np.clip((score - 0.4) / 0.5, 0, 1))
-        if position is None:
-            # Component detector is a fallback, rather than the median of all
-            # black housing pixels. Prefer a tip-sized blob near the last tip.
-            threshold = int(self.spec.get("threshold", 70))
-            mask = (crop > threshold if self.spec.get("polarity") == "light" else crop < threshold).astype(
-                np.uint8
-            )
-            count, _, stats, centers = cv2.connectedComponentsWithStats(mask, 8)
-            radius = max(2, self.spec["tip_radius"])
-            expected = np.pi * radius**2
-            candidates = []
-            for i in range(1, count):
-                area = stats[i, cv2.CC_STAT_AREA]
-                px, py = centers[i]
-                if (
-                    expected * 0.15 <= area <= expected * 5
-                    and radius <= px < self.width - radius
-                    and radius <= py < self.height - radius
-                ):
-                    prior = (
-                        self.last_tip
-                        if self.last_tip is not None
-                        else np.array([self.spec["center_x"], self.spec["center_y"]])
-                    )
-                    cost = abs(np.log(max(area, 1) / expected)) + 4 * np.linalg.norm(
-                        centers[i] - prior
-                    ) / max(self.width, self.height)
-                    candidates.append((cost, centers[i]))
-            if candidates:
-                cost, position = min(candidates, key=lambda item: item[0])
-                # Automatic dark/light component selection is deliberately tentative.
-                visual_quality = float(0.55 * np.exp(-cost / 3))
-        if position is None or visual_quality <= 0:
-            self.last_quality = 0.0
-            return 0.0, 0.0, 0.0
+        if min(crop.shape) < max(self.template.shape):
+            return self.gap("tip template exceeds crop")
+        response = cv2.matchTemplate(crop, self.template, cv2.TM_CCOEFF_NORMED)
+        response = np.nan_to_num(response, nan=-1, posinf=-1, neginf=-1)
+        yy, xx = np.indices(response.shape)
+        px, py = xx + (self.template.shape[1] - 1) / 2, yy + (self.template.shape[0] - 1) / 2
+        # Calibrated travel bounds constrain every candidate. Keep a small
+        # marking tolerance, without treating positions on housing as input.
+        travel = ((np.abs(px - self.spec["center_x"]) <= self.spec["travel_x"] * 1.08)
+                  & (np.abs(py - self.spec["center_y"]) <= self.spec["travel_y"] * 1.08))
+        response[~travel] = -1
+        _, score, _, location = cv2.minMaxLoc(response)
+        alternatives = response.copy()
+        exclusion = max(3, min(self.template.shape) * 1.2)
+        alternatives[(xx - location[0]) ** 2 + (yy - location[1]) ** 2 < exclusion ** 2] = -1
+        alternative = float(cv2.minMaxLoc(alternatives)[1])
+        # Reacquiring an occluded cap requires stronger independent appearance.
+        minimum = .76 if self.tip_lost_frames else .70
+        margin = .08 if self.tip_lost_frames else .06
+        if score < minimum or score - alternative < margin:
+            return self.gap("tip covered or appearance ambiguous")
+        position = np.array([px[location[1], location[0]], py[location[1], location[0]]])
+        visual_quality = float(np.clip((score - .6) / .35, 0, 1))
         crop_position = position.copy()
         if body_transform is not None:
-            local_to_camera = self.transform @ np.array(
-                [[1, 0, self.x], [0, 1, self.y], [0, 0, 1]], np.float32
-            )
-            tip_camera = cv2.transform(
-                np.array([[[position[0], position[1]]]], np.float32), local_to_camera[:2]
-            )[0, 0]
-            tip_radio = cv2.transform(tip_camera.reshape(1, 1, 2), np.linalg.inv(body_transform)[:2])[0, 0]
+            # Kept for diagnostic callers that supply independently tracked
+            # housing and shell poses. All transforms are projective now.
+            local_to_camera = self.transform @ np.float32([[1, 0, self.x], [0, 1, self.y], [0, 0, 1]])
+            tip_camera = cv2.perspectiveTransform(position.astype(np.float32).reshape(1, 1, 2), local_to_camera)
+            tip_radio = cv2.perspectiveTransform(tip_camera, np.linalg.inv(body_transform))[0, 0]
             position = tip_radio - np.array([self.x, self.y])
-            visual_quality *= max(0.5, min(1.0, body_quality))
-        quality = housing_quality * visual_quality
+            visual_quality *= float(np.clip(body_quality, 0, 1))
+        normalized = (position - [self.spec["center_x"], self.spec["center_y"]]) / [self.spec["travel_x"], self.spec["travel_y"]]
+        if not np.isfinite(normalized).all() or (np.abs(normalized) > 1.08).any():
+            return self.gap("tip outside calibrated travel")
+        quality = float(housing_quality * visual_quality)
+        if quality <= .1:
+            return self.gap("tip appearance too weak")
         self.last_tip, self.last_quality = crop_position, quality
-        x = float(np.clip((position[0] - self.spec["center_x"]) / self.spec["travel_x"], -1, 1))
-        y = float(np.clip((position[1] - self.spec["center_y"]) / self.spec["travel_y"], -1, 1))
-        return x, y, quality
+        self.tip_lost_frames, self.reason = 0, "visible calibrated tip"
+        x, y = np.clip(normalized, -1, 1)
+        return float(x), float(y), quality
 
     def annotate(self, frame):
         color = (60, 240, 120) if self.last_quality > 0.4 else (70, 90, 255)
@@ -290,10 +311,10 @@ class GimbalTracker:
             ],
             np.float32,
         )
-        cv2.polylines(frame, [cv2.transform(corners, self.transform[:2])[0].astype(np.int32)], True, color, 2)
-        if self.last_tip is not None:
+        cv2.polylines(frame, [cv2.perspectiveTransform(corners, self.transform)[0].astype(np.int32)], True, color, 2)
+        if self.last_tip is not None and self.last_quality > .1:
             point = np.array([[[self.x + self.last_tip[0], self.y + self.last_tip[1]]]], np.float32)
-            location = cv2.transform(point, self.transform[:2])[0, 0].astype(int)
+            location = cv2.perspectiveTransform(point, self.transform)[0, 0].astype(int)
             cv2.circle(frame, tuple(location), 6, color, 2)
 
 
@@ -311,7 +332,7 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
     ]
     outline_tracker = (
         RadioOutlineTracker(
-            scaled["radio_outline"], [scaled[side] for side in ("left_gimbal", "right_gimbal")]
+            scaled["radio_outline"], [scaled[side] for side in ("left_gimbal", "right_gimbal")], sample_fps
         )
         if "radio_outline" in scaled
         else None
@@ -327,29 +348,27 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
             body_transform, body_quality = outline_tracker.update(previous, frame)
         if body_quality < 0.35:
             body_transform = None
-        detected = [
-            tracker.initialize(frame, body_transform, body_quality)
-            if previous is None
-            else tracker.update(previous, frame, body_transform, body_quality)
-            for tracker in trackers
-        ]
+        if previous is not None and outline_tracker is not None and body_transform is None:
+            detected = [tracker.gap("radio face unobserved") for tracker in trackers]
+        else:
+            detected = [
+                tracker.initialize(frame, body_transform, body_quality)
+                if previous is None
+                else tracker.update(previous, frame, body_transform, body_quality)
+                for tracker in trackers
+            ]
+        if outline_tracker is not None and body_transform is None:
+            # A known shell loss must not silently switch to gimbal/background
+            # features and report apparently observed controls.
+            detected = [tracker.gap("radio face unobserved") for tracker in trackers]
         left, right = detected
         # Crops are expressed in the calibration frame's axes. Relative shell
         # tracking handles later movement; an inverted reference reverses both
         # directions. Physical left/right gimbal labels are kept separately.
         if config.get("radio_rotation_deg", 0) == 180:
             left, right = (-left[0], -left[1], left[2]), (-right[0], -right[1], right[2])
-        values = {
-            "yaw": left[0],
-            "throttle": -left[1],
-            "roll": right[0],
-            "pitch": -right[1],
-            "yaw_quality": left[2],
-            "throttle_quality": left[2],
-            "roll_quality": right[2],
-            "pitch_quality": right[2],
-            "quality": (left[2] + right[2]) / 2,
-        }
+        from fpv_matcher.radio.modes import assigned_inputs
+        values = {**assigned_inputs(left, right, config["stick_mode"]), "quality": (left[2] + right[2]) / 2}
         if outline_tracker is not None:
             values["radio_orientation_deg"] = outline_tracker.orientation()
             values["radio_orientation_quality"] = outline_tracker.quality

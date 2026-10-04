@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fpv_matcher.matching.assignment import assign, candidate_margin
+from fpv_matcher.matching.assignment import assign_segments, candidate_margin
 from fpv_matcher.pipeline import atomic_json, run_batch
 
 
@@ -21,7 +21,7 @@ def run_selected(fpv_paths, radio_paths, config, output, cache, settings, progre
                "stop_on_confident_match": False, "make_plots": False}
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     rows, errors, clips, unscanned = [], [], {"fpv": {}, "radio": {}}, {}
-    confirmed_radio = set(); started = time.monotonic()
+    started = time.monotonic()
     def report(stage, message, percent, **extra):
         event = {"stage": stage, "message": message, "percent": round(percent, 1), **extra}
         atomic_json(output / "progress.json", event)
@@ -29,8 +29,6 @@ def run_selected(fpv_paths, radio_paths, config, output, cache, settings, progre
     for ti, target in enumerate(targets):
         scanned = set()
         for ri, radio in enumerate(radios):
-            if radio.name in confirmed_radio:
-                continue
             scanned.add(radio.name)
             def update(event):
                 fraction = (ti + (ri + event["percent"] / 100) / max(1, len(radios))) / max(1, len(targets))
@@ -45,20 +43,22 @@ def run_selected(fpv_paths, radio_paths, config, output, cache, settings, progre
             for kind in clips:
                 clips[kind].update({c["name"]: c for c in summary["clips"][kind]})
             proposal = next((r for r in summary["rows"] if r["confidence"] == "strong"), None)
-            remaining = [p.name for p in radios if p.name not in scanned and p.name not in confirmed_radio]
+            remaining = [p.name for p in radios if p.name not in scanned]
             if proposal and remaining:
                 nonce = uuid.uuid4().hex
                 pending = {"status": "pending", "nonce": nonce, "candidate": proposal, "remaining": remaining,
-                           "scanned": len(scanned), "total": len(radios), "target_index": ti + 1, "targets": len(targets)}
+                           "scanned": len(scanned), "total": len(radios), "target_index": ti + 1, "targets": len(targets), "source_signatures": {kind: [clips[kind][proposal[kind + "_video"]]["size"], clips[kind][proposal[kind + "_video"]]["mtime_ns"]] for kind in ("radio", "fpv")}}
                 atomic_json(output / "early.json", pending)
-                report("review", f"Strong motion evidence for {target.name}; {len(remaining)} StickCam clips remain unscanned. Review or continue.", (ti + (ri + 1) / len(radios)) / len(targets) * 95)
+                report("review", f"Strong local evidence for {target.name}; {len(remaining)} StickCam clips remain unscanned. Review or continue.", (ti + (ri + 1) / len(radios)) / len(targets) * 95)
                 decision = output / f"decision-{nonce}.json"
                 while not decision.exists():
                     time.sleep(.5)
                 action = json.loads(decision.read_text())["action"]
                 atomic_json(output / "early.json", {**pending, "status": "resolved", "decision": action})
                 if action == "confirm":
-                    confirmed_radio.add(radio.name); unscanned[target.name] = remaining
+                    # A StickCam can own later O4 FPV file segments too.
+                    # Confirmation consumes this FPV target, not its StickCam.
+                    unscanned[target.name] = remaining
                     break
         else:
             unscanned[target.name] = []
@@ -69,14 +69,17 @@ def run_selected(fpv_paths, radio_paths, config, output, cache, settings, progre
     matrix = np.zeros((len(rn), len(fn)))
     for row in rows:
         matrix[rn.index(row["radio_video"]), fn.index(row["fpv_video"])] = row["combined_score"]
-    selected = set(assign(matrix, settings.get("minimum_score", .55)))
+    offsets = {(rn.index(row["radio_video"]), fn.index(row["fpv_video"])): row["offset_seconds"] for row in rows}
+    selected = set(assign_segments(matrix, offsets,
+        [clips["radio"][name]["duration"] for name in rn], [clips["fpv"][name]["duration"] for name in fn],
+        settings.get("minimum_score", .55)))
     for row in rows:
         ri, fi = rn.index(row["radio_video"]), fn.index(row["fpv_video"])
-        row["candidate_margin"] = candidate_margin(matrix, ri, fi)
+        row["candidate_margin"] = candidate_margin(matrix, ri, fi, multiple_fpv=sum(r == ri for r, _ in selected) > 1)
         row["global_assignment"] = (ri, fi) in selected
         if row["candidate_margin"] < .08:
             row["confidence"] = "review"
-    result = {"version": 3, "rows": rows, "errors": errors, "clips": {k: list(v.values()) for k, v in clips.items()},
+    result = {"version": 4, "pairing_model": "multiple_fpv_segments_per_stickcam", "rows": rows, "errors": errors, "clips": {k: list(v.values()) for k, v in clips.items()},
         "rate_profile": settings.get("rate_profile"), "settings": settings,
         "clock": {"delta_seconds": None, "confidence": 0, "support": 0},
         "excluded_radio": [p.name for p in radio_paths if p not in radios], "considered_radio": [p.name for p in radios],

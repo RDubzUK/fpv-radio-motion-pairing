@@ -7,7 +7,7 @@ import numpy as np
 from fpv_matcher.radio.stick_tracker import MAX_DIMENSION, iter_all_sticks
 from fpv_matcher.video.metadata import probe_video
 
-VERSION = "radio-review-outline-v1"
+VERSION = "radio-review-perspective-valid-gaps-v2"
 
 
 def extract_review_sticks(path, sample_fps, calibration, progress=None):
@@ -20,7 +20,7 @@ def extract_review_sticks(path, sample_fps, calibration, progress=None):
         row = {"time": timestamp, **values}
         if "radio_outline" in calibration:
             tracker = trackers[-1]
-            corners = cv2.transform(tracker.outline[None], tracker.transform[:2])[0] / scale
+            corners = cv2.perspectiveTransform(tracker.outline[None], tracker.transform)[0] / scale
             for i, point in enumerate(corners):
                 row[f"outline_{i}_x"], row[f"outline_{i}_y"] = point
         reporter.update(len(rows) / sample_fps)
@@ -74,7 +74,9 @@ def review_poses(data, gyro=None):
         valid = quality[i] >= .35
         if valid:
             anchor = i
-        elif anchor is not None and gyro_factor is not None and timestamp - times[anchor] <= .3 and np.isfinite(gyro_angle[i]) and np.isfinite(gyro_angle[anchor]):
+        elif quality[i] > 0 and anchor is not None and gyro_factor is not None and timestamp - times[anchor] <= .3 and np.isfinite(gyro_angle[i]) and np.isfinite(gyro_angle[anchor]):
+            # Camera gyro cannot establish whether the radio is in frame or
+            # where it translated. Zero-quality shell loss stays a gap.
             delta = gyro_factor * (gyro_angle[i] - gyro_angle[anchor])
             c, s = np.cos(delta), np.sin(delta)
             center = corners[anchor].mean(axis=0)

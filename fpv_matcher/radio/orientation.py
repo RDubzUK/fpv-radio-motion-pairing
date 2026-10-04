@@ -14,7 +14,7 @@ from fpv_matcher.pipeline import atomic_json
 from fpv_matcher.radio.reference import suggest_from_reference
 from fpv_matcher.video.frames import jpeg_frame
 
-VERSION = "session-radio-midpoint-orientation-v1"
+VERSION = "session-radio-static-housing-orientation-v2"
 
 
 def rotation_from_regions(regions):
@@ -34,15 +34,21 @@ def scaled_region(region, sx, sy):
             else value * min(sx, sy) if key == "tip_radius" else value for key, value in region.items()}
 
 
-def suggest_upright_regions(image, outline=None, rotation=0, radio_model="other"):
+def suggest_upright_regions(image, outline=None, rotation=0, radio_model="other", *, allow_uncertain=False):
     from fpv_matcher.radio.auto_calibration import suggest_gimbal_regions
+    if rotation == 180 and not outline:
+        proposal = suggest_gimbal_regions(image, radio_model=radio_model, allow_uncertain=allow_uncertain, layout_rotation=180)
+        if proposal.get("radio_outline"):
+            points = proposal["radio_outline"]
+            proposal["radio_outline"] = points[2:] + points[:2]
+        return proposal
     if rotation != 180:
-        return suggest_gimbal_regions(image, outline, radio_model)
+        return suggest_gimbal_regions(image, outline, radio_model, allow_uncertain=allow_uncertain)
     height, width = image.shape[:2]
     upright_outline = [[width - 1 - x, height - 1 - y] for x, y in outline] if outline else None
     if upright_outline:
         upright_outline = upright_outline[2:] + upright_outline[:2]
-    proposal = suggest_gimbal_regions(cv2.rotate(image, cv2.ROTATE_180), upright_outline, radio_model)
+    proposal = suggest_gimbal_regions(cv2.rotate(image, cv2.ROTATE_180), upright_outline, radio_model, allow_uncertain=allow_uncertain)
     if proposal.get("radio_outline"):
         points = [[width - 1 - x, height - 1 - y] for x, y in proposal["radio_outline"]]
         proposal["radio_outline"] = points[2:] + points[:2]
@@ -57,6 +63,35 @@ def suggest_upright_regions(image, outline=None, rotation=0, radio_model="other"
             if key in region:
                 region[key] = region["height"] - 1 - region[key]
     return proposal
+
+
+def suggest_radio_orientation(image, outline=None, radio_model="auto", *, preferred_rotation=0, allow_uncertain=False):
+    """Compare upright/inverted layouts; keep ambiguous results editable."""
+    guesses = []
+    errors = []
+    for rotation in (0, 180):
+        try:
+            candidate = suggest_upright_regions(image, outline, rotation, radio_model, allow_uncertain=allow_uncertain)
+            candidate["radio_rotation_deg"] = rotation
+            guesses.append(candidate)
+        except ValueError as exc:
+            errors.append(str(exc))
+    if not guesses:
+        raise ValueError(errors[0] if errors else "No clear radio layout. Try another frame or mark manually.")
+    guesses.sort(key=lambda p: p.get("joint_layout_score", p.get("geometry_score", 0)), reverse=True)
+    best = guesses[0]
+    margin = (best.get("joint_layout_score", best.get("geometry_score", 0)) -
+              guesses[1].get("joint_layout_score", guesses[1].get("geometry_score", 0))) if len(guesses) > 1 else 0.
+    # A failed alternative is not evidence that the surviving orientation is
+    # correct. Require both an asymmetric layout and a distinct score.
+    ambiguous = len(guesses) != 2 or margin < .08 or not best.get("radio_outline") or best.get("screen_edge_support", 0) < .55
+    if ambiguous and len(guesses) == 2 and margin < .08:
+        best = next((g for g in guesses if g["radio_rotation_deg"] == preferred_rotation), best)
+    reason = ("Orientation is uncertain; confirm Upright / Upside down after checking the screen and physical left/right gimbals."
+              if ambiguous else "Orientation suggested from the body, gimbal and screen layout; confirm it before saving.")
+    return {**best, "orientation_ambiguous": ambiguous, "orientation_margin": margin,
+            "orientation_evidence": [{"rotation_deg": g["radio_rotation_deg"], "score": g.get("joint_layout_score", g.get("geometry_score", 0))} for g in guesses],
+            "needs_review": True, "review_reasons": [*best.get("review_reasons", []), reason]}
 
 
 def _signature(path):

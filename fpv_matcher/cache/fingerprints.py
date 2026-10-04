@@ -36,7 +36,15 @@ def get_or_extract(
 ) -> dict[str, np.ndarray]:
     directory = Path(cache_dir)
     directory.mkdir(parents=True, exist_ok=True)
+    source = Path(path)
+    initial = source.stat()
+    source_signature = (initial.st_size, initial.st_mtime_ns)
+    def unchanged():
+        current = source.stat()
+        if (current.st_size, current.st_mtime_ns) != source_signature:
+            raise RuntimeError(f"{source.name} changed while reading it; restore the source and retry")
     key = _key(path, algorithm, config, identity)
+    unchanged()
     target = directory / f"{kind}.{key}.npz"
     if target.exists():
         try:
@@ -45,10 +53,12 @@ def get_or_extract(
                     fingerprint = {k: data[k] for k in data.files if k != "cache_key"}
                     if validate:
                         validate(fingerprint)
+                    unchanged()
                     return fingerprint
         except (OSError, ValueError, KeyError, EOFError, BadZipFile):
             pass
     fingerprint = extract()
+    unchanged()
     if validate:
         validate(fingerprint)
     # An interrupted worker cannot leave a partially written cache entry.
@@ -56,6 +66,7 @@ def get_or_extract(
     try:
         with os.fdopen(descriptor, "wb") as stream:
             np.savez_compressed(stream, cache_key=np.asarray(key), **fingerprint)
+        unchanged()
         os.replace(name, target)
     finally:
         Path(name).unlink(missing_ok=True)

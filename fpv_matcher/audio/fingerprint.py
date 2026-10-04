@@ -29,6 +29,25 @@ def _empty():
     }
 
 
+def validate_audio(data):
+    """Reject partial or malformed cached fingerprints before comparison."""
+    times = np.asarray(data["time"], float)
+    features = np.asarray(data["features"], float)
+    if times.ndim != 1 or features.shape != (len(times), 5):
+        raise ValueError("Audio fingerprints need five features at each timestamp")
+    if not np.isfinite(times).all() or not np.isfinite(features).all() or np.any(times < 0) or np.any(np.diff(times) <= 0):
+        raise ValueError("Audio fingerprint timestamps and features must be finite and ordered")
+    for key in ("valid", "segments"):
+        if np.asarray(data[key]).shape != times.shape:
+            raise ValueError("Audio fingerprint segments must match their timestamps")
+    hashes, hash_times = np.asarray(data["hashes"]), np.asarray(data["hash_times"], float)
+    if hashes.ndim != 1 or hash_times.shape != hashes.shape or not np.isfinite(hash_times).all() or np.any(hash_times < 0):
+        raise ValueError("Audio fingerprint hashes must have finite source timestamps")
+    quality, duration = float(np.asarray(data["quality"]).item()), float(np.asarray(data["duration"]).item())
+    if not np.isfinite(quality) or not 0 <= quality <= 1 or not np.isfinite(duration) or duration < 0:
+        raise ValueError("Audio fingerprint quality and duration are invalid")
+
+
 def _landmarks(samples, start):
     """Frequency-peak pairs provide evidence beyond similar volume envelopes.
 
@@ -238,7 +257,7 @@ def _boundary_overlap(radio, fpv, offset):
     )
 
 
-def score_at_offset(radio, fpv, offset_seconds, min_overlap_seconds=2.0):
+def score_at_offset(radio, fpv, offset_seconds, min_overlap_seconds=2.0, include_landmarks=True):
     minimum = max(3, round(min_overlap_seconds * FRAME_RATE))
     by_feature, overlap = {}, 0
     for rstart, ra in _chunks(radio):
@@ -256,15 +275,15 @@ def score_at_offset(radio, fpv, offset_seconds, min_overlap_seconds=2.0):
                     by_feature[col] = max(value, by_feature.get(col, 0))
     values = sorted(by_feature.values(), reverse=True)[:3]
     score = float(np.mean(values)) if len(values) >= 2 else 0.0
-    landmark_score, landmark_offset, _, _, span = landmark_match(radio, fpv)
-    if abs(landmark_offset - offset_seconds) <= 0.15 and landmark_score:
+    landmark_score, landmark_offset, _, _, _ = landmark_match(radio, fpv) if include_landmarks else (0, 0, 0, 0, 0)
+    if include_landmarks and abs(landmark_offset - offset_seconds) <= 0.15 and landmark_score:
         boundary_overlap = _boundary_overlap(radio, fpv, offset_seconds)
         if boundary_overlap >= min_overlap_seconds:
             score, overlap = max(score, landmark_score), max(overlap, boundary_overlap * FRAME_RATE)
     return score, overlap / FRAME_RATE
 
 
-def best_offset(radio, fpv, min_overlap_seconds=2.0):
+def best_offset(radio, fpv, min_overlap_seconds=2.0, include_landmarks=True):
     """Return score, offset, overlap, competing-peak margin at a single shared lag."""
     landmark_score, landmark_offset, landmark_margin, _, landmark_span = landmark_match(radio, fpv)
     if min(float(radio["quality"]), float(fpv["quality"])) < 0.1:
@@ -297,6 +316,8 @@ def best_offset(radio, fpv, min_overlap_seconds=2.0):
                 if item[0] > buckets.get(bucket, (0, 0, 0))[0]:
                     buckets[bucket] = item
     if not buckets:
+        if not include_landmarks:
+            return 0.0, 0.0, 0.0, 0.0
         return (
             landmark_score,
             landmark_offset,
@@ -306,7 +327,7 @@ def best_offset(radio, fpv, min_overlap_seconds=2.0):
     score, offset, overlap = max(buckets.values())
     second = max((item[0] for item in buckets.values() if abs(item[1] - offset) > 2), default=0.0)
     margin = max(0.0, score - second)
-    if landmark_score >= 0.82 and landmark_margin >= 0.08:
+    if include_landmarks and landmark_score >= 0.82 and landmark_margin >= 0.08:
         trend, trend_overlap = score_at_offset(radio, fpv, landmark_offset, min_overlap_seconds)
         return (
             max(landmark_score, trend),

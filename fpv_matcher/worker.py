@@ -14,7 +14,9 @@ def main():
     job = json.loads((base / "job.json").read_text(encoding="utf-8"))
     paths = json.loads((base / "inputs.json").read_text(encoding="utf-8"))
     config = json.loads((base / "radio_rois.json").read_text(encoding="utf-8"))
-    if job["settings"].get("match_target_kind") == "fpv" and job["settings"].get("stop_on_confident_match", False):
+    if (job["settings"].get("matching_strategy", "selected") != "automatic"
+            and job["settings"].get("match_target_kind") == "fpv"
+            and job["settings"].get("stop_on_confident_match", False)):
         from fpv_matcher.matching.incremental import run_selected
         run_selected([Path(p) for p in paths["fpv"]], [Path(p) for p in paths["radio"]], config, base / "results", cache,
                      job["settings"], progress=lambda event: print(event["message"], flush=True))

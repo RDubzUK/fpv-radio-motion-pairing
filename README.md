@@ -1,8 +1,8 @@
 # FPV ↔ StickCam Matcher
 
-A local Python engine and LAN web workspace for pairing FPV recordings with videos of the pilot's radio. Import a batch, calibrate the visible sticks, compare motion and boundary audio, review the proposed pairs, and export their shared intervals for editing.
+A local Python engine and LAN web workspace for pairing FPV recordings with videos of the pilot's radio. Choose sources, try cached boundary audio first, resolve calibration/matching exceptions, review synchronized pairs, and export their shared intervals for editing. The guided workspace keeps technical tools available on demand.
 
-The current implementation has been reviewed with synthetic signals, generated videos and browser workflows. Its accuracy on actual flight recordings still needs evaluation. Correlation scores and the “strong” label are evidence summaries, not calibrated probabilities.
+Earlier versions were reviewed with synthetic signals, generated videos and browser workflows. The latest tracker, staged matching gates and optional stabilized export have received static review and browser rendering inspection; their accuracy and output still need real-footage evaluation. Correlation scores and the “strong” label are evidence summaries, not calibrated probabilities.
 
 ## Open the workspace
 
@@ -49,7 +49,19 @@ python3.11 -m venv .venv
 
 The user service example is in `deploy/fpv-radio-motion-pairing.service`. Adjust its project path when installing elsewhere.
 
-## Workflow
+## Recommended workflow
+
+1. Name the session and choose FPV/StickCam sources. Use **Choose all, some or one** to limit the target set.
+2. Choose **Automatic · audio first** and **Find matching flights**. It reads cached audio first; distinct content proposals skip motion. Unresolved clips reuse current StickCam inputs and embedded FPV motion where calibration is available. Experimental FPV visual fallback is off by default.
+3. Use **Exceptions & next actions** to restore/relink sources, calibrate uncertain clips or inspect tracking coverage. Calibration is unnecessary for audio-only matching.
+4. **Review next pair** plays both feeds over the shared interval without motion extraction. Optional audio waveforms are independent of calibration. Check events and timing, then save the alignment.
+5. Export confirmed aligned clips, or enter the 9:16 editor. Several FPV segments can share one StickCam; timestamp predictions still require review.
+
+**Technical tools** exposes calibration, FPV preparation, evidence selection, rates, source/IMU mapping, extraction ratios, charts and logs. Last successful results remain viewable during a rerun or after cancellation/failure. Current decisions are bound to source signatures; changed files and legacy confirmations without signatures require review again.
+
+See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the complete process and outstanding validation, and [WORKFLOW_REVIEW.md](WORKFLOW_REVIEW.md) for the corrections in this review.
+
+## Detailed controls
 
 ### 1. Add recordings
 
@@ -59,7 +71,7 @@ Alternatively, choose files from your browser. Uploads go directly to the saved 
 
 Supported extensions: MP4, MOV, MKV, AVI, M4V and WebM. Decoding depends on FFmpeg's available codecs.
 
-### 2. Calibrate StickCam
+### Calibrate unresolved StickCam
 
 **Saved StickCam movement data → StickCam tracking** offers fixed extraction Hz (the default), **0.5 × source fps**, or **0.25 × source fps**. Each recording's average frame rate is detected independently: a 29.97 fps clip uses about 14.985 Hz or 7.493 Hz. The selected clip and preparation table show source fps and the requested tracking Hz. Ratio tracking supports up to 60 Hz; select a smaller ratio or fixed Hz for faster source recordings.
 
@@ -103,7 +115,7 @@ If you enable a rates profile under analysis settings, the app maps normalized r
 
 ### 3. Analyze
 
-Defaults are 30 Hz extraction, 30 Hz candidate comparison, two extraction workers, two seconds minimum usable overlap and a 0.55 proposal threshold. Strong proposals also need sufficient usable motion, multiple axes, a distinct timing peak and separation from other candidate clips.
+Defaults are 30 Hz extraction, 30 Hz candidate comparison, two extraction workers, two seconds minimum usable overlap and a 0.55 proposal threshold. Automatic mode screens audio first, requiring repeated distinctive evidence, a consistent offset and separation from rivals. Motion proposals additionally need usable observations, multiple axes and a distinct timing peak.
 
 Motion, audio and metadata are extracted once per recording and cached. Changing comparison settings can reuse those fingerprints. Cancellation stops the analysis process and its decoders; rerunning reuses completed cache entries. Bad files are reported individually when possible.
 
@@ -151,9 +163,9 @@ Visual fallback uses sparse Lucas–Kanade flow, forward/backward rejection and 
 
 **Motion comparison** works before full analysis: choose an FPV and optionally a configured StickCam and load signals. FPV rates or available quaternion orientation appear above detected stick/requested-rate traces and throttle. Zoom, pan, toggle axes and inspect shared cursor values; window requests preserve extrema and tracking gaps with bounded payloads. Normalised amplitude is a display aid, not a physical axis calibration. Chart shifts are exploratory; save real alignment in the shared video preview.
 
-**Centred StickCam preview** uses a saved four-corner radio outline to centre and level the visible shell, fitting its corners with a margin and smoothly changing zoom. Open the source playback using the button in that section. Usable StickCam gyro supports only short outline gaps after agreeing with trusted outline rotations; otherwise the preview uses outline observations. Missing outline tracking shows the full frame. It cannot reconstruct radio parts outside the source or correct arbitrary 3D perspective; stabilised exports are not implemented.
+**Centred StickCam preview** uses a saved four-corner radio outline to centre and level the visible shell, fitting its corners with a margin and smoothly changing zoom. Open the source playback using the button in that section. Usable StickCam gyro supports only short outline gaps after agreeing with trusted outline rotations; otherwise the preview uses outline observations. Missing outline tracking shows the full frame. It cannot reconstruct radio parts outside the source or correct arbitrary 3D perspective; optional centered/level separate StickCam exports now use current saved outline observations. Choose **Prepare this StickCam for stabilization**, then the **Centered & level** output option. The radio stays inside the crop and all crop corners must map to recorded pixels; lost/unsafe intervals retain original framing. The alignment manifest reports usable and fallback intervals. This native FFmpeg path has not yet been encoded/evaluated on real footage.
 
-Stick tips use a selected template with a component detector as a fallback. Wonky mode separately follows housing features and stabilises each gimbal crop. Unreliable housing or tip samples carry zero or reduced weight. Left and right gimbals have separate quality signals.
+Selected tip appearance is checked for distinct matches within calibrated travel. Confirmed radio landmarks anchor a perspective transform and rectify both gimbal crops. Distributed shell checks reject drift and out-of-frame outlines; lost shell or occluded/ambiguous tips produce quality gaps. Generic dark housing blobs no longer replace missing confirmed tips. Cache status reports per-axis and jointly observed coverage, separately from storage readiness.
 
 Fingerprints are resampled onto a common clip-relative grid, with smoothing before reducing the rate. Gaps remain invalid. Weighted correlations compare the corresponding body-rate axes for telemetry, or approximate roll/rotation, yaw/horizontal-flow and pitch/vertical-flow axes for visual fallback. The visual path tests position or velocity; the telemetry path uses position/rate commands. Both retain stick/image polarity handling, and combine continuous signals with activity bursts. Short accidental overlaps are downweighted. Likely motion alignments are refined at the extraction rate.
 
@@ -219,7 +231,7 @@ The config can be a single calibration (see `radio_rois.example.json`) or per-re
 }
 ```
 
-Those example coordinates must be calibrated to your source. CLI configs without selected tips retain a tentative dark/light component fallback; the web workflow requires explicit tips.
+Those example coordinates must be calibrated to your source. The web workflow requires explicit tips for calibrated movement extraction. Reference validity and observation gaps must be inspected before relying on estimated control inputs.
 
 Outputs include `matches.csv`, `results.json`, `progress.json` and automatic alignment plots. The web CSV includes saved manual corrections. `run_batch` in `fpv_matcher/pipeline.py` is the reusable engine; it has no web or Resolve dependency. `fpv_matcher/motion/base.py` defines the motion estimator interface.
 
@@ -247,7 +259,7 @@ Automatic decoding tries NVIDIA CUDA for supported H.264/HEVC clips, resizes on 
 
 For Wonky StickCam, a reliable radio outline transform is now shared by both gimbal trackers. Separate housing tracking resumes when outline quality drops. This avoids repeating full-frame optical-flow work while the outline is reliable. The changed tracking algorithm invalidates older stick extraction caches.
 
-Automatic FPV motion always prefers usable embedded gyro samples, then angular rates derived from embedded orientation. Image-derived motion is the fallback when neither can be read. The selected source is recorded in results and shown in Motion comparison. Camera axis mapping, mount uptilt and gyro timing remain explicit calibration settings.
+Automatic FPV motion always prefers usable embedded gyro samples, then angular rates derived from embedded orientation. Image-derived motion is an experimental fallback when neither can be read and the user has enabled visual matching. The selected source is recorded in results and shown in Motion comparison. Camera axis mapping, mount uptilt and gyro timing remain explicit calibration settings.
 
 After loading calibrated StickCam signals, expand **Find FPV clips by gyro correlation** and choose **Scan all FPV gyro**. The scan reuses that StickCam extraction and compares it against every session FPV clip with supported embedded gyro or orientation. Telemetry and unsupported-source results are cached by file identity and parser version, shared with batch matching and charts. Changed source files invalidate them.
 
@@ -293,9 +305,9 @@ Each calibrated StickCam clip records wall-clock time spent processing during mo
 
 **Prepare FPV visual motion**, above Find matching flights, lists every FPV recording with duration, embedded-motion availability and saved visual-motion status. Use **Check embedded motion · all FPV** to inspect supported gyro/attitude without running optical flow. Select clips for a smaller check or derivation, or choose **Derive all without embedded motion**. Derivation checks unknown sources first, skips clips with supported gyro or quaternion-derived rates, and processes eligible clips sequentially. Parser/decoder failures appear per clip in the preparation log. No StickCam calibration is required.
 
-Visual extraction Hz and Decode share the matching controls. Reducing Hz also lowers Compare Hz when necessary. Progress reports overall completion, per-clip elapsed time and an observed visual-extraction ETA. Cancellation keeps completed caches. Matching waits while FPV or StickCam preparation is active. The table reports samples, timeline coverage, usable tracking percentage and extraction time where recorded; older caches remain reusable even when their original time was not logged. Use **View motion** to inspect a saved clip in Motion comparison.
+Visual extraction defaults to the detected source frame rate, capped at 30 Hz, with half-rate, quarter-rate and custom-Hz options. This rate is independent of StickCam extraction. Decode is shared with the matching controls. Progress reports overall completion, per-clip elapsed time and an observed visual-extraction ETA. Cancellation keeps completed caches. Matching waits while FPV or StickCam preparation is active. The table reports samples, timeline coverage, usable tracking percentage and extraction time where recorded; older caches remain reusable even when their original time was not logged. Use **Review video + motion** to play a clip above its saved estimates, with a synchronized playhead, click-to-seek and optional following chart window. This reads the existing cache without deriving again.
 
-Preparation, matching and chart review share compressed visual fingerprints by source identity, sampling rate and algorithm version, including legacy integer-Hz caches. Other saved rates remain on disk and are shown when detected; switch back to reuse them. Image rotation and horizontal/vertical flow are 2D visual proxies, not drone body gyro or recovered gravity. Fast freestyle, blur and featureless sky can lose tracking; usable tracking percentage is a quality measure, not confidence that two recordings match. Embedded gyro/attitude remains preferred for automatic matching.
+Preparation, matching and chart review share compressed visual fingerprints by source identity, sampling rate and algorithm version, including legacy integer-Hz caches. Other saved rates remain on disk and are shown when detected; switch back to reuse them. The new visual fingerprint stores relative camera angular velocity and applies camera uptilt to obtain estimated body Roll/Pitch/Yaw rates in degrees per second. Old 2D flow is not reused as 3D angular rates; its cache files remain on disk. Horizontal/vertical flow and image rotation are retained as diagnostics. Recorded FOV/projection are explicit approximations, not measured lens calibration; this does not recover gravity or absolute attitude. Fast freestyle, blur and featureless sky can lose tracking; usable tracking percentage is a quality measure, not confidence that two recordings match. Embedded gyro/attitude remains preferred for automatic matching.
 
 Session creation and pair export have no fixed recording-count limit. File size, unique filenames, available disk space and bounded worker concurrency remain validated. All-to-all matching grows with both clip counts; select a subset to avoid unnecessary work in large sessions.
 
@@ -323,8 +335,39 @@ Session cards have lazy FPV thumbnails. The selected file is the available FPV r
 
 ### Radio model shape hints
 
-The radio dropdown includes **Other**, **Auto-detect**, and specific RadioMaster TX16S, Boxer, GX12, TX15, TX12, Pocket and Zorro, TBS Tango 2 and Mambo, and BETAFPV LiteRadio 3 families. MAX/MKII/Crush/Pro variants are identified on the appropriate family entry; HelloRadioSky and the generic Jumper option have been removed, and the previous “My session radio” option is now Other.
+The radio dropdown includes **Other**, **Auto-detect**, and specific RadioMaster TX16S, Boxer, GX12, TX15, TX12, Pocket and Zorro, TBS Tango 2 and Mambo, and BETAFPV LiteRadio 3 families. MKI/MKII/MAX/Crush/Pro variants are identified on the appropriate family entry; HelloRadioSky and the generic Jumper option have been removed, and the previous “My session radio” option is now Other.
 
 `fpv_matcher/radio/models.py` records manufacturer links, approximate normalized shell polygons, body proportions, gimbal landmarks/radii and display placement. The preview shows that internal geometry. These are broad detection priors, not measured engineering outlines or a trained classifier. With a marked shell, the selected model provides a small ranking prior for visible rim pairs. Without a shell or usable session image, observed gimbal rims anchor candidate body silhouettes, which need distributed image-edge support before corners can be proposed. Auto-detect lists plausible models; similar cases or covered shells remain ambiguous, and uncertain outlines/orientations require marking. The 5-second calibration scan uses these hints too and tries both upright and inverted hypotheses. Suggestions remain unconfirmed until reviewed. Hands and pinch/thumb grips can still obscure the useful edges.
 
-An operator-confirmed session frame remains the stronger photographic reference and is attempted first. Selecting Other uses that reference or generic rim evidence without assuming a catalogue silhouette. Changing the dropdown selects a pending model; **Change session radio using this frame** confirms its name and a fresh image reference. Existing manually confirmed calibrations and cached movement data are retained.
+An operator-confirmed session frame remains the stronger photographic reference and is attempted first. Selecting Other uses that reference and broad body-layout hints without making a model identity claim. Model selection is always a soft ranking hint; it never filters out a different visible body. The TX16S prior covers Mk1/Mk2: approximately square, gimbals in the upper half, display below. Changing the dropdown selects a pending model; **Change session radio using this frame** confirms its name and a fresh image reference. Existing manually confirmed calibrations and cached movement data are retained.
+
+### Source recovery and drafts
+
+After setup, **Source folders & availability** remains in the guided workspace. Check missing/changed media and relink existing filenames to a new server folder. This does not mount shares or discover additional recordings. Finish active work before relinking. Unsaved calibration drafts stay on this browser device; a changed source invalidates a draft, and **Discard draft** restores the saved calibration.
+
+### Confirmation and exports
+
+Separate and portrait exports require an explicitly saved, current alignment; export does not implicitly approve a rejected pair. A saved FPV owner cannot be silently displaced: select **Replace saved owner** while reviewing a different StickCam. Session deletion leaves originals and exports intact. Batch limits scale with recording count; per-clip caches survive interruption.
+
+### Gimbal suggestions and orientation review
+
+Suggestions search several housing sizes, consider multiple rim/body hypotheses together and compare upright/inverted body, gimbal and display layouts. **Suggest orientation from radio shape** is enabled for an unconfirmed frame; choosing Upright/180° manually disables that automatic suggestion. Ambiguous results remain warnings and require review. A symmetric outline or an obscured display cannot prove orientation. The suggest button loads its frame on demand and shows progress/errors beside the controls. Hand occlusion and clutter can still produce incorrect proposals; draw the body outline or use a clear confirmed session reference to constrain the search.
+
+### Pilot stick assignments
+
+**Session radio & orientation → Radio stick assignments** offers Modes 1–4, default Mode 2. The selected clip can override its mode; **Use these assignments for all StickCam clips** saves a session default and updates existing calibrations. Assignments follow the physical upright radio even when the source is inverted.
+
+| Mode | Left horizontal | Left vertical | Right horizontal | Right vertical |
+| --- | --- | --- | --- | --- |
+| 1 | Yaw | Pitch | Roll | Throttle |
+| 2 (default) | Yaw | Throttle | Roll | Pitch |
+| 3 | Roll | Pitch | Yaw | Throttle |
+| 4 | Roll | Throttle | Yaw | Pitch |
+
+Fingerprints retain canonical Mode 2 and physical stick observations. Loading them maps to the selected pilot mode, including observation quality and axis signs, without another video scan. Matching and saved review signals use named Roll/Pitch/Yaw/Throttle channels; charts record the mode used. Rate curves convert the three rotation commands to requested degrees per second; throttle stays normalized stick position and is not equated to gyro or vertical image flow. Reopen old charts / rerun motion matching after changing assignments.
+
+### Experimental visual angular rates
+
+Visual preparation now uses tracked viewing rays: robust rotation-only fitting for low-parallax intervals, essential-matrix pose recovery for translation, and rejection of unsupported/planar/poorly distributed intervals. Local rotation vectors avoid Euler wrapping during inversion. The camera basis is right/down/forward, mapped to body forward/right/down and corrected by the configured camera uptilt. Recorded horizontal FOV and rectilinear/equidistant projection are saved per session and form part of the cache identity; the initial 110° is explicitly an approximation. Choose settings matching the recorded video crop and projection.
+
+The video review plots estimated Roll/Pitch/Yaw below playback. Matching uses those same body-axis sequences against rates-derived StickCam requests, and continues to prefer supported embedded telemetry. Quality gaps remain gaps. This estimator has not yet been evaluated against labelled freestyle gyro recordings; unknown lens distortion, stabilization, parallax, blur and sampling gaps remain limits. Native gyro and estimated rotation are labelled separately. Relative rotation alone cannot measure throttle, gravity or absolute attitude.

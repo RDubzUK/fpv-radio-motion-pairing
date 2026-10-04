@@ -22,6 +22,8 @@ def export_pair(
     profile: str = "h264",
     run=None,
     progress=None,
+    radio_stabilization: dict | None = None,
+    cancelled=None,
 ) -> dict:
     if fps not in {24, 25, 30, 50, 60}:
         raise ValueError("Export frame rate must be 24, 25, 30, 50 or 60")
@@ -32,6 +34,21 @@ def export_pair(
         raise ValueError("Shared interval is shorter than one export frame")
     duration = frame_count / fps
     directory.mkdir(parents=True, exist_ok=True)
+    stabilization_chain = stabilization_summary = None
+    if radio_stabilization is not None:
+        from fpv_matcher.video.radio_stabilization import prepare_stabilization
+        metadata = info.get("source_metadata", {}).get("radio")
+        if metadata is None:
+            from fpv_matcher.video.metadata import probe_video
+            metadata = probe_video(radio_path)
+        signature = radio_stabilization.get("source_signature")
+        stat = Path(radio_path).stat()
+        if signature is not None and list(signature) != [stat.st_size, stat.st_mtime_ns]:
+            raise ValueError("StickCam footage changed since its stabilization data was saved")
+        if progress:
+            progress("Planning source-safe StickCam stabilization from saved outlines")
+        stabilization_chain, stabilization_summary = prepare_stabilization(
+            radio_stabilization, directory, info["radio_start"], frame_count, fps, metadata=metadata, cancelled=cancelled)
     outputs = []
     for index, (kind, source, start) in enumerate(
         (("StickCam", radio_path, info["radio_start"]), ("FPV", fpv_path, info["fpv_start"]))
@@ -41,8 +58,12 @@ def export_pair(
             if source.stem.casefold().startswith(kind.casefold() + "_")
             else f"{kind}_{source.stem}"
         )
-        name = f"{stem}_aligned.{'mov' if profile == 'dnxhr' else 'mp4'}"
+        suffix = "_stabilized_aligned" if index == 0 and stabilization_chain else "_aligned"
+        name = f"{stem}{suffix}.{'mov' if profile == 'dnxhr' else 'mp4'}"
         destination = directory / name
+        video_filters = f"fps={fps}:start_time=0:round=near,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,setpts=N/({fps}*TB)"
+        if index == 0 and stabilization_chain:
+            video_filters += "," + stabilization_chain
         command = [
             shutil.which("ffmpeg") or "ffmpeg",
             "-nostdin",
@@ -62,7 +83,7 @@ def export_pair(
             "-filter_threads",
             "1",
             "-vf",
-            f"fps={fps}:start_time=0:round=near,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,setpts=N/({fps}*TB)",
+            video_filters,
             "-af",
             f"aresample=async=1:first_pts=0,apad,atrim=duration={duration:.9f},asetpts=N/SR/TB",
             "-frames:v",
@@ -166,6 +187,8 @@ def export_pair(
         "timeline_note": "Place both clips at the same timeline position. They start at zero and have identical video frame counts.",
         "alignment_note": "Accuracy depends on the estimated or manually reviewed offset. CFR export does not make an uncertain estimate frame accurate.",
     }
+    if stabilization_summary:
+        manifest["radio_stabilization"] = stabilization_summary
     (directory / "alignment.json").write_text(
         json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8"
     )
