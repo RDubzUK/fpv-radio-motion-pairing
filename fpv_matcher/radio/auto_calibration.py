@@ -68,7 +68,7 @@ def _rectify(gray, outline):
     return cv2.warpPerspective(gray, forward, (target_width, target_height)), inverse
 
 
-def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None) -> dict:
+def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None, radio_model="other") -> dict:
     """Require visible paired rim evidence; leave ambiguous frames for marking."""
     if frame is None or frame.size == 0:
         raise ValueError("Could not read the reference frame")
@@ -77,6 +77,8 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None)
     if min(source_height, source_width) < 100:
         raise ValueError("Reference frame is too small to detect gimbal regions")
     inverse = None
+    from fpv_matcher.radio.models import model_for, geometry_support, suggest_shell
+    model = model_for(radio_model)
     if radio_outline:
         gray, inverse = _rectify(gray, radio_outline)
     height, width = gray.shape
@@ -123,6 +125,8 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None)
             spacing_score = np.exp(-abs(spacing - 4.0) / 3.0)
             rim_score = np.sqrt(left[3] * right[3]) * np.sqrt(left[4] * right[4])
             score = float(similarity * alignment * spacing_score * rim_score)
+            if model and inverse is not None:
+                score *= .9 + .1 * geometry_support(model, left, right, width, height)
             pairs.append((score, left, right))
     if not pairs:
         raise ValueError("No pair has enough visible housing-rim evidence. Mark the radio outline or draw both regions.")
@@ -162,7 +166,8 @@ def suggest_gimbal_regions(frame: np.ndarray, radio_outline: list | None = None)
             "tip_radius": max(3.0, min(region_width, region_height) * 0.035),
             "threshold": 70, "polarity": "dark", "rim_edge_support": coverage,
         })
-    return {
+    proposal = {
         "regions": {"left_gimbal": regions[0], "right_gimbal": regions[1]},
         "geometry_score": score, "detection_method": "paired housing rims",
     }
+    return suggest_shell(frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), proposal, radio_model) if not radio_outline else proposal

@@ -17,10 +17,10 @@ from fpv_matcher.audio.fingerprint import ALGORITHM_VERSION as AUDIO_VERSION
 from fpv_matcher.audio.fingerprint import best_offset, extract_audio, landmark_match, score_at_offset
 from fpv_matcher.cache.fingerprints import get_or_extract
 from fpv_matcher.config import calibration_for
-from fpv_matcher.matching.assignment import assign, candidate_margin
+from fpv_matcher.matching.assignment import assign, assign_segments, candidate_margin
 from fpv_matcher.matching.evidence import normalize_sources, motion_enabled, audio_enabled_pair
 from fpv_matcher.matching.correlation import MatchResult, compare, prepare, section_support
-from fpv_matcher.motion.lucas_kanade import LucasKanadeEstimator
+from fpv_matcher.motion.derivation import cached_visual_motion
 from fpv_matcher.motion.telemetry import cached_telemetry, body_rates, validate_motion_settings
 from fpv_matcher.radio.rates import apply_rate_profile, validate_rate_profile
 from fpv_matcher.video.metadata import filename_timestamp, format_timestamp, probe_video
@@ -51,7 +51,7 @@ def infer_clock_difference(radio_times, fpv_times, results, scores, audio, allow
         distinctive |= aud["best_score"] >= 0.82 and aud["peak_margin"] >= 0.08
         if (
             not distinctive
-            or candidate_margin(scores, ri, fi) < 0.04
+            or candidate_margin(scores, ri, fi, multiple_fpv=True) < 0.04
             or radio_times[ri] is None
             or fpv_times[fi] is None
         ):
@@ -166,7 +166,6 @@ def run_batch(
 
     report("extract", f"Preparing {len(fpv_paths) + len(radio_paths)} recordings", 0)
     cv2.setNumThreads(1)
-    estimator = LucasKanadeEstimator()
     errors, clips = [], {"fpv": [], "radio": []}
     identities = config.get("identities", {})
 
@@ -214,9 +213,8 @@ def run_batch(
                         raise ValueError(f"Embedded FPV motion unavailable: {exc}") from exc
                     telemetry_note = str(exc)
             if motion is None and evidence_sources["fpv_visual"]:
-                motion = get_or_extract(str(path), cache, kind, estimator.algorithm_version,
-                    {"sample_fps": sample_fps, "max_dimension": estimator.max_dimension},
-                    lambda: estimator.extract(str(path), sample_fps, progress=lambda event: extraction_progress(kind, path, event)), identity)
+                motion = cached_visual_motion(path, cache, sample_fps, identity,
+                    progress=lambda event: extraction_progress(kind, path, event))
                 info["motion_source"] = "visual"
                 info["motion_label"] = "2D image motion"
                 if telemetry_note:
@@ -437,7 +435,8 @@ def run_batch(
                     matrix[ri, fi] += 0.08 * clock_confidence * agreement * (1 - matrix[ri, fi])
     # Refine likely motion pairs at the full extraction rate. The expensive work
     # is O(number of clips), while the full candidate matrix remains coarse.
-    likely = set(assign(matrix, minimum_score))
+    likely = set(assign_segments(matrix, {key: value.offset_seconds for key, value in results.items()},
+                  [c["info"]["duration"] for c in radio], [c["info"]["duration"] for c in fpv], minimum_score))
     likely.update(
         (ri, int(np.argmax(matrix[ri]))) for ri in range(len(radio)) if np.max(matrix[ri]) >= minimum_score
     )
@@ -471,7 +470,8 @@ def run_batch(
                 f"Refined {index + 1}/{len(likely)} alignments",
                 86 + (index + 1) / max(1, len(likely)) * 5,
             )
-    selected = set(assign(matrix, minimum_score))
+    selected = set(assign_segments(matrix, {key: value.offset_seconds for key, value in results.items()},
+                   [c["info"]["duration"] for c in radio], [c["info"]["duration"] for c in fpv], minimum_score))
     rows = []
     for ri, rc in enumerate(radio):
         for fi, fc in enumerate(fpv):
@@ -489,7 +489,7 @@ def run_batch(
                 0.0,
                 min(rc["info"]["duration"] - max(0.0, offset), fc["info"]["duration"] - max(0.0, -offset)),
             )
-            margin = candidate_margin(matrix, ri, fi)
+            margin = candidate_margin(matrix, ri, fi, multiple_fpv=sum(r == ri for r, _ in selected) > 1)
             strong = (
                 matrix[ri, fi] >= 0.65
                 and margin >= 0.08
@@ -550,7 +550,8 @@ def run_batch(
     assigned_radio = {row["radio_video"] for row in rows if row["global_assignment"]}
     assigned_fpv = {row["fpv_video"] for row in rows if row["global_assignment"]}
     summary = {
-        "version": 2,
+        "version": 3,
+        "pairing_model": "multiple_fpv_segments_per_stickcam",
         "rate_profile": rate_profile,
         "rows": rows,
         "errors": errors,
@@ -612,7 +613,7 @@ def run_batch(
             )
     report(
         "complete",
-        f"{len(assigned_radio)} proposed pairs; {len(summary['unmatched_radio'])} StickCam and {len(summary['unmatched_fpv'])} FPV unmatched; {len(errors)} skipped files",
+        f"{len(assigned_fpv)} proposed FPV pairs across {len(assigned_radio)} StickCam recordings; {len(summary['unmatched_radio'])} StickCam and {len(summary['unmatched_fpv'])} FPV unmatched; {len(errors)} skipped files",
         100,
     )
     return summary

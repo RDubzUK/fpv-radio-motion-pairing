@@ -55,7 +55,7 @@ The user service example is in `deploy/fpv-radio-motion-pairing.service`. Adjust
 
 Choose **Use folders on the server** for media already on the machine. Use the separate **Browse…** button beside each source path to navigate the server's folders and inspect supported video files before choosing. SMB/CIFS shares mounted on the server appear as shortcuts in the folder picker; mount a share on the server first, then browse it there. Files are read in place; the app does not duplicate them. Each input can be a directory or a single video. Directories are scanned at their top level.
 
-Alternatively, choose files from your browser. Uploads go directly to the saved session in 8 MiB chunks. A paused or interrupted upload resumes from its last completed chunk after reselecting the original unfinished files. Each file can be up to 128 GiB; each input group can contain up to 80 videos. Filenames must be unique within a group.
+Alternatively, choose files from your browser. Uploads go directly to the saved session in 8 MiB chunks. A paused or interrupted upload resumes from its last completed chunk after reselecting the original unfinished files. Each file can be up to 128 GiB; there is no fixed video-count cap. Larger sessions take more processing time; selecting a subset for matching reduces comparisons. Filenames must be unique within a group.
 
 Supported extensions: MP4, MOV, MKV, AVI, M4V and WebM. Decoding depends on FFmpeg's available codecs.
 
@@ -118,7 +118,7 @@ Open a proposed pair, or review an unmatched clip's best candidate. The FPV sele
 - The frame buttons move the shared cursor or adjust the offset at the selected export rate.
 - Choose one microphone for playback, or mute both.
 - **Fast preview · 480p on demand** starts from the requested source time, prepares a four-second H.264/AAC fragment and buffers a small amount ahead. It does not queue an entire-video proxy. Seeking requests fragments at the new position; both videos keep source-relative timestamps for paired playback. Uncheck it to try supported original files. Unsupported originals fall back to fast preview. Analysis and exports use the originals.
-- Save the pairing and alignment, or leave the StickCam unmatched. Saved changes preserve one-to-one pairing.
+- Save each FPV segment’s pairing and alignment, or reject that segment. One StickCam can hold several FPV segments; saving another does not replace earlier segments.
 
 Export a single pair or all reviewed pairs. Available profiles:
 
@@ -288,3 +288,43 @@ Extraction and comparison now default to 30 Hz with two seconds minimum overlap.
 ### StickCam extraction timing
 
 Each calibrated StickCam clip records wall-clock time spent processing during movement-data derivation. Fresh extraction time, cache reuse lookup time, extraction rate, sample count, and failures are saved in the persistent derivation log and shown in the per-video status table. While a clip is running, its elapsed time updates with task progress.
+
+### Prepare FPV visual motion separately
+
+**Prepare FPV visual motion**, above Find matching flights, lists every FPV recording with duration, embedded-motion availability and saved visual-motion status. Use **Check embedded motion · all FPV** to inspect supported gyro/attitude without running optical flow. Select clips for a smaller check or derivation, or choose **Derive all without embedded motion**. Derivation checks unknown sources first, skips clips with supported gyro or quaternion-derived rates, and processes eligible clips sequentially. Parser/decoder failures appear per clip in the preparation log. No StickCam calibration is required.
+
+Visual extraction Hz and Decode share the matching controls. Reducing Hz also lowers Compare Hz when necessary. Progress reports overall completion, per-clip elapsed time and an observed visual-extraction ETA. Cancellation keeps completed caches. Matching waits while FPV or StickCam preparation is active. The table reports samples, timeline coverage, usable tracking percentage and extraction time where recorded; older caches remain reusable even when their original time was not logged. Use **View motion** to inspect a saved clip in Motion comparison.
+
+Preparation, matching and chart review share compressed visual fingerprints by source identity, sampling rate and algorithm version, including legacy integer-Hz caches. Other saved rates remain on disk and are shown when detected; switch back to reuse them. Image rotation and horizontal/vertical flow are 2D visual proxies, not drone body gyro or recovered gravity. Fast freestyle, blur and featureless sky can lose tracking; usable tracking percentage is a quality measure, not confidence that two recordings match. Embedded gyro/attitude remains preferred for automatic matching.
+
+Session creation and pair export have no fixed recording-count limit. File size, unique filenames, available disk space and bounded worker concurrency remain validated. All-to-all matching grows with both clip counts; select a subset to avoid unnecessary work in large sessions.
+
+### Split FPV recordings, including O4 footage
+
+Matching can propose several independently supported FPV files for one StickCam recording, provided their aligned StickCam ranges do not substantially overlap. Each FPV file has one StickCam owner; competing/duplicate coverage remains for review. A second valid segment is not treated as a competing flight when assessing candidate margin.
+
+After confirming a segment’s sync, **Find related FPV after saving alignment** (enabled by default) checks all session FPV filenames, including clips outside a selected matching scope. **Save & find related FPV segments** also starts this scan. The confirmed FPV offset anchors relative camera time; additional FPV filename times predict offsets into the actual StickCam duration. Dates need not be correct or match between cameras. The scan reads metadata when missing, reports progress/cancellation, and adds a **Related FPV segments** table. Preview each predicted alignment, adjust it and save it individually. Timestamp candidates do not receive an audio/motion confidence score or become confirmed automatically.
+
+Repeated timestamps, overlapping candidates, copied/stabilised files and clock resets are flagged for review. Files without usable filename timestamps need independent audio/motion matching; file sequence numbers alone do not establish sync. Each saved segment exports its own common range and corresponding StickCam range. Batch export accepts repeated StickCam sources with distinct FPV segments, using separate output folders to preserve every export.
+
+### Session list and collapsible workspace
+
+Use **Delete session** beside Rename session to remove a session from the frontend list. This is reversible under **Deleted sessions · restore**. It does not delete exports, original footage, shared fingerprints or existing download links, and does not reclaim their disk space. Processing must be stopped first.
+
+Once all source recordings are ready, **Add recordings** is hidden; use **New session** to set up another batch. Every major panel has a clickable, keyboard-accessible heading, with **Collapse all / Expand all** in the header. Explicit preview/editor/chart navigation opens its destination; routine progress updates preserve collapsed sections. Collapsing a video panel pauses its players.
+
+Calibration view: selecting **Upside down · 180°** automatically enables a horizontal mirror of the still/reference preview. The mirror can be toggled independently. Gimbal boxes, tip/centre clicks and shell corners map to original frame coordinates; labels remain readable. A mirrored outline is reordered to the source image’s corner order. View mirroring does not alter saved stick inputs or apply a second axis correction; the tracker’s saved 180° setting still reverses both stick axes. Horizontal mirroring changes left/right and does not rotate the image upright.
+
+You can replace an incorrect session radio: choose the correct model or Other, select a clear frame, verify its outline/gimbals/tips, then choose **Change session radio using this frame**. The new reference gets a fresh revision. Previous orientation checks and pending automatic calibration suggestions are retired; manually confirmed calibrations remain saved for review. Finish/cancel current radio checks before changing it.
+
+The folder picker identifies whether you are selecting **FPV video** or **StickCam video** footage. **Use this folder** stays above its scrollable file list. The larger dialog keeps its navigation/selection controls visible within the available screen height.
+
+Session cards have lazy FPV thumbnails. The selected file is the available FPV recording closest to the mean modified date of all available recordings in that session. A still at 90 seconds is preferred, 60 seconds for shorter clips, or the midpoint if under a minute; unavailable files are skipped and up to three candidates are tried. Small JPEGs are cached on disk by source size/modified date and reused after restart. New uploads retain the browser's original modified date for selection; older uploads use their server file dates.
+
+### Radio model shape hints
+
+The radio dropdown includes **Other**, **Auto-detect**, and specific RadioMaster TX16S, Boxer, GX12, TX15, TX12, Pocket and Zorro, TBS Tango 2 and Mambo, and BETAFPV LiteRadio 3 families. MAX/MKII/Crush/Pro variants are identified on the appropriate family entry; HelloRadioSky and the generic Jumper option have been removed, and the previous “My session radio” option is now Other.
+
+`fpv_matcher/radio/models.py` records manufacturer links, approximate normalized shell polygons, body proportions, gimbal landmarks/radii and display placement. The preview shows that internal geometry. These are broad detection priors, not measured engineering outlines or a trained classifier. With a marked shell, the selected model provides a small ranking prior for visible rim pairs. Without a shell or usable session image, observed gimbal rims anchor candidate body silhouettes, which need distributed image-edge support before corners can be proposed. Auto-detect lists plausible models; similar cases or covered shells remain ambiguous, and uncertain outlines/orientations require marking. The 5-second calibration scan uses these hints too and tries both upright and inverted hypotheses. Suggestions remain unconfirmed until reviewed. Hands and pinch/thumb grips can still obscure the useful edges.
+
+An operator-confirmed session frame remains the stronger photographic reference and is attempted first. Selecting Other uses that reference or generic rim evidence without assuming a catalogue silhouette. Changing the dropdown selects a pending model; **Change session radio using this frame** confirms its name and a fresh image reference. Existing manually confirmed calibrations and cached movement data are retained.

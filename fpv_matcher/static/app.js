@@ -5,13 +5,16 @@ const state = { job: null, results: null, source: 'upload', busy: false, uploadC
   calibration: null, metadata: null, tool: null, drag: null, pair: null, page: 0,
   playing: false, startingPlayback: false, animation: null, lastCorrection: 0,
   frameController: null, frameURL: null, frameToken: 0, offsetToken: 0, targets: {fpv: new Set(), radio: new Set()},
-  calibrationName: null, calibrationProposalId: null, calibrationDrafts: {} };
+  calibrationMirrorOverride: null, calibrationName: null, calibrationProposalId: null, calibrationDrafts: {} };
 const clone = value => JSON.parse(JSON.stringify(value));
 const calibrationScan = { id: null, jobId: null, token: 0, timer: null, running: false, rows: [] };
+const segmentScan = {token:0, timer:null, task:null, running:false};
+const fpvPreparation = {key:'', refreshed:0, token:0, task:null, jobId:null, timer:null, running:false, selected:new Set()};
 const radioOrientation = { token: 0, timer: null, task: null, running: false, result: null };
 const part = value => encodeURIComponent(value);
 const path = suffix => `/api/jobs/${state.job.id}${suffix}`;
 const show = (id, visible = true) => $(id).classList.toggle('hidden', !visible);
+function openPanel(id) { show(id); $(id).open = true; }
 const message = (id, text, error = false) => { $(id).textContent = text; $(id).classList.toggle('error', error); };
 const bytes = value => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GiB` : `${(value / 1024 ** 2).toFixed(1)} MiB`;
 const time = (value, precise = false) => {
@@ -24,6 +27,7 @@ const clipDuration = record => Number.isFinite(record?.metadata?.duration) ? tim
 const clipLabel = record => `${record.name} · ${clipDuration(record)}`;
 const offsetText = value => `${value >= 0 ? '+' : ''}${Number(value).toFixed(3)}s`;
 const el = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
+let radioModels = [];
 const action = (text, callback, className = 'secondary') => { const button = el('button', text, className); button.addEventListener('click', callback); return button; };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function api(url, options = {}) {
@@ -72,7 +76,7 @@ function updateEvidenceSummary() {
   if (mode.motion && $('audio-only-unconfigured').checked && !mode.audio) notes.push('Unconfigured StickCam fallback requires both audio sources.');
   message('evidence-summary', notes.join(' '), !valid || (mode.motion && $('audio-only-unconfigured').checked && !mode.audio));
   $('audio-only-unconfigured').disabled = !mode.motion;
-  if (state.job) $('analyze').disabled = activeAnalysis() || stickPreparation.running || !Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size) || !valid || (mode.motion && $('audio-only-unconfigured').checked && !mode.audio);
+  if (state.job) $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size) || !valid || (mode.motion && $('audio-only-unconfigured').checked && !mode.audio);
 }
 function calibrated(config) { return config && (config.exclude || config.skip_motion || ['left_gimbal', 'right_gimbal'].every(side => config[side]?.tip_x !== undefined)); }
 function updateMatchTargetOptions() {
@@ -131,12 +135,15 @@ function updateCalibrationCount() {
 function updateJobUI() {
   if (!state.job) return;
   const completeInputs = Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size);
+  show('inputs-panel', !completeInputs);
   show('calibration-panel', completeInputs);
   show('analysis-panel', completeInputs);
+  show('fpv-preparation-panel', completeInputs);
+  if (completeInputs) refreshFPVData().catch(error => message('fpv-data-message', error.message, true));
   show('motion-panel', completeInputs);
   show('video-list-panel', completeInputs);
   updateMotionOptions();
-  $('analyze').disabled = activeAnalysis() || stickPreparation.running || !completeInputs;
+  $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !completeInputs;
   updateEvidenceSummary();
   $('analyze').textContent = ['failed', 'interrupted', 'cancelled', 'complete'].includes(state.job.status) ? 'Run analysis again (reuse cache)' : 'Analyze recordings';
   show('cancel-analysis', activeAnalysis());
@@ -147,13 +154,15 @@ function updateJobUI() {
   message('analysis-message', state.job.message, state.job.status === 'failed');
   ['save-calibration', 'check-tracking', 'copy-regions'].forEach(id => $(id).disabled = activeAnalysis());
   updateRadioOrientationUI();
-  $('stick-sampling-ratio').disabled = activeAnalysis() || stickPreparation.running;
+  $('stick-sampling-ratio').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running;
   updateMarkTools();
   for (const id of ['auto-find-radio', 'auto-find-all']) $(id).disabled = activeAnalysis() || calibrationScan.running || !completeInputs;
   if (completeInputs) updateCalibrationCount();
   const latestScan = state.job.calibration_scans?.at(-1);
   if (latestScan && calibrationScan.id !== latestScan.id) watchCalibrationScan(latestScan.id, state.job.id, state.jobToken);
   updateMatchTargetOptions();
+  const activeSegmentScan = state.job.segment_scans?.find(task => ['queued', 'running'].includes(task.status));
+  if (activeSegmentScan && segmentScan.task !== activeSegmentScan.id) watchRelatedSegments(activeSegmentScan.id, state.job.id, state.jobToken);
   const early = state.job.early_proposal; show('early-proposal', early?.status === 'pending');
   if (early?.status === 'pending') message('early-proposal-evidence', `${early.candidate.fpv_video} ↔ ${early.candidate.radio_video} · offset ${offsetText(early.candidate.offset_seconds)} · ${early.remaining.length} StickCam candidates remain unscanned. ${sectionsText(early.candidate)}`);
   $('prepare').textContent = state.job.status === 'uploading' ? 'Resume uploads' : 'Prepare new session';
@@ -168,23 +177,43 @@ function updateJobUI() {
 async function history() {
   const data = await api('/api/jobs');
   $('history').replaceChildren();
-  if (!data.jobs.length) { $('history').append(el('span', 'Your sessions will appear here.', 'muted')); return; }
+  if (!data.jobs.length) $('history').append(el('span', 'Your sessions will appear here.', 'muted'));
   for (const job of data.jobs) {
-    const button = action(job.label, guarded(() => selectJob(job.id), 'input-error'), `secondary${state.job?.id === job.id ? ' active' : ''}`);
+    const button = action('', guarded(() => selectJob(job.id), 'input-error'), `secondary${state.job?.id === job.id ? ' active' : ''}`);
+    if (job.thumbnail_url) {
+      const image = el('img', undefined, 'session-thumbnail'); image.src = job.thumbnail_url; image.alt = `FPV frame from ${job.label}`; image.loading = 'lazy'; image.decoding = 'async';
+      image.onerror = () => image.replaceWith(el('span', 'FPV thumbnail unavailable', 'session-thumbnail-placeholder'));
+      button.append(image);
+    }
+    button.append(el('span', job.label, 'session-title'));
     button.append(el('small', `${job.radio_count} StickCam / ${job.fpv_count} FPV · ${job.status}`));
     button.disabled = state.busy; $('history').append(button);
   }
+  const deleted = await api('/api/deleted-sessions');
+  show('deleted-sessions', deleted.sessions.length > 0); $('deleted-session-list').replaceChildren();
+  for (const session of deleted.sessions) $('deleted-session-list').append(action(`Restore ${session.label}`, guarded(async () => {
+    await api(`/api/jobs/${session.id}/restore`, {method:'POST'}); await history(); await selectJob(session.id);
+    message('session-message', 'Session restored; exports were kept.');
+  }, 'session-message')));
 }
 function clearSession() {
+  segmentScan.token++; clearTimeout(segmentScan.timer); segmentScan.running = false; segmentScan.task = null;
+  show('related-segments', false);
+  fpvPreparation.token++; clearTimeout(fpvPreparation.timer); fpvPreparation.key = '';
+  fpvPreparation.running = false; fpvPreparation.task = null; fpvPreparation.selected.clear(); state.fpvData = null;
+  $('fpv-data-rows').replaceChildren(); $('fpv-data-log').replaceChildren();
+  show('fpv-data-progress', false); show('fpv-preparation-cancel', false);
   resetMotionReview();
   stickPreparation.token++; clearTimeout(stickPreparation.timer); stickPreparation.key = '';
   stickPreparation.running = false; stickPreparation.task = null; state.stickData = null;
   show('derive-sticks-cancel', false); show('stick-data-progress', false); $('stick-data-log').replaceChildren();
   calibrationScan.token++; clearTimeout(calibrationScan.timer); calibrationScan.id = null; calibrationScan.rows = []; calibrationScan.running = false;
   radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
-  $('session-radio-label').value = ''; show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
+  $('session-radio-label').value = 'auto'; renderRadioShape(); show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
   state.calibrationName = state.calibrationProposalId = null; state.calibrationDrafts = {};
   show('auto-calibration-review', false); show('auto-find-cancel', false); show('auto-calibration-progress', false); message('auto-calibration-message', '');
+  show('inputs-panel'); show('delete-session-confirmation', false);
+  for (const panel of document.querySelectorAll('[data-major-panel]')) panel.open = true;
   state.jobToken++; state.calToken++; state.viewerToken++;
   state.frameController?.abort(); state.frameToken++;
   clearTimeout(state.pollTimer); for (const timer of state.exportTimers.values()) clearTimeout(timer); state.exportTimers.clear();
@@ -193,7 +222,7 @@ function clearSession() {
   state.targets = {fpv: new Set(), radio: new Set()};
   localStorage.removeItem('fpv-session');
   show('rename-session-controls', false); $('rename-session-label').value = ''; message('session-message', '');
-  for (const id of ['video-list-panel', 'motion-panel', 'calibration-panel', 'analysis-panel', 'results-panel', 'viewer-panel', 'portrait-panel', 'exports-panel', 'diagnostics-panel', 'upload-progress']) show(id, false);
+  for (const id of ['fpv-preparation-panel', 'video-list-panel', 'motion-panel', 'calibration-panel', 'analysis-panel', 'results-panel', 'viewer-panel', 'portrait-panel', 'exports-panel', 'diagnostics-panel', 'upload-progress']) show(id, false);
   message('input-error', ''); $('prepare').textContent = 'Prepare session';
 }
 function loadRateProfile(profile) {
@@ -259,8 +288,9 @@ scheduleRateTotals();
 async function selectJob(id) {
   clearSession(); const token = state.jobToken;
   const job = await api(`/api/jobs/${id}`); if (token !== state.jobToken) return;
+  if (job.deleted_at) { await history(); message('session-message', 'This session was deleted from the frontend; use Deleted sessions to restore it.'); return; }
   state.job = job; state.source = job.source; localStorage.setItem('fpv-session', id);
-  $('session-radio-label').value = job.radio_profile?.label || '';
+  $('session-radio-label').value = job.radio_profile?.model_id || (job.radio_profile ? 'other' : 'auto'); renderRadioShape();
   $('rename-session-label').value = job.label || ''; show('rename-session-controls');
   setSource(job.source); updateJobUI();
   const oldDefaults = {sample_fps:15, match_fps:7.5, min_overlap:5}, newDefaults = {sample_fps:30, match_fps:30, min_overlap:2};
@@ -275,6 +305,7 @@ async function selectJob(id) {
   if (job.settings.match_target_kind !== 'all' && job.settings.match_target_kind) state.targets[job.settings.match_target_kind] = new Set(job.settings.match_target_names || (job.settings.match_target_name ? [job.settings.match_target_name] : []));
   updateMatchTargetOptions();
   refreshStickData(true).catch(error => message('stick-data-message', error.message, true));
+  refreshFPVData(true).catch(error => message('fpv-data-message', error.message, true));
   await history();
   if (job.status === 'complete') await loadResults();
   if (job.exports?.length) renderExports();
@@ -285,7 +316,7 @@ async function selectJob(id) {
 async function loadClipDurations(jobId, token) {
   const records = Object.entries(state.job.inputs).flatMap(([kind, items]) => items.filter(r => r.uploaded === r.size).map(record => ({kind, record})));
   let index = 0, refreshed = 0;
-  const render = () => { updateMotionOptions(); updateMatchTargetOptions(); updateCalibrationCount(); updateStickSamplingPreview(); };
+  const render = () => { updateMotionOptions(); updateMatchTargetOptions(); updateCalibrationCount(); updateStickSamplingPreview(); renderFPVData(); };
   async function worker() {
     while (token === state.jobToken && index < records.length) {
       const {kind, record} = records[index++];
@@ -340,10 +371,13 @@ async function browseFolder(path) {
     }
     $('folder-entries').append(row);
   }
-  message('folder-picker-message', listing.truncated ? 'Showing the first 500 folders and videos. Narrow the path to see more.' : 'Choose a folder with the FPV or StickCam recordings.');
+  message('folder-picker-message', listing.truncated ? 'Showing the first 500 folders and videos. Narrow the path to see more.' : `Choose a folder containing ${folderTarget?.id === 'fpv-path' ? 'FPV' : 'StickCam'} recordings.`);
 }
 for (const button of document.querySelectorAll('.browse-folder')) button.onclick = guarded(async () => {
   folderTarget = $(button.dataset.folderField);
+  const purpose = folderTarget.id === 'fpv-path' ? 'FPV video' : 'StickCam video';
+  $('folder-picker-title').textContent = `Choose ${purpose} source folder`;
+  $('folder-purpose').textContent = `Selecting ${purpose} footage`;
   $('folder-picker').showModal();
   const currentPath = folderTarget.value.trim();
   const fpvPath = folderTarget.id === 'radio-path' ? $('fpv-path').value.trim() : '';
@@ -378,7 +412,7 @@ $('prepare').onclick = guarded(async () => {
       if (state.source === 'local') body = { source: 'local', fpv_path: $('fpv-path').value.trim(), radio_path: $('radio-path').value.trim() };
       else {
         if (!files.fpv.length || !files.radio.length) throw new Error('Choose recordings of both types.');
-        body = { source: 'upload', files: Object.fromEntries(Object.entries(files).map(([kind, list]) => [kind, list.map(file => ({ name: file.name, size: file.size }))])) };
+        body = { source: 'upload', files: Object.fromEntries(Object.entries(files).map(([kind, list]) => [kind, list.map(file => ({ name: file.name, size: file.size, last_modified: file.lastModified }))])) };
       }
       body.label = $('session-label').value.trim();
       const job = await api('/api/jobs', { method: 'POST', json: body }); await selectJob(job.id);
@@ -435,6 +469,7 @@ function rememberCalibrationDraft() {
   state.calibrationDrafts[state.calibrationName] = { config, proposalId: state.calibrationProposalId };
 }
 async function loadCalibration(name) {
+  openPanel('calibration-panel');
   if (!name || !state.job) return;
   rememberCalibrationDraft();
   const token = ++state.calToken, jobToken = state.jobToken;
@@ -442,6 +477,7 @@ async function loadCalibration(name) {
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas'); show('tracking-check', false);
   state.calibrationName = name; state.calibrationProposalId = state.calibrationDrafts[name]?.proposalId || null;
   state.tool = state.drag = null; state.calibration = clone(state.calibrationDrafts[name]?.config || state.job.calibrations[name] || emptyCalibration());
+  state.calibrationMirrorOverride = null;
   $('radio-rotation-deg').value = String(state.calibration.radio_rotation_deg || 0);
   radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
   show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
@@ -518,10 +554,37 @@ async function showFrame(reset = true, token = state.calToken) {
   if (state.job.radio_profile && !activeAnalysis()) checkRadioOrientation(false, true).catch(error => message('radio-orientation-message', error.message, true));
 }
 $('calibration-clip').onchange = guarded(() => loadCalibration($('calibration-clip').value), 'calibration-message');
+async function loadRadioModels() {
+  const data = await api('/api/radio-models'); radioModels = data.models;
+  const select = $('session-radio-label'), previous = select.value;
+  select.replaceChildren();
+  for (const [value, label] of [['auto', 'Auto-detect · confirm a model'], ['other', 'Other']]) { const option = el('option', label); option.value = value; select.append(option); }
+  for (const model of radioModels) { const option = el('option', `${model.label}${model.variants.length ? ` · ${model.variants.join(' / ')}` : ''}`); option.value = model.id; select.append(option); }
+  select.value = previous || 'auto'; renderRadioShape();
+}
+function renderRadioShape() {
+  const model = radioModels.find(row => row.id === $('session-radio-label').value), canvas = $('radio-shape-preview');
+  show('radio-shape-preview', !!model);
+  const hint = $('radio-shape-message'); hint.replaceChildren();
+  if (!model) { hint.textContent = $('session-radio-label').value === 'other' ? 'Other uses your confirmed radio frame and visible gimbal rims, without a catalogue shape assumption.' : 'Compare known shell shapes after detecting gimbal rims. Predictions remain unconfirmed; similar radios and covered bodies may need a manual outline.'; return; }
+  const context = canvas.getContext('2d'); context.clearRect(0, 0, canvas.width, canvas.height);
+  const w = Math.min(250, 145 * model.body_aspect), h = w / model.body_aspect, x = (300 - w) / 2, y = (180 - h) / 2;
+  context.beginPath(); model.shell.forEach(([px, py], i) => { if (i) context.lineTo(x + px*w, y + py*h); else context.moveTo(x + px*w, y + py*h); }); context.closePath();
+  context.fillStyle = '#22283e'; context.fill(); context.strokeStyle = '#c3a0f4'; context.lineWidth = 2; context.stroke();
+  context.strokeStyle = '#7fd9fa';
+  for (const [px, py] of model.gimbals) { context.beginPath(); context.arc(x + px*w, y + py*h, w*model.gimbal_radius, 0, Math.PI*2); context.stroke(); context.beginPath(); context.arc(x + px*w, y + py*h, 3, 0, Math.PI*2); context.fillStyle = '#7fd9fa'; context.fill(); }
+  if (model.screen) { const [a,b,c,d] = model.screen; context.strokeStyle = '#92a0ba'; context.strokeRect(x+a*w, y+b*h, (c-a)*w, (d-b)*h); }
+  hint.append(document.createTextNode(`Approximate ${model.family} shell and gimbal layout. Shape supports detection; your confirmed session image takes priority. `));
+  const link = el('a', 'Manufacturer reference'); link.href = model.source; link.target = '_blank'; link.rel = 'noopener'; hint.append(link);
+}
+$('session-radio-label').onchange = renderRadioShape;
+
 function updateRadioOrientationUI() {
   const profile = state.job?.radio_profile, unavailable = !state.metadata || $('exclude-clip').checked || activeAnalysis();
   message('session-radio-message', profile ? `Confirmed: ${profile.label} · reference ${profile.name} at ${time(profile.reference_time)}. Predictions identify this saved appearance; the model label can be corrected above.` : 'Confirm one clear, calibrated radio view to establish the expected appearance for this session.');
   $('radio-rotation-deg').disabled = unavailable;
+  $('confirm-session-radio').textContent = profile ? 'Change session radio using this frame' : 'Confirm radio & use this frame as reference';
+  $('cal-mirror-horizontal').disabled = unavailable;
   $('confirm-session-radio').disabled = unavailable || $('skip-motion').checked || radioOrientation.running;
   for (const id of ['check-radio-midpoint','check-radio-all']) $(id).disabled = unavailable || !profile || radioOrientation.running;
   const row = radioOrientation.result;
@@ -537,6 +600,7 @@ function applyRadioRotation(rotation) {
     if ((rotation === 0 && !physicalLeftOnImageLeft) || (rotation === 180 && physicalLeftOnImageLeft))
       [state.calibration.left_gimbal, state.calibration.right_gimbal] = [right, left];
   }
+  state.calibrationMirrorOverride = null; state.drag = null;
   state.calibration.radio_rotation_deg = rotation; state.calibration.radio_orientation_confirmed = false;
   $('radio-rotation-deg').value = String(rotation); drawRegions();
   message('radio-orientation-message', `${rotation === 180 ? 'Upside down' : 'Upright'} at this calibration frame. Check physical left/right regions and tips, then confirm calibration to save. Corrected stick directions require movement data derived with this orientation.`);
@@ -602,14 +666,21 @@ $('cancel-radio-orientation').onclick = guarded(async () => {
 }, 'radio-orientation-message');
 $('confirm-session-radio').onclick = guarded(async () => {
   const jobId = state.job.id, jobToken = state.jobToken, name = $('calibration-clip').value;
-  const label = $('session-radio-label').value.trim();
-  if (!label) throw new Error('Enter the radio model or a custom name to confirm it.');
+  const choice = $('session-radio-label').value;
+  if (choice === 'auto') throw new Error('Choose the suggested radio model, or Other, before confirming.');
+  const label = radioModels.find(model => model.id === choice)?.label || 'Other';
   if (state.calibration.radio_outline?.length !== 4) throw new Error('Mark the radio outline, both gimbals and both tips before confirming this reference.');
   await saveCalibration(false);
   if (jobToken !== state.jobToken || name !== $('calibration-clip').value) return;
   const saved = await api(`/api/jobs/${jobId}/session-radio`, {method:'PUT', json:{radio_video:name, label}});
   if (jobToken !== state.jobToken) return;
-  state.job.radio_profile = saved.profile; state.job.radio_orientation_checks = {}; updateRadioOrientationUI();
+  state.job.radio_profile = saved.profile; state.job.radio_orientation_checks = {};
+  calibrationScan.token++; clearTimeout(calibrationScan.timer); calibrationScan.id = null; calibrationScan.rows = []; calibrationScan.running = false;
+  state.job.calibration_scans = [];
+  for (const [clip, draft] of Object.entries(state.calibrationDrafts)) if (draft.proposalId) delete state.calibrationDrafts[clip];
+  show('auto-calibration-review', false); show('radio-orientation-result', false); radioOrientation.result = null;
+  message('auto-calibration-message', 'Session radio reference changed. Find new suggestions; previously confirmed calibrations remain saved for review.');
+  updateRadioOrientationUI();
   await checkRadioOrientation();
 }, 'radio-orientation-message');
 function proposalConfirmed(row) { return row.confirmed || state.job?.calibration_reviews?.[row.name]?.proposal_id === calibrationScan.id; }
@@ -639,7 +710,8 @@ async function openCalibrationProposal(row) {
   await showFrame(false);
   if (jobToken !== state.jobToken) return;
   updateMarkTools(); rememberCalibrationDraft();
-  message('calibration-message', `Pending suggestion at ${row.at.toFixed(1)}s. ${row.message} Dashed circles are proposed tips; confirm only after checking the outline, housings, centres and both tips.`);
+  const shapes = row.proposal?.shape_matches?.map(candidate => candidate.label).join(', ');
+  message('calibration-message', `Pending suggestion at ${row.at.toFixed(1)}s. ${row.message} ${shapes ? `Shape candidates: ${shapes}. ` : ''}${row.proposal?.shape_message || ''} Dashed circles are proposed tips; confirm only after checking the outline, housings, centres and both tips.`);
 }
 async function navigateCalibration(direction) {
   const records = state.job.inputs.radio, index = records.findIndex(r => r.name === $('calibration-clip').value);
@@ -655,7 +727,7 @@ async function startCalibrationSearch(all = false) {
   const jobId = state.job.id, jobToken = state.jobToken;
   const task = await api(`/api/jobs/${jobId}/calibration-scan`, {method:'POST', json: {
     radio_video: all ? null : $('calibration-clip').value, start: all ? 0 : Number($('reference-time').value),
-    search_seconds: Number($('auto-search-seconds').value), stickcam_mode: all ? 'wonky' : $('fixed-camera').checked ? 'fixed' : 'wonky'
+    radio_model: $('session-radio-label').value, search_seconds: Number($('auto-search-seconds').value), stickcam_mode: all ? 'wonky' : $('fixed-camera').checked ? 'fixed' : 'wonky'
   }});
   if (jobToken !== state.jobToken) return;
   watchCalibrationScan(task.id, jobId, jobToken);
@@ -704,7 +776,7 @@ $('auto-regions').onclick = guarded(async () => {
   const previousCalibration = JSON.stringify(state.calibration);
   const outlined = state.calibration.radio_outline?.length === 4;
   message('calibration-message', outlined ? 'Checking gimbal rims inside the radio outline…' : 'Checking saved radio references and visible gimbal rims…');
-  const proposal = await api(path(`/calibration/${part(name)}/suggest?at=${referenceTime}`), { method: 'POST', json: { radio_outline: state.calibration.radio_outline || [], radio_rotation_deg: state.calibration.radio_rotation_deg || 0 } });
+  const proposal = await api(path(`/calibration/${part(name)}/suggest?at=${referenceTime}`), { method: 'POST', json: { radio_model: $('session-radio-label').value, radio_outline: state.calibration.radio_outline || [], radio_rotation_deg: state.calibration.radio_rotation_deg || 0 } });
   if (token !== state.calToken || jobToken !== state.jobToken || frameToken !== state.frameToken || previousCalibration !== JSON.stringify(state.calibration)) return;
   const sx = state.metadata.width / proposal.frame_width, sy = state.metadata.height / proposal.frame_height;
   if (proposal.radio_rotation_deg !== undefined) {
@@ -729,7 +801,7 @@ $('auto-regions').onclick = guarded(async () => {
   drawRegions();
   const missingTips = ['left_gimbal', 'right_gimbal'].filter(side => state.calibration[side].tip_x === undefined);
   const tipMessage = missingTips.length ? `Could not reliably locate the ${missingTips.map(side => side.startsWith('left') ? 'left' : 'right').join(' and ')} tip${missingTips.length > 1 ? 's' : ''}; click the corresponding tip tool to mark ${missingTips.length > 1 ? 'them' : 'it'}.` : 'Both current stick tips are suggested. Review all markers, adjust any point, then save or check tracking.';
-  message('calibration-message', `${proposal.reference_clip ? `Located a saved radio reference from ${proposal.reference_clip}.` : `Suggested gimbal housings${outlined ? ' inside the marked outline' : ''}.`} ${tipMessage} Circles mark tips; crosses mark estimated neutral centres.`);
+  message('calibration-message', `${proposal.reference_clip ? `Located a saved radio reference from ${proposal.reference_clip}.` : `Suggested gimbal housings${outlined ? ' inside the marked outline' : ''}.`} ${proposal.shape_matches?.length ? `Shape candidates: ${proposal.shape_matches.map(row => row.label).join(', ')}. ` : ''}${proposal.shape_message || ''} ${tipMessage} Circles mark tips; crosses mark estimated neutral centres.`);
 }, 'calibration-message');
 $('fixed-camera').onchange = () => {
   if (!state.calibration) return;
@@ -754,9 +826,12 @@ for (const button of document.querySelectorAll('[data-tool]')) button.onclick = 
   document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item === button));
   message('calibration-message', state.tool === 'radio-outline' ? 'Click the radio body corners in order: top left, top right, bottom right, bottom left. Stay on the shell and avoid including your hands.' : state.tool.startsWith('box') ? 'Drag a rectangle around the complete gimbal and its housing.' : state.tool.startsWith('tip') ? 'Click the centre of the visible stick tip.' : 'Click the neutral gimbal centre (where the tip would be at rest).');
 };
+function calibrationMirrored() { return state.calibrationMirrorOverride ?? state.calibration?.radio_rotation_deg === 180; }
+$('cal-mirror-horizontal').onchange = () => { state.calibrationMirrorOverride = $('cal-mirror-horizontal').checked; state.drag = null; drawRegions(); };
 function coordinates(event) {
   const bounds = $('roi-canvas').getBoundingClientRect();
-  return { x: Math.max(0, Math.min(state.metadata.width - 1, (event.clientX - bounds.left) / bounds.width * state.metadata.width)),
+  const x = (event.clientX - bounds.left) / bounds.width * state.metadata.width;
+  return { x: Math.max(0, Math.min(state.metadata.width - 1, calibrationMirrored() ? state.metadata.width - x : x)),
     y: Math.max(0, Math.min(state.metadata.height - 1, (event.clientY - bounds.top) / bounds.height * state.metadata.height)) };
 }
 $('roi-canvas').onpointerdown = event => {
@@ -774,6 +849,10 @@ $('roi-canvas').onpointerup = event => {
     if (outline.length >= 4) state.calibration.radio_outline = [];
     state.calibration.radio_outline = [...(state.calibration.radio_outline || []), [Math.round(end.x), Math.round(end.y)]];
     const count = state.calibration.radio_outline.length;
+    if (count === 4 && calibrationMirrored()) {
+      const points = state.calibration.radio_outline;
+      state.calibration.radio_outline = [points[1], points[0], points[3], points[2]];
+    }
     message('calibration-message', count === 4 ? 'Radio outline saved in this calibration. Check the orientation trace during the tracking preview.' : `Radio outline: ${count}/4 corners marked.`);
   } else if (kind === 'box') {
     const x = Math.floor(Math.min(start.x, end.x)), y = Math.floor(Math.min(start.y, end.y));
@@ -791,11 +870,21 @@ $('roi-canvas').onpointerup = event => {
 $('roi-canvas').onpointercancel = () => { state.drag = null; drawRegions(); };
 function drawRegions() {
   const canvas = $('roi-canvas'), context = canvas.getContext('2d'); context.clearRect(0, 0, canvas.width, canvas.height);
+  const mirrored = calibrationMirrored();
+  $('cal-stage').classList.toggle('cal-mirrored', mirrored); $('cal-mirror-horizontal').checked = mirrored;
+  context.save();
+  if (mirrored) { context.translate(canvas.width, 0); context.scale(-1, 1); }
+  // Geometry uses source coordinates; draw labels normally so they remain readable.
+  const label = (text, x, y) => {
+    context.save();
+    if (mirrored) { context.setTransform(1, 0, 0, 1, 0, 0); x = canvas.width - x - context.measureText(text).width; }
+    context.fillText(text, x, y); context.restore();
+  };
   const line = Math.max(2, canvas.width / 500); context.lineWidth = line; context.font = `${Math.max(14, canvas.width / 70)}px system-ui`;
   for (const [index, side] of ['left_gimbal', 'right_gimbal'].entries()) {
     const spec = state.calibration?.[side]; if (!spec) continue;
     context.strokeStyle = context.fillStyle = index ? '#4dccff' : '#d787ff'; context.strokeRect(spec.x, spec.y, spec.width, spec.height);
-    context.fillText(index ? 'RIGHT' : 'LEFT', spec.x + line * 2, Math.max(20, spec.y - line * 2));
+    label(index ? 'RIGHT' : 'LEFT', spec.x + line * 2, Math.max(20, spec.y - line * 2));
     const cx = spec.x + spec.center_x, cy = spec.y + spec.center_y;
     context.beginPath(); context.moveTo(cx - line * 4, cy); context.lineTo(cx + line * 4, cy); context.moveTo(cx, cy - line * 4); context.lineTo(cx, cy + line * 4); context.stroke();
     if (spec.tip_x !== undefined) {
@@ -804,7 +893,7 @@ function drawRegions() {
       context.setLineDash(spec.tip_suggested ? [line * 3, line * 2] : []);
       context.beginPath(); context.arc(tx, ty, radius, 0, Math.PI * 2); context.stroke(); context.setLineDash([]);
       context.beginPath(); context.arc(tx, ty, line, 0, Math.PI * 2); context.fill();
-      context.fillText('TIP', tx + radius + line * 2, ty);
+      label('TIP', tx + radius + line * 2, ty);
     }
   }
   const outline = state.calibration?.radio_outline || [];
@@ -815,9 +904,10 @@ function drawRegions() {
     for (const point of outline.slice(1)) context.lineTo(point[0], point[1]);
     if (outline.length === 4) context.closePath();
     context.stroke();
-    outline.forEach(([x, y], index) => { context.beginPath(); context.arc(x, y, line * 3, 0, Math.PI * 2); context.fill(); context.fillText(String(index + 1), x + line * 3, y - line * 3); });
+    outline.forEach(([x, y], index) => { context.beginPath(); context.arc(x, y, line * 3, 0, Math.PI * 2); context.fill(); label(String(mirrored && outline.length === 4 ? [1,0,3,2].indexOf(index) + 1 : index + 1), x + line * 3, y - line * 3); });
   }
   if (state.drag?.kind === 'box') { const { start, current } = state.drag; context.strokeStyle = '#fff'; context.strokeRect(start.x, start.y, current.x - start.x, current.y - start.y); }
+  context.restore();
 }
 $('tip-radius').oninput = () => {
   for (const side of ['left_gimbal', 'right_gimbal']) if (state.calibration?.[side]) state.calibration[side].tip_radius = Number($('tip-radius').value);
@@ -1016,21 +1106,23 @@ async function loadResults() {
 }
 function renderResults() {
   show('results-panel'); show('exports-panel'); const data = state.results;
-  const assigned = data.rows.filter(row => row.global_assignment).sort((a, b) => a.radio_video.localeCompare(b.radio_video));
+  const assigned = data.rows.filter(row => row.global_assignment).sort((a, b) => a.radio_video.localeCompare(b.radio_video) || a.radio_common_start_seconds - b.radio_common_start_seconds);
   const scope = data.match_scope?.kind !== 'all' ? ` · ${data.match_scope.kind === 'fpv' ? 'FPV' : 'StickCam'} targets: ${(data.match_scope.targets || [data.match_scope.target]).join(', ')}` : '';
-  message('result-summary', `${assigned.length} proposed pairs${scope} · ${data.unmatched_radio.length} StickCam and ${data.unmatched_fpv.length} FPV unmatched · ${(data.elapsed_seconds / 60).toFixed(1)} min analysis`);
+  message('result-summary', `${assigned.length} proposed FPV pairs across ${new Set(assigned.map(r => r.radio_video)).size} StickCam recordings${scope} · ${data.unmatched_radio.length} StickCam and ${data.unmatched_fpv.length} FPV unmatched · ${(data.elapsed_seconds / 60).toFixed(1)} min analysis`);
   message('clock-summary', data.clock.delta_seconds === null ? 'No reliable camera-clock difference established.' : `FPV − StickCam clock difference: ${offsetText(data.clock.delta_seconds)} · ${data.clock.support} supporting pair(s)${data.clock.support < 2 ? ' · tentative' : ''}.`);
   const ratesName = data.rate_profile?.model === 'actual' ? 'ACTUAL' : data.rate_profile?.model === 'kiss' ? 'KISS' : 'Betaflight legacy';
   message('rate-summary', data.rate_profile ? `Stick positions compared through the ${ratesName} rate curves.` : 'No FPV rate curve was applied.');
   $('csv-download').href = path('/file/matches.csv'); $('pair-cards').replaceChildren();
   for (const row of assigned) {
-    const button = action('', guarded(() => openPair(row.radio_video, row.fpv_video), 'viewer-message'), `pair-card${state.pair?.radio_video === row.radio_video ? ' active' : ''}`);
+    const button = action('', guarded(() => openPair(row.radio_video, row.fpv_video), 'viewer-message'), `pair-card${state.pair?.radio_video === row.radio_video && state.pair?.fpv_video === row.fpv_video ? ' active' : ''}`);
     button.append(el('span', row.reviewed ? 'Reviewed' : row.confidence === 'strong' ? 'Strong proposal' : 'Needs review', `badge ${row.reviewed ? 'saved' : row.confidence}`));
     const names = el('div', undefined, 'names'); names.append(el('span', clipLabel(state.job.inputs.radio.find(r => r.name === row.radio_video) || {name:row.radio_video})), el('span', '↔ ' + clipLabel(state.job.inputs.fpv.find(r => r.name === row.fpv_video) || {name:row.fpv_video}))); button.append(names);
     button.append(el('small', `Score ${row.combined_score.toFixed(3)} · offset ${offsetText(row.offset_seconds)} · ${time(row.overlap_seconds)} shared`));
     button.append(el('small', row.evidence));
     if (row.motion_included === false) button.append(el('small', 'Motion comparison not used'));
     else if (row.usable_sections !== undefined) button.append(el('small', `${row.correlated_sections}/${row.usable_sections} usable 3s sections agree · ${Math.round(row.section_agreement * 100)}% support`));
+    const siblings = assigned.filter(item => item.radio_video === row.radio_video);
+    if (siblings.length > 1) button.append(el('small', `FPV segment ${siblings.indexOf(row) + 1}/${siblings.length} for this StickCam`));
     $('pair-cards').append(button);
   }
   if (!assigned.length) $('pair-cards').append(el('p', 'No candidate passed the proposal threshold. Review the strongest alternatives below, or improve the tracking calibration.', 'hint'));
@@ -1045,6 +1137,7 @@ function renderResults() {
   if (data.unmatched_fpv.length) $('unmatched').append(el('p', 'Unmatched FPV: ' + data.unmatched_fpv.join(', '), 'hint'));
   if (data.excluded_radio?.length) $('unmatched').append(el('p', 'Excluded StickCam: ' + data.excluded_radio.join(', '), 'hint'));
   $('file-errors').replaceChildren(...data.errors.map(error => el('p', `${error.name}: ${error.error}`)));
+  renderRelatedSegments();
   const filter = $('candidate-filter').value;
   $('candidate-filter').replaceChildren(el('option', 'All clips'), ...state.job.inputs.radio.map(record => { const option = el('option', record.name); option.value = record.name; return option; }));
   $('candidate-filter').options[0].value = ''; $('candidate-filter').value = filter; renderCandidatePage();
@@ -1090,7 +1183,7 @@ function intervalBars() {
 }
 async function openPair(radioName, fpvName, customOffset = null) {
   const token = ++state.viewerToken, jobToken = state.jobToken;
-  pausePair(); show('portrait-panel', false); state.pair = null; show('viewer-panel'); message('viewer-message', 'Loading both videos…');
+  pausePair(); show('portrait-panel', false); state.pair = null; openPanel('viewer-panel'); message('viewer-message', 'Loading both videos…');
   $('open-portrait').disabled = true;
   $('export-pair').disabled = $('save-alignment').disabled = true; $('pair-play').disabled = true;
   $('viewer-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1106,7 +1199,7 @@ async function openPair(radioName, fpvName, customOffset = null) {
   const candidate = candidates.find(row => row.fpv_video === fpvName);
   if (customOffset !== null && Math.abs(customOffset - candidate.offset_seconds) > 1e-7) $('review-state').textContent = 'Unsaved alignment adjustment';
   const motionEvidence = candidate.motion_included === false ? 'motion not used' : `${candidate.reliable_axes} motion axes · timing peak margin ${candidate.peak_margin.toFixed(3)}`;
-  message('pair-evidence', `${info.evidence} · score ${info.score.toFixed(3)} · ${motionEvidence} · candidate margin ${candidate.candidate_margin.toFixed(3)}. ${sectionsText(candidate)}`);
+  message('pair-evidence', `${customOffset !== null && Math.abs(customOffset - candidate.offset_seconds) > 1e-7 ? 'Predicted filename alignment: confirm shared content; the original scores below were measured at another offset. ' : ''}${info.evidence} · score ${info.score.toFixed(3)} · ${motionEvidence} · candidate margin ${candidate.candidate_margin.toFixed(3)}. ${sectionsText(candidate)}`);
   $('pair-seek').max = info.overlap_duration; intervalBars(); applyAudio();
   await Promise.all([loadVideo($('radio-preview'), 'radio', radioName, () => token === state.viewerToken && jobToken === state.jobToken, 'viewer-message', $('playback-proxy').checked, info.radio_start),
     loadVideo($('fpv-preview'), 'fpv', fpvName, () => token === state.viewerToken && jobToken === state.jobToken, 'viewer-message', $('playback-proxy').checked, info.fpv_start)]);
@@ -1181,15 +1274,68 @@ async function saveAlignment() {
   const current = state.pair, token = state.viewerToken;
   await api(path(`/pairs/${part(current.radio_video)}`), { method: 'PUT', json: { fpv_video: current.fpv_video, offset_seconds: current.offset_seconds } });
   if (token !== state.viewerToken) return;
-  current.reviewed = true; $('review-state').textContent = 'Reviewed alignment'; message('viewer-message', 'Pairing and offset saved. Both clips will export from the shared start.'); await loadResults();
+  current.reviewed = true; $('review-state').textContent = 'Reviewed alignment'; message('viewer-message', 'Segment pairing and offset saved. Other segments for this StickCam are kept.'); await loadResults();
+  if ($('auto-find-segments').checked) await startRelatedSegments(current);
   return token === state.viewerToken ? current : null;
 }
 $('save-alignment').onclick = guarded(saveAlignment, 'viewer-message');
 $('reject-pair').onclick = guarded(async () => {
   if (!state.pair) return; pausePair();
-  await api(path(`/pairs/${part(state.pair.radio_video)}`), { method: 'PUT', json: { fpv_video: null } });
-  await loadResults(); $('review-state').textContent = 'Left unmatched'; message('viewer-message', 'This StickCam is unmatched. You can try and save another candidate.');
+  await api(path(`/pairs/${part(state.pair.radio_video)}`), { method: 'PUT', json: { fpv_video: state.pair.fpv_video, reject:true } });
+  await loadResults(); $('review-state').textContent = 'Segment rejected'; message('viewer-message', 'This FPV segment is unmatched. Other saved segments for this StickCam are kept.');
 }, 'viewer-message');
+
+function renderRelatedSegments() {
+  const groups = state.results?.segment_candidates || [];
+  show('related-segments', groups.length > 0 || segmentScan.running);
+  const list = $('related-segment-rows'); list.replaceChildren();
+  for (const group of groups) {
+    for (const candidate of group.clips) {
+      const matched = state.results.rows.find(r => r.radio_video === candidate.radio_video && r.fpv_video === candidate.fpv_video);
+      const row = el('tr'), controls = el('td');
+      controls.append(action(matched?.reviewed ? 'View saved segment' : 'Preview predicted alignment', guarded(() => openPair(candidate.radio_video, candidate.fpv_video, matched?.reviewed ? null : candidate.offset_seconds), 'viewer-message')));
+      row.append(el('td', candidate.radio_video), el('td', candidate.fpv_video),
+        el('td', `${time(candidate.radio_start, true)}–${time(candidate.radio_start + candidate.overlap_seconds, true)}`),
+        el('td', matched?.reviewed ? 'Reviewed & saved' : matched?.rejected ? 'Rejected · review again if needed' : `Timestamp candidate · ${candidate.note}`), controls);
+      list.append(row);
+    }
+  }
+}
+async function startRelatedSegments(pair) {
+  if (!pair || !pair.reviewed) return;
+  const token = state.jobToken, jobId = state.job.id;
+  message('segment-scan-message', 'Looking for FPV files on the confirmed StickCam timeline…'); show('related-segments');
+  try {
+    const task = await api(`/api/jobs/${jobId}/pairs/${part(pair.radio_video)}/segments`, {method:'POST', json:{fpv_video:pair.fpv_video}});
+    if (token !== state.jobToken) return;
+    watchRelatedSegments(task.id, jobId, token);
+  } catch(error) { message('segment-scan-message', error.message, true); }
+}
+function watchRelatedSegments(task, jobId, jobToken) {
+  clearTimeout(segmentScan.timer); const token = ++segmentScan.token;
+  segmentScan.task = task; segmentScan.running = true;
+  show('related-segments'); show('segment-scan-cancel'); show('segment-scan-progress');
+  const poll = async () => {
+    if (token !== segmentScan.token || jobToken !== state.jobToken) return;
+    try {
+      const result = await api(`/api/jobs/${jobId}/motion-review/${task}`);
+      if (token !== segmentScan.token || jobToken !== state.jobToken) return;
+      if (result.progress) {
+        $('segment-scan-progress').value = result.progress.percent;
+        message('segment-scan-message', `${result.progress.completed}/${result.progress.total} FPV files checked · ${Number(result.progress.percent).toFixed(1)}%`);
+      } else { $('segment-scan-progress').removeAttribute('value'); message('segment-scan-message', result.message); }
+      if (['queued','running'].includes(result.status)) { segmentScan.timer = setTimeout(poll, 1000); return; }
+      segmentScan.running = false; show('segment-scan-cancel', false); show('segment-scan-progress', false);
+      await loadResults(); show('related-segments');
+      message('segment-scan-message', `${result.message}${result.failures?.length ? ` ${result.failures.length} source(s) could not be checked.` : ''}`, result.status === 'failed');
+    } catch(error) { message('segment-scan-message', `Connection interrupted; retrying… ${error.message}`, true); segmentScan.timer = setTimeout(poll, 3000); }
+  };
+  poll();
+}
+$('find-related-segments').onclick = guarded(async () => { const pair = await saveAlignment(); if (pair && !$('auto-find-segments').checked) await startRelatedSegments(pair); }, 'viewer-message');
+$('segment-scan-cancel').onclick = guarded(async () => {
+  if (segmentScan.task) await api(path(`/motion-review/${segmentScan.task}/cancel`), {method:'POST'});
+}, 'segment-scan-message');
 
 // Each export has its own durable status and download links, independent of the
 // pair currently selected in the viewer.
@@ -1208,7 +1354,7 @@ async function requestExport(pairs) {
   const result = await api(`/api/jobs/${id}/exports`, { method: 'POST', json: { pairs, fps: Number($('export-fps').value), profile: $('export-profile').value } });
   if (token !== state.jobToken) return;
   state.job.exports ||= []; if (!state.job.exports.some(item => item.id === result.id)) state.job.exports.push({ id: result.id, status: 'queued', message: 'Preparing aligned clips' }); renderExports();
-  $('exports-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  openPanel('exports-panel'); $('exports-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 $('export-pair').onclick = guarded(async () => { const saved = await saveAlignment(); if (saved) await requestExport([{ radio_video: saved.radio_video, fpv_video: saved.fpv_video, offset_seconds: saved.offset_seconds }]); }, 'viewer-message');
 $('export-batch').onclick = guarded(async () => {
@@ -1243,6 +1389,7 @@ window.addEventListener('pagehide', () => { pausePair(); state.uploadController?
   try {
     const system = await api('/api/system'); message('system', `${bytes(system.free_bytes)} free · local processing · LAN ready${system.ffmpeg && system.ffprobe ? '' : ' · install FFmpeg before analyzing'}`);
     $('playback-proxy').checked = localStorage.getItem('fpv-fast-preview') !== '0';
+    try { await loadRadioModels(); } catch (error) { message('radio-shape-message', error.message, true); }
     await history();
     try { await loadRatePresets(); } catch (error) { message('rate-preset-message', error.message, true); }
     const saved = localStorage.getItem('fpv-session'); if (saved) await selectJob(saved);
@@ -1286,6 +1433,7 @@ $('motion-use-pair').onclick = guarded(async () => {
   if (!state.pair) return; selectMotionPair(state.pair); await loadMotionSignals();
 }, 'motion-message');
 async function loadMotionSignals() {
+  openPanel('motion-panel');
   const token = ++motion.token, jobToken = state.jobToken, jobId = state.job.id;
   clearTimeout(motion.timer); motion.data = null; show('motion-charts', false);
   resetMotionPreview();
@@ -1893,7 +2041,7 @@ function watchStickPreparation(task, jobId, jobToken) {
       if (['queued', 'running'].includes(result.status)) { stickPreparation.timer = setTimeout(poll, 1500); return; }
       stickPreparation.running = false; show('derive-sticks-cancel', false); show('stick-data-progress', false); $('derive-sticks').disabled = activeAnalysis();
       $('stick-sampling-ratio').disabled = activeAnalysis();
-      $('analyze').disabled = activeAnalysis();
+      updateFPVPreparationUI();
       renderStickPreparationLog(result);
       message('stick-data-message', result.status === 'complete' ? `${result.complete}/${result.total} StickCam recordings have saved movement data. ${result.total - result.complete} failed; see the derivation log.` : result.message, result.status === 'failed');
     } catch (error) {
@@ -1916,8 +2064,138 @@ $('derive-sticks-cancel').onclick = guarded(async () => {
 }, 'stick-data-message');
 $('stick-data-refresh').onclick = guarded(() => refreshStickData(true), 'stick-data-message');
 for (const id of ['sample-fps', 'stick-sampling-ratio']) $(id).onchange = guarded(async () => {
-  updateStickSamplingPreview(); resetMotionReview(); await refreshStickData(true);
+  updateStickSamplingPreview(); resetMotionReview(); await refreshStickData(true); await refreshFPVData(true);
 }, 'stick-data-message');
+
+function updateFPVPreparationUI() {
+  const busy = activeAnalysis() || fpvPreparation.running || stickPreparation.running;
+  for (const id of ['fpv-check-all', 'fpv-derive-all', 'fpv-select-eligible', 'fpv-preparation-fps', 'fpv-preparation-decode']) $(id).disabled = busy;
+  for (const id of ['fpv-check-selected', 'fpv-derive-selected']) $(id).disabled = busy || !fpvPreparation.selected.size;
+  $('fpv-selection-count').textContent = `${fpvPreparation.selected.size} selected`;
+  $('analyze').disabled = busy || !state.job || Object.values(state.job.inputs).flat().some(r => r.uploaded !== r.size);
+  $('derive-sticks').disabled = busy;
+  $('sample-fps').disabled = busy;
+  $('decode-mode').disabled = busy;
+  updateEvidenceSummary();
+}
+function embeddedMotionLabel(data) {
+  return data.status === 'available' ? data.kind === 'quaternion_rates' ? 'Embedded attitude rates · preferred' : 'Embedded gyro · preferred'
+    : data.status === 'unavailable' ? 'No supported embedded motion' : 'Not checked';
+}
+function renderFPVData() {
+  const result = state.fpvData;
+  if (!result || !state.job) return;
+  $('fpv-data-count').textContent = `${result.embedded} embedded · ${result.cached} visual caches at ${rateText(result.sample_fps)} Hz`;
+  const list = $('fpv-data-rows'); list.replaceChildren();
+  for (const clip of result.clips) {
+    const record = state.job.inputs.fpv.find(r => r.name === clip.name);
+    const row = el('tr'), selectCell = el('td'), checkbox = el('input');
+    checkbox.type = 'checkbox'; checkbox.checked = fpvPreparation.selected.has(clip.name);
+    checkbox.setAttribute('aria-label', `Select ${clip.name}`);
+    checkbox.onchange = () => { checkbox.checked ? fpvPreparation.selected.add(clip.name) : fpvPreparation.selected.delete(clip.name); updateFPVPreparationUI(); };
+    selectCell.append(checkbox);
+    const embedded = el('td', embeddedMotionLabel(clip.embedded));
+    embedded.title = clip.embedded.message || '';
+    if (clip.embedded.status === 'available') embedded.className = 'cache-ready';
+    const visual = clip.visual, status = el('td', {cached:'Derived · saved', other_rate:'Saved at another rate', not_derived:'Not derived', unavailable:'Source or cache unavailable'}[visual.status] || visual.status);
+    if (visual.status === 'cached') status.className = 'cache-ready';
+    const details = el('td', visual.samples !== undefined ? `${visual.samples.toLocaleString()} samples · ${rateText(visual.sample_fps)} Hz · ${visual.usable_percent}% usable tracking${visual.range ? ` · ${time(visual.range[0])}–${time(visual.range[1])}` : ''}` : '—');
+    const elapsed = visual.extraction_seconds != null ? `${Number(visual.extraction_seconds).toFixed(2)} s extraction` : clip.last_preparation ? `${clip.last_preparation.status} · ${Number(clip.last_preparation.elapsed_seconds || 0).toFixed(2)} s` : 'Not recorded';
+    const inspect = el('td');
+    if (visual.status === 'cached') {
+      const button = action('View motion', guarded(async () => {
+        resetMotionReview(); $('motion-fpv').value = clip.name; $('motion-radio').value = ''; $('motion-source').value = 'visual';
+        $('motion-panel').scrollIntoView({behavior:'smooth', block:'start'}); await loadMotionSignals();
+      }, 'fpv-data-message'));
+      button.disabled = fpvPreparation.running; inspect.append(button);
+    }
+    row.append(selectCell, el('td', clip.name), el('td', clipDuration(record)), embedded, status, details, el('td', elapsed), inspect);
+    list.append(row);
+  }
+  updateFPVPreparationUI();
+}
+async function refreshFPVData(force = false) {
+  if (!state.job || state.job.inputs.fpv.some(r => r.uploaded !== r.size)) return;
+  const jobId = state.job.id, jobToken = state.jobToken, fps = Number($('sample-fps').value);
+  const key = `${jobId}:${fps}`;
+  if (!force && key === fpvPreparation.key && Date.now() - fpvPreparation.refreshed < 3000) return;
+  fpvPreparation.key = key; fpvPreparation.refreshed = Date.now();
+  $('fpv-preparation-fps').value = fps; $('fpv-preparation-decode').value = $('decode-mode').value;
+  const result = await api(`/api/jobs/${jobId}/fpv-data?${new URLSearchParams({sample_fps:fps})}`);
+  if (jobToken !== state.jobToken || key !== fpvPreparation.key) return;
+  state.fpvData = result; renderFPVData();
+  const active = result.tasks.find(task => ['queued','running'].includes(task.status));
+  if (active && (!fpvPreparation.running || fpvPreparation.task !== active.id)) watchFPVPreparation(active.id, jobId, jobToken);
+  if (!active && !fpvPreparation.running) {
+    message('fpv-data-message', `${result.clips.filter(c => c.embedded.status === 'unknown').length} not checked · ${result.clips.filter(c => c.embedded.status === 'unavailable').length} without supported embedded motion. Check or derive selected clips, or prepare all. Existing data is reused.`);
+    const list = $('fpv-data-log'); list.replaceChildren();
+    for (const task of result.tasks.slice(-10).reverse()) list.append(action(`${task.status} · ${task.message}`, guarded(async () => {
+      renderFPVPreparationLog(await api(`/api/jobs/${jobId}/motion-review/${task.id}`));
+    }, 'fpv-data-message')));
+  }
+}
+function renderFPVPreparationLog(result) {
+  const list = $('fpv-data-log'); list.replaceChildren();
+  for (const row of result.clips || result.progress?.clips || []) {
+    list.append(el('div', `${row.name} · ${row.status === 'cached' ? row.reused ? 'Reused saved visual motion' : 'Derived & saved visual motion' : row.status === 'checked' ? embeddedMotionLabel(row.embedded) : row.message || row.status} · ${Number(row.elapsed_seconds || 0).toFixed(2)} s${row.usable_percent !== undefined ? ` · ${row.usable_percent}% usable tracking` : ''}`));
+  }
+}
+function watchFPVPreparation(task, jobId, jobToken) {
+  clearTimeout(fpvPreparation.timer);
+  const token = ++fpvPreparation.token;
+  fpvPreparation.task = task; fpvPreparation.running = true; fpvPreparation.jobId = jobId;
+  updateFPVPreparationUI(); show('fpv-preparation-cancel'); show('fpv-data-progress');
+  const poll = async () => {
+    if (token !== fpvPreparation.token || jobToken !== state.jobToken) return;
+    try {
+      const result = await api(`/api/jobs/${jobId}/motion-review/${task}`);
+      if (token !== fpvPreparation.token || jobToken !== state.jobToken) return;
+      if (result.progress) {
+        const p = result.progress; $('fpv-data-progress').value = p.percent;
+        message('fpv-data-message', `${p.completed}/${p.total} clips finished · ${p.name} · ${p.stage === 'embedded' ? 'Checking embedded motion' : 'Deriving visual motion'} · ${Number(p.elapsed_seconds || 0).toFixed(1)} s on this clip · ${Number(p.percent).toFixed(1)}% overall${p.stage === 'visual' ? ` · current clip ${etaText(p.eta_seconds)}` : ''}`);
+      } else { $('fpv-data-progress').removeAttribute('value'); message('fpv-data-message', result.message); }
+      renderFPVPreparationLog(result);
+      await refreshFPVData(true);
+      if (['queued','running'].includes(result.status)) { fpvPreparation.timer = setTimeout(poll, 1500); return; }
+      fpvPreparation.running = false; show('fpv-preparation-cancel', false); show('fpv-data-progress', false);
+      renderFPVData(); renderFPVPreparationLog(result); updateEvidenceSummary();
+      message('fpv-data-message', result.status === 'complete' ? result.action === 'check' ? `Embedded motion check finished · ${result.failed} failed; see log.` : `${result.cached} visual caches ready · ${result.skipped} clips kept embedded motion · ${result.failed} failed; see log.` : result.message, result.status === 'failed' || result.failed > 0);
+    } catch(error) {
+      message('fpv-data-message', `Connection interrupted; retrying… ${error.message}`, true);
+      fpvPreparation.timer = setTimeout(poll, 3000);
+    }
+  };
+  poll();
+}
+async function startFPVPreparation(action, selected) {
+  const jobId = state.job.id, jobToken = state.jobToken;
+  const fps = Number($('fpv-preparation-fps').value), decode = $('fpv-preparation-decode').value;
+  const task = await api(`/api/jobs/${jobId}/prepare-fpv`, {method:'POST', json:{action, sample_fps:fps, decode_mode:decode,
+    ...(selected ? {names:[...fpvPreparation.selected]} : {})}});
+  if (jobToken !== state.jobToken) return;
+  $('sample-fps').value = fps; $('decode-mode').value = decode; state.job.settings.sample_fps = fps;
+  if (Number($('match-fps').value) > fps) $('match-fps').value = fps;
+  updateStickSamplingPreview(); refreshStickData(true).catch(error => message('stick-data-message', error.message, true));
+  watchFPVPreparation(task.id, jobId, jobToken);
+}
+for (const [id, action, selected] of [['fpv-check-all','check',false], ['fpv-check-selected','check',true], ['fpv-derive-all','derive',false], ['fpv-derive-selected','derive',true]])
+  $(id).onclick = guarded(() => startFPVPreparation(action, selected), 'fpv-data-message');
+$('fpv-data-refresh').onclick = guarded(() => refreshFPVData(true), 'fpv-data-message');
+$('fpv-select-eligible').onclick = () => {
+  fpvPreparation.selected = new Set((state.fpvData?.clips || []).filter(c => c.embedded.status !== 'available').map(c => c.name)); renderFPVData();
+};
+$('fpv-clear-selection').onclick = () => { fpvPreparation.selected.clear(); renderFPVData(); };
+$('fpv-preparation-cancel').onclick = guarded(async () => {
+  if (fpvPreparation.task) await api(`/api/jobs/${fpvPreparation.jobId}/motion-review/${fpvPreparation.task}/cancel`, {method:'POST'});
+}, 'fpv-data-message');
+$('fpv-preparation-fps').onchange = guarded(async () => {
+  $('sample-fps').value = $('fpv-preparation-fps').value;
+  if (Number($('match-fps').value) > Number($('sample-fps').value)) $('match-fps').value = $('sample-fps').value;
+  resetMotionReview(); updateStickSamplingPreview();
+  await refreshFPVData(true); await refreshStickData(true);
+}, 'fpv-data-message');
+$('fpv-preparation-decode').onchange = () => { $('decode-mode').value = $('fpv-preparation-decode').value; };
+$('decode-mode').addEventListener('change', () => { $('fpv-preparation-decode').value = $('decode-mode').value; });
 
 let ratePresets = { presets: {}, default: null };
 async function loadRatePresets(selected = '') {
@@ -1978,7 +2256,7 @@ $('open-portrait').onclick = guarded(async () => {
   const result = await api(path('/portrait-layout'), { method: 'POST', json: { radio_video: saved.radio_video, fpv_video: saved.fpv_video, offset_seconds: saved.offset_seconds } });
   if (token !== portrait.token || viewerToken !== state.viewerToken) return;
   portrait.pair = result.pair;
-  show('portrait-panel'); $('portrait-pair-label').textContent = `${saved.fpv_video} + ${saved.radio_video} · saved offset ${offsetText(saved.offset_seconds)}`;
+  openPanel('portrait-panel'); $('portrait-pair-label').textContent = `${saved.fpv_video} + ${saved.radio_video} · saved offset ${offsetText(saved.offset_seconds)}`;
   $('portrait-seek').max = saved.overlap_duration; $('portrait-seek').value = elapsed();
   writePortraitLayout(result.layout); message('portrait-message', 'Adjust the framing, then save or export.');
   $('portrait-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -2029,3 +2307,25 @@ $('portrait-export').onclick = guarded(async () => {
   message('portrait-message', 'Portrait export queued. Progress and downloads are in Aligned exports.');
   state.job = await api(`/api/jobs/${jobId}`); renderExports();
 }, 'portrait-message');
+
+$('collapse-all').onclick = () => { for (const panel of document.querySelectorAll('[data-major-panel]')) panel.open = false; };
+$('expand-all').onclick = () => { for (const panel of document.querySelectorAll('[data-major-panel]')) panel.open = true; };
+for (const panel of document.querySelectorAll('[data-major-panel]')) panel.addEventListener('toggle', () => {
+  if (!panel.open) for (const video of panel.querySelectorAll('video')) video.pause();
+  if (!panel.open && panel.id === 'viewer-panel') pausePair();
+  if (!panel.open && panel.id === 'motion-panel') pauseMotionPreview();
+});
+$('csv-download').addEventListener('click', event => event.stopPropagation());
+$('delete-session').onclick = () => {
+  if (!state.job) return;
+  message('delete-session-description', `Delete “${state.job.label || state.job.id}” from the frontend? Its source footage, exports and download links will be kept. You can restore it later.`);
+  show('delete-session-confirmation');
+};
+$('cancel-delete-session').onclick = () => show('delete-session-confirmation', false);
+$('confirm-delete-session').onclick = guarded(async () => {
+  if (!state.job) return;
+  const id = state.job.id;
+  await api(`/api/jobs/${id}`, {method:'DELETE'});
+  state.uploadController?.abort(); clearSession(); await history();
+  message('session-message', 'Session deleted from the frontend. Exports and source footage were kept; use Deleted sessions to restore.');
+}, 'session-message');

@@ -9,14 +9,13 @@ import cv2
 import numpy as np
 
 from fpv_matcher.pipeline import atomic_json
-from fpv_matcher.radio.auto_calibration import suggest_gimbal_regions
 from fpv_matcher.radio.reference import suggest_from_reference
-from fpv_matcher.radio.orientation import rotation_from_regions
+from fpv_matcher.radio.orientation import rotation_from_regions, suggest_upright_regions
 from fpv_matcher.radio.tips import suggest_visible_tip
 from fpv_matcher.video.frames import jpeg_frame
 from fpv_matcher.video.metadata import probe_video
 
-VERSION = "calibration-five-second-reference-orientation-v2"
+VERSION = "calibration-five-second-reference-shapes-v3"
 
 
 def _frame(path, at):
@@ -32,7 +31,7 @@ def _scale_region(region, sx, sy):
             else value * min(sx, sy) if key == "tip_radius" else value for key, value in region.items()}
 
 
-def _proposal(image, references):
+def _proposal(image, references, radio_model="auto"):
     proposals = []
     for reference in references:
         candidate = suggest_from_reference(reference["image"], image, reference["outline"], reference["regions"])
@@ -40,7 +39,30 @@ def _proposal(image, references):
             if reference.get("orientation_confirmed"):
                 candidate["radio_rotation_deg"] = rotation_from_regions(candidate["regions"])["rotation_deg"]
             proposals.append({**candidate, "reference_clip": reference["name"]})
-    proposal = max(proposals, key=lambda p: (sum("tip_x" in r for r in p["regions"].values()), p["reference_inliers"])) if proposals else suggest_gimbal_regions(image)
+    if proposals:
+        proposal = max(proposals, key=lambda p: (sum("tip_x" in r for r in p["regions"].values()), p["reference_inliers"]))
+    else:
+        guesses = []
+        for rotation in (0, 180) if radio_model != "other" else (0,):
+            try:
+                candidate = suggest_upright_regions(image, rotation=rotation, radio_model=radio_model)
+                candidate["radio_rotation_deg"] = rotation
+                guesses.append(candidate)
+            except ValueError:
+                continue
+        if not guesses:
+            raise ValueError("No clear gimbal/radio shape evidence. Try a later frame or mark manually.")
+        def shell_score(candidate):
+            return max((r["edge_support"] for r in candidate.get("shape_matches", [])), default=0)
+        guesses.sort(key=shell_score, reverse=True)
+        proposal = guesses[0]
+        if len(guesses) > 1 and shell_score(proposal) - shell_score(guesses[1]) < .08:
+            # Symmetric shell evidence cannot establish orientation. Keep the
+            # upright candidate as an editable draft and require confirmation.
+            proposal = next((g for g in guesses if g["radio_rotation_deg"] == 0), proposal)
+            if proposal.get("radio_outline"):
+                proposal.pop("radio_outline")
+                proposal["shape_message"] = "Shell orientation is ambiguous; mark its outline and confirm orientation."
     for region in proposal["regions"].values():
         if "tip_x" not in region:
             tip = suggest_visible_tip(image, region)
@@ -89,7 +111,7 @@ def run(request_path):
                     "at": float(at), "completed": index, "total": total, "clips": rows,
                     "percent": (index + attempt / max(1, len(times))) / total * 100})
                 try:
-                    proposal = _proposal(_frame(path, float(at)), [r for r in references if r["name"] != clip["name"]])
+                    proposal = _proposal(_frame(path, float(at)), [r for r in references if r["name"] != clip["name"]], request.get("radio_model", "auto"))
                     outline = proposal.get("radio_outline")
                     rank = (bool(outline), 2 - len(proposal["missing_tips"]), proposal.get("reference_inliers", 0))
                     sx, sy = info["width"] / proposal["frame_width"], info["height"] / proposal["frame_height"]

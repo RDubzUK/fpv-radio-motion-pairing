@@ -8,8 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fpv_matcher.cache.fingerprints import get_or_extract
-from fpv_matcher.motion.lucas_kanade import LucasKanadeEstimator
+from fpv_matcher.motion.derivation import cached_visual_motion
 from fpv_matcher.motion.telemetry import cached_telemetry
 from fpv_matcher.pipeline import atomic_json
 from fpv_matcher.radio.rates import apply_rate_profile
@@ -64,10 +63,8 @@ def run(request_path):
                 raise ValueError(f"Embedded motion unavailable: {exc}") from exc
             warnings.append(f"Embedded motion unavailable: {exc}. Showing image-derived motion.")
     if fpv is None:
-        estimator = LucasKanadeEstimator()
-        fpv = get_or_extract(request["fpv_path"], cache, "fpv", estimator.algorithm_version,
-                             {"sample_fps": request["sample_fps"], "max_dimension": estimator.max_dimension},
-                             lambda: estimator.extract(request["fpv_path"], request["sample_fps"], progress=lambda event: report("fpv", event)), request.get("fpv_identity"))
+        fpv = cached_visual_motion(request["fpv_path"], cache, request["sample_fps"], request.get("fpv_identity"),
+                                   progress=lambda event: report("fpv", event))
         fpv = {**fpv, "kind": np.asarray("visual"), "label": np.asarray("Image-derived motion · 2D affine estimate"),
                "note": np.asarray("Image rotation and horizontal/vertical flow are visual proxies, not calibrated drone roll/pitch/yaw. Tracking gaps are omitted.")}
     np.savez_compressed(directory / "fpv.npz", **fpv)

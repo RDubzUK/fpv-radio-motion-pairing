@@ -36,7 +36,7 @@ The original motion-pairing specification is design input. Later requests add th
 | Wrong camera dates/times | Relative readings, including epoch dates, and consensus clock differences from distinctive pairs |
 | Focused matching | Analyze all recordings, one StickCam against the FPV set, or one FPV against the StickCam set; optional unconfigured StickCam matching uses boundary audio and a tentative learned filename-clock offset |
 | Ambiguous or missing matches | Unmatched assignment options, candidate and timing separation, conservative proposal threshold |
-| Review and correction | Candidate selection, linked preview, shared-interval bars, frame nudges and saved one-to-one corrections |
+| Review and correction | Candidate selection, linked preview, shared-interval bars, frame nudges and saved per-FPV-segment corrections |
 | Resolve export | Equal CFR frame counts, individual or reviewed-batch exports, MP4 and DNxHR/PCM choices, alignment manifests |
 | Long-running operation | Durable job status, cancellation, safe reruns, cached extraction and restart recovery |
 | Reviewable code | Separated core/media/web modules, readable frontend files, dependency lock and documentation |
@@ -49,7 +49,7 @@ The original motion-pairing specification is design input. Later requests add th
 - Stacked motion charts have an adjacent synced video preview with side-by-side/stacked layout, shared transport, drift correction and chart seeking; it can be used before batch analysis.
 - A changed extraction configuration invalidates its fingerprint cache; changed matching settings reuse extraction.
 - Identified offsets are relative to the original clips, including a later StickCam calibration reference.
-- Manual pairings preserve one-to-one assignment and are reflected in CSV/exports.
+- Manual pairings allow multiple FPV segments per StickCam, keep one StickCam owner per FPV file, and are reflected in CSV/exports.
 - Preview stops at the shared interval's end and uses one selected audio source.
 - A saved radio outline supplies a camera-relative orientation transform for stick positions, with tracking quality shown in the preview.
 - Suggested regions, neutral centres and current tip points remain editable; dashed tip circles indicate proposals until the operator saves the calibration. The message identifies missing tips that need manual selection.
@@ -104,3 +104,32 @@ Prioritise capture validity before lowering matching thresholds: absolute appear
 - Record per-clip StickCam movement derivation time, separate fresh extraction from cache reuse, and surface persisted timings in the preparation table and derivation log.
 - Offer half/quarter of each StickCam clip's detected average fps alongside fixed Hz, display the effective rate, and share that rate's cached inputs across preparation, matching and chart review. Preserve other cached rates. FPV extraction/comparison rates remain independent; lower tracking rates trade temporal detail for less vision work.
 - Save a human-confirmed session radio appearance/model label and outline. Check each StickCam midpoint (bounded ±5/±10s retries) and calibration frame against that reference; show identity/orientation evidence, allow manual upright/inverted corrections, preserve physical gimbal labels and invert reference-frame stick axes when needed. Flag ambiguous or changing orientation; never infer a model from silhouette alone. Persist checks and keep original source coordinates for calibration; centred preview poses use physical upright corner order.
+
+### Dedicated FPV motion preparation
+
+- Add a separate section for checking supported embedded gyro/attitude and deriving visual fallback for selected or all eligible FPV clips, independent of StickCam calibration.
+- Keep embedded motion preferred; show parser failures and unavailable sources separately from saved visual motion. Process one clip at a time, expose progress/cancel/logs, per-clip duration, quality and extraction timing.
+- Share validated visual caches with matching and chart review, preserve legacy integer-Hz fingerprints and other sampling rates, and invalidate changed sources. Allow inspection in Motion comparison.
+- Remove arbitrary 80-recording session and pair-export caps; retain file/storage validation and bounded concurrency. Large all-to-all sessions still need more processing time.
+
+### Split recordings and session workspace
+
+- Support several independently correlated, non-overlapping FPV segments per StickCam; retain one owner per FPV file and review overlapping/duplicate coverage.
+- A human-confirmed sync anchors relative filename clocks. Offer all timestamp-overlapping FPV files as reviewable segment candidates, using StickCam duration for containment rather than flight identity. Preserve each segment’s offset; review/reject/export independently, including repeat StickCam sources in batch exports.
+- Keep timestamp-only candidates explicitly unverified, show clock resets/duplicate coverage, and preserve manual matches when discovering later segments.
+- Delete a session from the frontend list with reversible restoration; preserve exported files, download URLs, source footage and fingerprints. Block deletion while processing.
+- Hide Add recordings after sources are ready; make every major panel collapsible and add Collapse all / Expand all. Explicit navigation opens the target; polling keeps collapse choices.
+
+- Mark FPV visual motion and StickCam derived inputs as Experimental in matching controls.
+- Mirror the calibration view horizontally by default for a 180° reference, map pointer/marker geometry to original coordinates, preserve readable labels/source corner order, and retain the existing physical stick-axis correction.
+- Make session radio replacement explicit; retire old proposals/checks while preserving confirmed calibrations for review.
+- Put folder selection above the scrollable list, enlarge the dialog within the viewport, and label FPV versus StickCam selection.
+
+### Session thumbnails and radio catalogue
+
+- Session cards choose the available FPV recording nearest the mean modified timestamp across the session's source recordings. Prefer a still at 90s, use 60s or a short clip's midpoint when necessary; lazy, serialized JPEG decoding with persistent small-image caches avoids proxy work.
+- New uploads preserve their original modified timestamp for selection. Missing or unreadable source files get a fallback thumbnail/placeholder without blocking session selection.
+- Replace generic HelloRadioSky/Jumper and “My session radio” choices with Other, Auto-detect and ten specific manufacturer model families/variants.
+- Keep source-linked approximate shell polygons, body aspect, gimbal locations/radii and display geometry internally. Show the geometry for review and use it as a weak rim-ranking prior and an edge-validated shell proposal.
+- Confirmed session image matching stays first. Auto predictions do not establish model identity or orientation reliably when similar shells/hand occlusion prevent a distinct fit; all proposed markers remain subject to user confirmation.
+- No real footage detector/extraction benchmark or automated test suite was run for this update; syntax and frontend rendering were inspected.

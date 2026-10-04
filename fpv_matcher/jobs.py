@@ -47,14 +47,16 @@ def update(job_id: str, mutate) -> dict:
         return copy.deepcopy(job)
 
 
-def all_jobs() -> list[dict]:
+def all_jobs(include_deleted=False) -> list[dict]:
     root = DATA / "jobs"
     if not root.exists():
         return []
     jobs = []
     for path in root.glob("*/job.json"):
         try:
-            jobs.append(get(path.parent.name))
+            job = get(path.parent.name)
+            if include_deleted or not job.get("deleted_at"):
+                jobs.append(job)
         except KeyError:
             continue
     return sorted(jobs, key=lambda job: job.get("updated_at", 0), reverse=True)

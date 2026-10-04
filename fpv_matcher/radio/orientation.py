@@ -34,15 +34,20 @@ def scaled_region(region, sx, sy):
             else value * min(sx, sy) if key == "tip_radius" else value for key, value in region.items()}
 
 
-def suggest_upright_regions(image, outline=None, rotation=0):
+def suggest_upright_regions(image, outline=None, rotation=0, radio_model="other"):
     from fpv_matcher.radio.auto_calibration import suggest_gimbal_regions
     if rotation != 180:
-        return suggest_gimbal_regions(image, outline)
+        return suggest_gimbal_regions(image, outline, radio_model)
     height, width = image.shape[:2]
     upright_outline = [[width - 1 - x, height - 1 - y] for x, y in outline] if outline else None
     if upright_outline:
         upright_outline = upright_outline[2:] + upright_outline[:2]
-    proposal = suggest_gimbal_regions(cv2.rotate(image, cv2.ROTATE_180), upright_outline)
+    proposal = suggest_gimbal_regions(cv2.rotate(image, cv2.ROTATE_180), upright_outline, radio_model)
+    if proposal.get("radio_outline"):
+        points = [[width - 1 - x, height - 1 - y] for x, y in proposal["radio_outline"]]
+        proposal["radio_outline"] = points[2:] + points[:2]
+    if proposal.get("shape_shell"):
+        proposal["shape_shell"] = [[width - 1 - x, height - 1 - y] for x, y in proposal["shape_shell"]]
     for region in proposal["regions"].values():
         region["x"], region["y"] = width - region["x"] - region["width"], height - region["y"] - region["height"]
         for key in ("center_x", "tip_x"):

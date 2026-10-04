@@ -4,15 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>FPV ↔ StickCam Matcher</title>
-  <link rel="stylesheet" href="/static/style.css?v=10">
-  <script type="module" src="/static/app.js?v=30"></script>
+  <link rel="stylesheet" href="/static/style.css?v=13">
+  <script type="module" src="/static/app.js?v=34"></script>
 </head>
 <body>
 <main>
-  <header><div class="eyebrow">FLIGHT + CONTROL / MATCHING WORKSPACE</div><h1>Your flights. Paired and aligned.</h1><p class="lede">Match FPV footage to StickCam recordings, review the shared interval, and export clips for Resolve.</p><div class="toolbar"><span id="system" class="muted">Connecting…</span><button id="new-session" class="secondary">New session</button></div></header>
-  <section class="panel compact"><h2>Sessions</h2><div id="history" class="history"><span class="muted">Loading saved sessions…</span></div><div id="rename-session-controls" class="actions hidden"><label class="field grow">Current session name<input id="rename-session-label" type="text" maxlength="120"></label><button id="rename-session">Rename session</button></div><p id="session-message" class="hint" role="status"></p></section>
-  <section id="inputs-panel" class="panel">
-    <div class="section-heading"><span class="step">01</span><h2>Add recordings</h2></div>
+  <header><div class="eyebrow">FLIGHT + CONTROL / MATCHING WORKSPACE</div><h1>Your flights. Paired and aligned.</h1><p class="lede">Match FPV footage to StickCam recordings, review the shared interval, and export clips for Resolve.</p><div class="toolbar"><span id="system" class="muted">Connecting…</span><button id="collapse-all" class="secondary">Collapse all</button><button id="expand-all" class="secondary">Expand all</button><button id="new-session" class="secondary">New session</button></div></header>
+  <details id="sessions-panel" class="panel compact" data-major-panel open><summary class="panel-summary"><h2>Sessions</h2></summary><div id="history" class="history"><span class="muted">Loading saved sessions…</span></div><div id="rename-session-controls" class="actions hidden"><label class="field grow">Current session name<input id="rename-session-label" type="text" maxlength="120"></label><button id="rename-session">Rename session</button><button id="delete-session" class="secondary">Delete session</button></div><div id="delete-session-confirmation" class="actions hidden"><span id="delete-session-description" class="hint"></span><button id="confirm-delete-session" class="secondary">Delete from frontend</button><button id="cancel-delete-session" class="secondary">Cancel</button></div><details id="deleted-sessions" class="hidden"><summary>Deleted sessions · restore</summary><p class="hint">Deleting only removes the session from the frontend list. Source footage, exports and their download links are kept. Restore brings back its settings and results.</p><div id="deleted-session-list" class="actions"></div></details><p id="session-message" class="hint" role="status"></p></details>
+  <details id="inputs-panel" class="panel" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><span class="step">01</span><h2>Add recordings</h2></div></summary>
     <div class="tabs"><button id="source-upload" class="secondary active">Upload from this device</button><button id="source-local" class="secondary">Use folders on the server</button></div>
     <div id="upload-fields" class="grid">
       <label class="field">FPV recordings<input id="fpv-files" type="file" accept="video/*,.mkv,.avi,.m4v" multiple><small id="fpv-count">Choose your drone camera clips.</small></label>
@@ -26,14 +26,14 @@
     <div class="actions"><label class="field">Session name<input id="session-label" type="text" placeholder="Saturday flights"></label><button id="prepare">Prepare session</button><button id="pause-upload" class="secondary hidden">Pause upload</button></div>
     <div id="upload-progress" class="hidden"><progress id="upload-bar" max="100" value="0"></progress><p id="upload-message" role="status"></p></div>
     <p id="input-error" class="error" role="alert"></p>
-  </section>
-  <section id="video-list-panel" class="panel hidden">
+  </details>
+  <details id="video-list-panel" class="panel hidden" data-major-panel open><summary class="panel-summary"><h2>Video lists &amp; match scope</h2></summary>
     <div class="actions settings"><label>Match scope <select id="match-target-kind"><option value="all">All recordings</option><option value="fpv">Selected FPV against all StickCam</option><option value="radio">Selected StickCam against all FPV</option></select></label><label id="match-target-wrap" class="hidden">Quick select one <select id="match-target-name"></select></label><button id="targets-select-all" class="secondary">Select all on this side</button><button id="targets-clear" class="secondary">Clear selection</button></div>
     <details id="video-lists" open><summary>Video lists · select all, some or one</summary><div class="grid"><div><h3 id="fpv-list-title">FPV videos</h3><div id="fpv-video-list" class="video-file-list"></div></div><div><h3 id="radio-list-title">StickCam videos</h3><div id="radio-video-list" class="video-file-list"></div></div></div></details>
     <p id="target-selection-summary" class="hint"></p><label class="toggle"><input id="stop-on-confident-match" type="checkbox" checked>For selected FPV, pause when strong evidence is found so I can confirm or continue scanning</label>
-  </section>
-  <section id="calibration-panel" class="panel hidden">
-    <div class="section-heading"><span class="step">02</span><h2>Calibrate StickCam</h2><span id="calibrated-count" class="badge"></span></div>
+  </details>
+  <details id="calibration-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><span class="step">02</span><h2>Calibrate StickCam</h2><span id="calibrated-count" class="badge"></span></div></summary>
     <p class="hint">Choose a frame where the housings and stick tips are visible. Suggest regions proposes housing boxes, neutral centres and current stick tips using saved radio references or visible rims and caps. Check every marker and amend it with the tools below. Dashed circles mark suggested tips; crosses mark neutral centres. Covered or uncertain tips need a manual click or a clearer frame. Mode 2: left = yaw/throttle, right = roll/pitch.</p>
     <div class="actions"><label class="field grow">Recording<select id="calibration-clip"></select></label><label class="toggle"><input id="fixed-camera" type="checkbox"><span id="camera-label">Wonky StickCam</span></label><label class="toggle"><input id="skip-motion" type="checkbox">Audio only for this clip</label><label class="toggle"><input id="exclude-clip" type="checkbox">Exclude this clip</label></div>
     <div class="actions"><button id="calibration-previous" class="secondary">Previous clip</button><button id="calibration-next" class="secondary">Next clip</button><button id="auto-find-radio" class="secondary">Find radio in this clip</button><button id="auto-find-all" class="secondary">Auto-calibrate remaining clips</button><label>Search up to <input id="auto-search-seconds" type="number" min="5" max="600" step="5" value="60"> s</label><button id="auto-find-cancel" class="secondary hidden">Cancel search</button></div>
@@ -45,12 +45,12 @@
       <aside class="calibration-controls" aria-label="StickCam frame and calibration controls">
         <h3>Frame &amp; calibration</h3>
         <details id="radio-orientation-section" open><summary>Session radio &amp; orientation</summary>
-          <label class="field">Radio name / model<input id="session-radio-label" type="text" maxlength="100" list="radio-models" placeholder="Name your radio or choose a model"></label>
-          <datalist id="radio-models"><option value="RadioMaster TX16S"><option value="RadioMaster Boxer"><option value="RadioMaster GX12"><option value="HelloRadioSky"><option value="Jumper"><option value="My session radio"></datalist>
+          <label class="field">Radio model<select id="session-radio-label"><option value="auto">Auto-detect · confirm a model</option><option value="other">Other</option></select></label>
+          <canvas id="radio-shape-preview" width="300" height="180" class="hidden" aria-label="Approximate shell and gimbal layout for the selected radio"></canvas><p id="radio-shape-message" class="hint"></p>
           <div class="actions"><button id="confirm-session-radio" class="secondary">Confirm radio &amp; use this frame as reference</button><button id="check-radio-midpoint" class="secondary">Check midpoint</button><button id="check-radio-all" class="secondary">Check all clip orientations</button><button id="cancel-radio-orientation" class="secondary hidden">Cancel orientation check</button></div>
           <p id="session-radio-message" class="hint"></p>
           <label>Radio at this calibration frame<select id="radio-rotation-deg"><option value="0">Upright · 0°</option><option value="180">Upside down · 180°</option></select></label>
-          <p class="hint">Left/right mean the radio’s physical controls viewed upright. When upside down, physical left appears on the right of the image. Keep the frame as recorded; this setting corrects stick directions. Review the labelled regions after changing it.</p>
+          <label class="toggle"><input id="cal-mirror-horizontal" type="checkbox">Mirror calibration image horizontally</label><p class="hint">180° automatically mirrors this view left/right; you can turn the mirror off. Marker clicks map back to the original footage, and labels retain the radio’s physical left/right controls. A horizontal mirror does not turn the image upright. The saved 180° orientation corrects both stick axes during tracking; mirroring the view adds no second axis flip.</p>
           <progress id="radio-orientation-progress" class="hidden" max="100"></progress><p id="radio-orientation-message" class="hint" role="status"></p>
           <div id="radio-orientation-result" class="hidden"><img id="radio-orientation-image" class="diagnostic" alt="StickCam frame near the midpoint for radio orientation review"><p id="radio-orientation-evidence" class="hint"></p><button id="apply-radio-orientation" class="secondary">Use suggested calibration orientation</button></div>
           <p class="hint">Confirm a clear radio outline and both sticks once as the session reference. Shape and distributed face details then identify that same radio near each clip’s midpoint (retrying ±5s / ±10s), and at its calibration frame. Unknown results need manual review. The model label is yours to confirm; a silhouette alone cannot identify a model reliably.</p>
@@ -72,16 +72,27 @@
       <div class="tablewrap stick-data-table"><table><thead><tr><th>StickCam video</th><th>Saved movement data</th><th>Samples / extraction rate</th><th>Last extraction time</th><th>Saved</th></tr></thead><tbody id="stick-data-rows"></tbody></table></div>
       <details><summary>Derivation log</summary><div id="stick-data-log" class="hint"></div></details>
     </details>
-  </section>
-  <section id="analysis-panel" class="panel hidden">
-    <div class="section-heading"><span class="step">03</span><h2>Find matching flights</h2></div>
+  </details>
+  <details id="fpv-preparation-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><h2>Prepare FPV visual motion</h2><span id="fpv-data-count" class="badge push"></span></div></summary>
+    <p class="hint">For FPV clips without usable embedded gyro or attitude data, derive image rotation and horizontal/vertical flow here. Embedded motion is checked first and remains preferred. Saved visual data is reused by matching and Motion comparison; StickCam calibration is not needed for this step.</p>
+    <p class="hint">These are 2D image estimates, not measured drone roll/pitch/yaw or gravity. Fast flips, blur and featureless sky can cause tracking gaps. Usable tracking shows the percentage of samples with quality above 0.1, not match confidence.</p>
+    <div class="actions settings"><label>Visual extraction <input id="fpv-preparation-fps" type="number" min="1" max="30" step="1" value="30"> Hz</label><label>Decode <select id="fpv-preparation-decode"><option value="auto">GPU when available</option><option value="cpu">CPU</option><option value="cuda">CUDA only</option></select></label><span class="hint">Shared with Extract / Decode in matching; Compare Hz is reduced if necessary. Clips are processed one at a time.</span></div>
+    <div class="actions"><button id="fpv-check-all" class="secondary">Check embedded motion · all FPV</button><button id="fpv-derive-all">Derive all without embedded motion</button><button id="fpv-preparation-cancel" class="secondary hidden">Cancel preparation</button><button id="fpv-data-refresh" class="secondary">Refresh saved data</button></div>
+    <div class="actions"><button id="fpv-select-eligible" class="secondary">Select unchecked / without embedded</button><button id="fpv-clear-selection" class="secondary">Clear selection</button><span id="fpv-selection-count" class="badge">0 selected</span><button id="fpv-check-selected" class="secondary" disabled>Check selected</button><button id="fpv-derive-selected" disabled>Derive selected without embedded</button></div>
+    <progress id="fpv-data-progress" class="hidden" max="100"></progress><p id="fpv-data-message" class="hint" role="status"></p>
+    <div class="tablewrap stick-data-table"><table><thead><tr><th>Select</th><th>FPV video</th><th>Duration</th><th>Embedded motion</th><th>Saved visual motion</th><th>Samples / quality</th><th>Extraction time</th><th>Inspect</th></tr></thead><tbody id="fpv-data-rows"></tbody></table></div>
+    <details><summary>FPV preparation log</summary><div id="fpv-data-log" class="hint"></div></details>
+  </details>
+  <details id="analysis-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><span class="step">03</span><h2>Find matching flights</h2></div></summary>
     <fieldset id="matching-evidence" class="matching-evidence">
       <legend>Data to use for matching</legend>
       <div class="actions"><button id="evidence-all" class="secondary" type="button">All available</button><button id="evidence-audio" class="secondary" type="button">Audio + timestamps</button><button id="evidence-gyro" class="secondary" type="button">Gyro + sticks</button></div>
       <div class="evidence-grid">
         <label class="evidence-option"><input id="use-fpv-gyro" type="checkbox" checked><span>FPV embedded gyro / attitude<small>Preferred motion source when available.</small></span></label>
-        <label class="evidence-option"><input id="use-fpv-visual" type="checkbox" checked><span>FPV derived motion<small>Visual fallback if selected embedded data is unavailable.</small></span></label>
-        <label class="evidence-option"><input id="use-stick-inputs" type="checkbox" checked><span>StickCam derived inputs<small>Uses saved inputs; derives missing data from calibrated clips.</small></span></label>
+        <label class="evidence-option"><input id="use-fpv-visual" type="checkbox" checked><span>FPV derived motion (Experimental)<small>Visual fallback if selected embedded data is unavailable.</small></span></label>
+        <label class="evidence-option"><input id="use-stick-inputs" type="checkbox" checked><span>StickCam derived inputs (Experimental)<small>Uses saved inputs; derives missing data from calibrated clips.</small></span></label>
         <label class="evidence-option"><input id="use-fpv-audio" type="checkbox" checked><span>FPV audio<small>Fingerprint and trends from the first and last 30 seconds.</small></span></label>
         <label class="evidence-option"><input id="use-stickcam-audio" type="checkbox" checked><span>StickCam audio<small>Must be paired with FPV audio for audio matching.</small></span></label>
         <label class="evidence-option"><input id="use-filename-timestamps" type="checkbox" checked><span>Filename timestamps<small>Relative camera clocks, anchored by an audio or motion match.</small></span></label>
@@ -96,9 +107,9 @@
     <div class="actions"><button id="analyze">Analyze recordings</button><button id="cancel-analysis" class="secondary hidden">Cancel analysis</button><a id="analysis-log" class="hidden" target="_blank" rel="noopener">Analysis log</a></div>
     <progress id="analysis-bar" max="100" value="0"></progress><div id="extraction-progress-list" class="extraction-progress-list"></div><p id="analysis-message" role="status"></p>
     <div id="early-proposal" class="hidden"><h3>Early pair proposal · search incomplete</h3><p id="early-proposal-evidence" class="hint"></p><div class="actions"><button id="early-preview" class="secondary">Preview proposal with charts</button><button id="early-confirm">Confirm pair &amp; skip remaining candidates</button><button id="early-continue" class="secondary">Continue scanning</button></div></div>
-  </section>
-  <section id="motion-panel" class="panel hidden">
-    <div class="section-heading"><h2>Motion comparison</h2><span class="badge push">FPV + StickCam signals</span></div>
+  </details>
+  <details id="motion-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><h2>Motion comparison</h2><span class="badge push">FPV + StickCam signals</span></div></summary>
     <p class="hint">Inspect embedded camera motion or image-derived motion above the detected sticks on a shared timeline. Load one clip comparison at a time; extraction is cached. You can inspect FPV motion before configuring StickCam.</p>
     <div class="grid"><label class="field">FPV recording<select id="motion-fpv"></select></label><label class="field">StickCam recording<select id="motion-radio"></select></label></div>
     <div class="actions"><label>FPV signal <select id="motion-source"><option value="auto">Embedded motion, otherwise visual</option><option value="gyro">Embedded gyro / attitude only</option><option value="visual">Image-derived motion</option></select></label><button id="motion-load">Load motion signals</button><button id="motion-cancel" class="secondary hidden">Cancel extraction</button><button id="motion-use-pair" class="secondary">Use preview pair</button></div>
@@ -133,26 +144,27 @@
       <div class="actions"><label>Window start <input id="motion-start" type="number" step="0.1"> s</label><label>Window end <input id="motion-end" type="number" step="0.1"> s</label><button id="motion-window" class="secondary">Show window</button><span id="motion-cursor" class="hint" aria-live="polite"></span></div>
       <p id="motion-note" class="hint"></p><p class="hint">Scroll over a plot to zoom; drag to pan; click to inspect values. Clicking also seeks the shared video preview when it shows these recordings. Positive FPV shift moves its signal later on the StickCam timeline. Chart adjustments are exploratory; save alignment in the video viewer.</p>
     </div>
-  </section>
-  <section id="results-panel" class="panel hidden">
-    <div class="section-heading"><span class="step">04</span><h2>Review the pairs</h2><a id="csv-download" class="push">Download scores CSV</a></div>
-    <p id="result-summary"></p><p class="hint">Scores measure correlation evidence, not the probability of a correct match. “Strong” needs multiple axes, a distinct timing peak and separation from other clips. Review the videos before editing.</p>
+  </details>
+  <details id="results-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><span class="step">04</span><h2>Review the pairs</h2><a id="csv-download" class="push">Download scores CSV</a></div></summary>
+    <p id="result-summary"></p><p class="hint">Scores measure correlation evidence, not the probability of a correct match. “Strong” needs multiple axes, a distinct timing peak and separation from other clips. One StickCam may pair with multiple FPV segments; each segment keeps its own offset. Review the videos before editing.</p>
     <p id="clock-summary" class="hint"></p><p id="rate-summary" class="hint"></p><div id="pair-cards" class="pair-cards"></div><div id="unmatched"></div><div id="file-errors" class="error"></div>
+    <details id="related-segments" class="hidden" open><summary>Related FPV segments · anchored filename timing</summary><p class="hint">One StickCam can contain several FPV files. A saved alignment anchors the relative FPV camera clock; filename start times and actual durations predict shared ranges. These are candidates to review, not confirmed matches. Duplicate timestamps, overlapping files and camera clock resets need independent audio or motion checks. Saving each segment keeps its own alignment.</p><progress id="segment-scan-progress" class="hidden" max="100"></progress><p id="segment-scan-message" class="hint" role="status"></p><button id="segment-scan-cancel" class="secondary hidden">Cancel segment search</button><div class="tablewrap stick-data-table"><table><thead><tr><th>StickCam</th><th>FPV segment</th><th>StickCam shared range</th><th>Review status</th><th>Inspect</th></tr></thead><tbody id="related-segment-rows"></tbody></table></div></details>
     <details><summary>All candidate comparisons</summary><div class="actions"><label>StickCam <select id="candidate-filter"><option value="">All clips</option></select></label><button id="previous-page" class="secondary">Previous</button><span id="page-label"></span><button id="next-page" class="secondary">Next</button></div><div class="tablewrap"><table><thead><tr><th>StickCam</th><th>FPV</th><th>Evidence score</th><th>Motion</th><th>Audio</th><th>Offset</th><th>Review</th></tr></thead><tbody id="candidate-rows"></tbody></table></div></details>
-  </section>
-  <section id="viewer-panel" class="panel hidden">
-    <div class="section-heading"><h2>Shared interval preview</h2><span id="review-state" class="badge push"></span></div>
+  </details>
+  <details id="viewer-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><h2>Shared interval preview</h2><span id="review-state" class="badge push"></span></div></summary>
     <div class="grid"><label class="field">StickCam<select id="review-radio"></select></label><label class="field">FPV candidate<select id="review-fpv"></select></label></div>
     <p id="pair-evidence" class="hint"></p><div class="video-pair"><div><h3 id="radio-heading">StickCam</h3><video id="radio-preview" playsinline preload="metadata"></video></div><div><h3 id="fpv-heading">FPV</h3><video id="fpv-preview" playsinline preload="metadata" muted></video></div></div>
     <div id="overlap-bars" class="overlap-bars"></div>
     <div class="pair-controls"><button id="pair-play">Play</button><button id="step-back" class="secondary" aria-label="Previous frame">−1 frame</button><button id="step-forward" class="secondary" aria-label="Next frame">+1 frame</button><input id="pair-seek" type="range" min="0" max="1" step="0.001" value="0" aria-label="Shared timeline"><span id="pair-time">0:00 / 0:00</span></div>
     <div class="actions"><label>Offset <input id="review-offset" type="number" step="0.001"> s</label><button id="offset-back" class="secondary">Offset −1 frame</button><button id="offset-forward" class="secondary">Offset +1 frame</button><label>Listen to <select id="preview-audio"><option value="radio">StickCam</option><option value="fpv">FPV</option><option value="none">Mute both</option></select></label><label class="toggle"><input id="playback-proxy" type="checkbox" checked>Fast preview · 480p on demand</label></div>
     <p class="hint">Positive offset trims the StickCam start; negative offset trims the FPV start. Adjust in frame steps to line up a shared sound or visible event. Fast preview encodes only short chunks around the playhead, with audio and source-relative timing. Uncheck it to try supported originals. Browser playback is for review; exports use the originals and saved offset.</p>
-    <div class="actions"><button id="save-alignment">Save pairing &amp; alignment</button><button id="reject-pair" class="secondary">Leave this StickCam unmatched</button><label>Export rate <select id="export-fps"><option>24</option><option>25</option><option selected>30</option><option>50</option><option>60</option></select> fps</label><label>Format <select id="export-profile"><option value="h264">Compact MP4 · H.264/AAC</option><option value="dnxhr">Resolve editing · DNxHR HQX/PCM</option></select></label><button id="export-pair">Export this aligned pair</button><button id="open-portrait" class="secondary">Save alignment &amp; open 9:16 editor</button></div>
+    <div class="actions"><button id="save-alignment">Save pairing &amp; alignment</button><button id="reject-pair" class="secondary">Reject this FPV segment</button><label>Export rate <select id="export-fps"><option>24</option><option>25</option><option selected>30</option><option>50</option><option>60</option></select> fps</label><label>Format <select id="export-profile"><option value="h264">Compact MP4 · H.264/AAC</option><option value="dnxhr">Resolve editing · DNxHR HQX/PCM</option></select></label><button id="find-related-segments" class="secondary">Save &amp; find related FPV segments</button><label class="toggle"><input id="auto-find-segments" type="checkbox" checked>Find related FPV after saving alignment</label><button id="export-pair">Export this aligned pair</button><button id="open-portrait" class="secondary">Save alignment &amp; open 9:16 editor</button></div>
     <p id="viewer-message" role="status"></p>
-  </section>
-  <section id="portrait-panel" class="panel hidden">
-    <div class="section-heading"><h2>9:16 pair editor</h2><span class="badge push">1080 × 1920</span></div><p id="portrait-pair-label" class="hint"></p>
+  </details>
+  <details id="portrait-panel" class="panel hidden" data-major-panel open>
+    <summary class="panel-summary"><div class="section-heading"><h2>9:16 pair editor</h2><span class="badge push">1080 × 1920</span></div></summary><p id="portrait-pair-label" class="hint"></p>
     <p class="hint">FPV sits above StickCam with a hard horizontal split. Zoom is relative to filling each pane; 60% keeps a wider main FPV view, with blurred footage filling its surroundings. Position and rotation affect only that video's pane. Playback uses the saved shared alignment.</p>
     <div class="portrait-workspace"><div class="portrait-preview"><canvas id="portrait-canvas" width="540" height="960" aria-label="Portrait video composition preview"></canvas><div class="pair-controls"><button id="portrait-play">Play</button><input id="portrait-seek" type="range" min="0" max="1" step="0.001" value="0" aria-label="Portrait shared timeline"></div><p id="portrait-time" class="hint"></p></div><div class="portrait-settings">
       <label class="field">Top FPV pane share<input id="portrait-split" type="range" min="20" max="80" value="60"><span id="portrait-split-label">60% FPV / 40% StickCam</span></label>
@@ -162,19 +174,19 @@
       <div class="actions"><button id="portrait-save">Save layout</button><button id="portrait-reset" class="secondary">Reset layout</button><button id="portrait-export">Export 9:16 MP4</button></div><p id="portrait-message" class="hint" role="status"></p>
       <p class="hint">Layout and trim points are saved per pair. Export renders the original source resolution into one 1080 × 1920 MP4. The centred StickCam review preview is separate; this editor applies the static transforms shown here.</p>
     </div></div>
-  </section>
-  <section id="exports-panel" class="panel hidden"><div class="section-heading"><h2>Aligned exports</h2><button id="export-batch" class="secondary push">Export all reviewed pairs</button></div><p class="hint">Full source resolution, identical frame counts at your chosen rate. Choose compact MP4 or 10-bit DNxHR MOV with PCM audio for editing, including Resolve on Linux. DNxHR files are substantially larger. Place both clips at the same timeline position. Each export includes its alignment details.</p><div id="export-list"></div></section>
-  <details id="diagnostics-panel" class="panel hidden"><summary>Motion diagnostics</summary><p class="hint">These plots show the automatic estimates. Manual corrections are reflected in the viewer, CSV and exports.</p><div id="plots" class="plots"></div></details>
+  </details>
+  <details id="exports-panel" class="panel hidden" data-major-panel open><summary class="panel-summary"><div class="section-heading"><h2>Aligned exports</h2><button id="export-batch" class="secondary push">Export all reviewed pairs</button></div></summary><p class="hint">Full source resolution, identical frame counts at your chosen rate. Choose compact MP4 or 10-bit DNxHR MOV with PCM audio for editing, including Resolve on Linux. DNxHR files are substantially larger. Place both clips at the same timeline position. Each export includes its alignment details.</p><div id="export-list"></div></details>
+  <details id="diagnostics-panel" class="panel hidden" data-major-panel><summary class="panel-summary">Motion diagnostics</summary><p class="hint">These plots show the automatic estimates. Manual corrections are reflected in the viewer, CSV and exports.</p><div id="plots" class="plots"></div></details>
   <footer>FPV ↔ StickCam Matcher · Local processing · Sessions and fingerprints stay on this machine.</footer>
 </main>
 <dialog id="folder-picker" aria-labelledby="folder-picker-title">
-  <div class="folder-picker-heading"><div><div class="eyebrow">SERVER FOLDERS</div><h2 id="folder-picker-title">Choose a source folder</h2></div><button id="folder-picker-close" class="secondary" type="button">Close</button></div>
+  <div class="folder-picker-heading"><div><div class="eyebrow">SERVER FOLDERS <span id="folder-purpose" class="badge"></span></div><h2 id="folder-picker-title">Choose a source folder</h2></div><button id="folder-picker-close" class="secondary" type="button">Close</button></div>
   <p class="hint">Browse folders on the machine running the viewer. Video files are shown so you can check the folder contents.</p>
   <div id="folder-network-shares" class="folder-network-shares hidden"><span class="muted">Mounted SMB shares</span><div id="folder-network-buttons"></div></div>
   <div class="folder-current"><button id="folder-parent" class="secondary" type="button">Up one folder</button><code id="folder-current-path"></code></div>
   <p id="folder-picker-message" class="hint" role="status"></p>
-  <div id="folder-entries" class="folder-entries" role="list" aria-label="Folders and videos"></div>
   <div class="folder-picker-footer"><span id="folder-video-count" class="muted"></span><button id="folder-select" type="button">Use this folder</button></div>
+  <div id="folder-entries" class="folder-entries" role="list" aria-label="Folders and videos"></div>
 </dialog>
 </body>
 </html>
