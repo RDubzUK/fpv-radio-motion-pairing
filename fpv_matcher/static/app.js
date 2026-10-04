@@ -2148,7 +2148,8 @@ function stickTrackingStageText(data) {
     stages.push(`decode ${showTime(seconds('tracking_decode_seconds'))} · ${count('tracking_decoded_frames').toLocaleString()} frames`);
   if (data.tracking_shell_seconds !== undefined) {
     const roi = count('tracking_outline_roi_searches'), full = count('tracking_outline_global_searches');
-    const searches = roi + full ? ` · SIFT ${showTime(seconds('tracking_outline_sift_seconds'))} / matches ${showTime(seconds('tracking_outline_match_seconds'))} / checks ${showTime(seconds('tracking_outline_validation_seconds'))}; ${roi} local / ${full} full searches` : '';
+    const roiFound = count('tracking_outline_roi_successes'), fullFound = count('tracking_outline_global_successes');
+    const searches = roi + full ? ` · SIFT ${showTime(seconds('tracking_outline_sift_seconds'))} / matches ${showTime(seconds('tracking_outline_match_seconds'))} / checks ${showTime(seconds('tracking_outline_validation_seconds'))}; local ${roiFound}/${roi}, full ${fullFound}/${full}` : '';
     stages.push(`radio ${showTime(seconds('tracking_shell_seconds'))}${searches}`);
   }
   if (data.tracking_stick_seconds !== undefined) stages.push(`gimbals ${showTime(seconds('tracking_stick_seconds'))}`);
@@ -2164,6 +2165,9 @@ function stickTrackingStageText(data) {
       .reduce((sum, key) => sum + seconds(key), 0);
     stages.push(`CUDA ${showTime(gpu)} · ${count('tracking_gpu_operations').toLocaleString()} ops / ${count('tracking_gpu_uploads').toLocaleString()} uploads`);
   }
+  const cpu = ['tracking_cpu_flow_seconds', 'tracking_cpu_warp_seconds', 'tracking_cpu_template_seconds']
+    .reduce((sum, key) => sum + seconds(key), 0);
+  if (cpu > 0) stages.push(`CPU flow/crop/tip ops ${showTime(cpu)}`);
   return stages.length ? `Stage time so far · ${stages.join(' · ')}` : '';
 }
 function renderStickProgress(progress, status) {
