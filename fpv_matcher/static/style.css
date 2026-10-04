@@ -34,6 +34,18 @@
 .calibration-controls details{margin-top:12px}
 .calibration-controls .hint{font-size:12px;margin-bottom:4px}
 .calibration-preview .calibration-save-controls #save-calibration{background:linear-gradient(105deg,var(--purple),#793deb 57%,var(--cyan))}
+.stick-progress-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}
+.stick-progress-card{min-width:0;padding:14px 16px;background:#090f24;border:1px solid var(--line);border-radius:12px}
+.stick-progress-card h4{display:flex;align-items:center;gap:8px;margin:0 0 12px;font-size:14px}
+.stick-progress-card progress{display:block;width:100%;margin:8px 0}
+.stick-progress-card .hint{margin:8px 0 0}
+.stick-current-name{overflow-wrap:anywhere;font-size:13px;margin:0 0 10px}
+.stick-estimate-note,.stick-progress-videos{grid-column:1/-1;margin:0}
+.stick-derivation-queue{max-height:320px;overflow:auto;margin-top:10px}
+.stick-derivation-queue td:first-child{overflow-wrap:anywhere}
+.stick-derivation-queue thead th{position:sticky;top:0;background:#090f24;z-index:1}
+.stick-derivation-queue progress{width:100px;margin:0 8px 0 0;vertical-align:middle}
+@media(max-width:600px){.stick-progress-summary{grid-template-columns:1fr}}
 @media(max-width:900px){.calibration-workspace{grid-template-columns:1fr}.calibration-controls{order:2}}
 /* Leave room for Windows system-font descenders in the gradient title. */
 h1{line-height:1.2;padding-bottom:.08em;overflow:visible;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}

@@ -2661,12 +2661,13 @@ def derive_session_sticks(job_id: str, body: dict = Body(...)):
         except ValueError:
             continue
         try:
-            radio_fps = tracking_fps(fps, ratio, _metadata(job, "radio", record["name"]).get("fps")) if ratio else fps
+            info = _metadata(job, "radio", record["name"])
+            radio_fps = tracking_fps(fps, ratio, info.get("fps")) if ratio else fps
         except ValueError as exc:
             raise HTTPException(400, f"{record['name']}: {exc}") from exc
         clips.append({"name": record["name"], "path": str(path), "identity": _fpv_source_identity(record),
                       "signature": [path.stat().st_size, path.stat().st_mtime_ns], "calibration": calibration,
-                      "sample_fps": radio_fps})
+                      "sample_fps": radio_fps, "duration_seconds": info["duration"]})
     if not clips:
         raise HTTPException(400, "Calibrate at least one StickCam video before deriving inputs")
     # A previous completed run can contain failed clips or a deleted cache: queue again if any current cache is missing.
@@ -2756,7 +2757,8 @@ def motion_review(job_id: str, chart_id: str, start: float | None = None, end: f
         for row in result["clips"]:
             record = _record(job, "radio", row["name"])
             row["current_cache"] = stick_cache_status(record["path"], jobs.DATA / "cache", job["calibrations"].get(row["name"]), row.get("sample_fps", request["sample_fps"]), _fpv_source_identity(record))
-        return {**status, **result}
+        progress_file = directory / "progress.json"
+        return {**status, **result, "progress": json.loads(progress_file.read_text()) if progress_file.exists() else None}
     if request.get("kind") == "audio-review":
         if not math.isfinite(offset):
             raise HTTPException(400, "Choose a finite audio shift")

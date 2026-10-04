@@ -213,7 +213,7 @@ function clearSession() {
   resetMotionReview();
   stickPreparation.token++; clearTimeout(stickPreparation.timer); stickPreparation.key = '';
   stickPreparation.running = false; stickPreparation.task = null; state.stickData = null;
-  show('derive-sticks-cancel', false); show('stick-data-progress', false); $('stick-data-log').replaceChildren();
+  show('derive-sticks-cancel', false); show('stick-progress-summary', false); $('stick-data-log').replaceChildren();
   calibrationScan.token++; clearTimeout(calibrationScan.timer); calibrationScan.id = null; calibrationScan.rows = []; calibrationScan.running = false;
   radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
   $('session-radio-label').value = 'auto'; renderRadioShape(); show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
@@ -2084,6 +2084,94 @@ function renderExtractionProgress() {
 }
 
 const stickPreparation = { key: '', refreshed: 0, token: 0, task: null, jobId: null, timer: null, running: false };
+function stickRemaining(seconds, running = true) {
+  if (!Number.isFinite(seconds)) return 'Estimating…';
+  if (seconds < 1) return running ? 'Finishing / updating estimate…' : 'Complete';
+  return `About ${time(Math.ceil(seconds))} remaining`;
+}
+function legacyStickProgress(progress) {
+  if (!progress || progress.clip_percent !== undefined) return progress;
+  const rows = progress.clips || [], finished = new Map(rows.map(row => [row.name,row]));
+  const fraction = Math.max(0,Math.min(1,progress.percent * progress.total / 100 - progress.completed));
+  const currentDone = finished.has(progress.name);
+  const required = state.job.inputs.radio.filter(record => {
+    const cal = state.job.calibrations[record.name];
+    return calibrated(cal) && !cal.exclude && !cal.skip_motion;
+  });
+  const group = name => { const cal = state.job.calibrations[name] || {}; return `${cal.stickcam_mode || 'wonky'}:${!!cal.radio_outline}`; };
+  const rates = new Map();
+  for (const row of rows) {
+    const record = required.find(item => item.name === row.name);
+    const duration = record?.metadata?.duration;
+    if (!row.reused && row.status === 'cached' && row.extraction_seconds > 0 && duration > 0)
+      rates.set(group(row.name),row.extraction_seconds / (duration * (row.sample_fps || progress.sample_fps)));
+  }
+  if (!currentDone && progress.elapsed_seconds >= 3 && progress.processed_seconds > 0)
+    rates.set(group(progress.name),progress.elapsed_seconds / (progress.processed_seconds * progress.sample_fps));
+  const result = {...progress, clip_percent:currentDone ? 100 : Math.min(99, fraction * 100),
+    completed:rows.length, clip_status:currentDone ? (finished.get(progress.name).reused ? 'reused' : finished.get(progress.name).status === 'failed' ? 'failed' : 'saved') : fraction >= 1 ? 'saving' : 'extracting',
+    batch_elapsed_seconds:rows.reduce((sum,row)=>sum+(row.elapsed_seconds || 0),0)+(currentDone ? 0 : progress.elapsed_seconds || 0),
+    estimate_basis:rates.size ? 'observed' : 'estimating', legacy:true};
+  // Only infer the queue when its size agrees with the running task. Partial
+  // technical runs may have different targets; never invent their remaining clips.
+  if (required.length !== progress.total || required.some(row => !Number.isFinite(row.metadata?.duration))) return result;
+  const queue = required.map(record => {
+    const saved = finished.get(record.name), active = record.name === progress.name && !saved;
+    const cache = state.stickData?.clips.find(item => item.name === record.name);
+    const reused = saved ? saved.reused : !active && cache?.status === 'cached';
+    const fps = saved?.sample_fps || (active ? progress.sample_fps : cache?.requested_fps) || progress.sample_fps;
+    const duration = record.metadata.duration, weight = reused ? 0 : duration * fps;
+    const eta = saved || reused ? 0 : active ? progress.eta_seconds : rates.has(group(record.name)) ? rates.get(group(record.name)) * weight : null;
+    return {name:record.name, status:saved ? saved.status === 'failed' ? 'failed' : reused ? 'reused' : 'saved' : active ? result.clip_status : reused ? 'ready_to_reuse' : 'queued',
+      percent:saved ? 100 : active ? result.clip_percent : 0, elapsed_seconds:saved?.elapsed_seconds || (active ? progress.elapsed_seconds : 0),
+      eta_seconds:eta, duration_seconds:duration, sample_fps:fps, weight};
+  });
+  const weight = queue.reduce((sum,row)=>sum+row.weight,0);
+  result.percent = weight ? Math.min(rows.length === progress.total ? 100 : 99.9,queue.reduce((sum,row)=>sum+row.weight*row.percent/100,0)/weight*100) : rows.length/progress.total*100;
+  const remaining = queue.filter(row => row.percent < 100 && row.status !== 'ready_to_reuse').map(row => row.eta_seconds);
+  result.batch_eta_seconds = remaining.every(Number.isFinite) ? remaining.reduce((sum,value)=>sum+value,0) : null;
+  result.queue = queue;
+  return result;
+}
+function renderStickProgress(progress, status) {
+  progress = legacyStickProgress(progress);
+  show('stick-progress-summary');
+  const running = ['queued', 'running'].includes(status);
+  if (!progress) {
+    if (!running) { show('stick-progress-summary',false); return; }
+    for (const id of ['stick-data-progress','stick-clip-progress']) $(id).removeAttribute('value');
+    message('stick-batch-percent',''); message('stick-clip-percent',''); message('stick-current-name','Waiting for processing to start');
+    message('stick-batch-detail','Queued · the timer starts when processing begins.');
+    message('stick-batch-eta','Estimating after processing starts…'); message('stick-clip-detail',''); message('stick-clip-eta','');
+    $('stick-progress-rows').replaceChildren(); return;
+  }
+  const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  const clipPercent = Math.max(0, Math.min(100, Number(progress.clip_percent ?? (percent * progress.total - progress.completed * 100)) || 0));
+  const age = running && progress.updated_at ? Math.max(0, Date.now() / 1000 - progress.updated_at) : 0;
+  const remaining = value => Number.isFinite(value) ? Math.max(0,value - age) : null;
+  const batchEta = remaining(progress.batch_eta_seconds), clipEta = remaining(progress.eta_seconds);
+  $('stick-data-progress').value = percent; $('stick-clip-progress').value = clipPercent;
+  message('stick-batch-percent',`${percent.toFixed(1)}%`); message('stick-clip-percent',`${clipPercent.toFixed(1)}%`);
+  message('stick-current-name',progress.name);
+  const failed = (progress.clips || []).filter(row => row.status === 'failed').length;
+  const reused = (progress.clips || []).filter(row => row.reused).length;
+  message('stick-batch-detail',`${progress.completed}/${progress.total} videos finished · ${reused} reused${failed ? ` · ${failed} failed` : ''}${Number.isFinite(progress.batch_elapsed_seconds) ? ` · ${time(progress.batch_elapsed_seconds + age)} elapsed` : ''}`);
+  const finish = running && batchEta >= 1 ? ` · estimated finish ${new Date(Date.now() + batchEta * 1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}` : '';
+  message('stick-batch-eta',`${running ? stickRemaining(batchEta) : status === 'complete' ? 'Batch finished' : `Batch ${status}`}${finish}`);
+  const phases = {extracting:'Deriving inputs', saving:'Saving movement data', reusing:'Loading saved data', ready_to_reuse:'Ready to reuse', queued:'Queued', reused:'Reused saved data', saved:'Derived & saved', failed:'Failed'};
+  const phase = phases[progress.clip_status] || 'Deriving inputs';
+  message('stick-clip-detail',`${phase} · ${time((progress.elapsed_seconds || 0) + (clipPercent < 100 ? age : 0))} elapsed · ${rateText(progress.sample_fps)} Hz${Number.isFinite(progress.processed_seconds) && Number.isFinite(progress.duration_seconds) && clipPercent < 100 ? ` · ${time(progress.processed_seconds)} of ${time(progress.duration_seconds)} footage scanned` : ''}`);
+  message('stick-clip-eta',clipPercent >= 100 ? phase : stickRemaining(clipEta,running));
+  message('stick-estimate-note',`${progress.estimate_basis === 'history' ? 'Initial estimates use previous successful derivations in this session.' : progress.estimate_basis === 'estimating' ? 'Time estimates appear after enough footage has been processed.' : 'Estimates use observed processing speed and update during derivation.'} ${progress.legacy && !progress.queue ? 'This older task has a clip-count batch percentage; a total estimate needs the remaining clip metadata.' : 'Batch progress is weighted by clip duration and tracking rate; cached videos require no new tracking.'} Decode, SMB speed, backwards tracking and saving can change the estimate.`);
+  const list = $('stick-progress-rows'); list.replaceChildren();
+  for (const row of progress.queue || []) {
+    const tr = el('tr'), cell = el('td'), bar = el('progress'); bar.max = 100; bar.value = row.percent;
+    bar.setAttribute('aria-label',`${row.name} progress`); cell.append(bar,el('small',`${Number(row.percent).toFixed(1)}%`));
+    tr.append(el('td',`${row.name} · ${time(row.duration_seconds)} · ${rateText(row.sample_fps)} Hz`), el('td',phases[row.status] || row.status), cell,
+      el('td',row.status === 'failed' ? 'Failed' : row.percent >= 100 ? `Finished in ${time(row.elapsed_seconds)}` : row.status === 'ready_to_reuse' ? 'Cache lookup only' : row.status === 'queued' && Number.isFinite(row.eta_seconds) ? `About ${time(Math.ceil(row.eta_seconds))} to process` : stickRemaining(row.status === 'extracting' || row.status === 'saving' ? remaining(row.eta_seconds) : row.eta_seconds,running)));
+    list.append(tr);
+  }
+}
 function readStickSamplingRatio() { return $('stick-sampling-ratio').value === '' ? null : Number($('stick-sampling-ratio').value); }
 function rateText(value) { return Number(value).toLocaleString(undefined, {maximumFractionDigits:3}); }
 function updateStickSamplingPreview() {
@@ -2154,7 +2242,7 @@ function watchStickPreparation(task, jobId, jobToken) {
   const token = ++stickPreparation.token;
   stickPreparation.task = task; stickPreparation.jobId = jobId; stickPreparation.running = true;
   $('stick-sampling-ratio').disabled = true;
-  $('derive-sticks').disabled = true; show('derive-sticks-cancel'); show('stick-data-progress');
+  $('derive-sticks').disabled = true; show('derive-sticks-cancel'); renderStickProgress(null, 'queued');
   $('analyze').disabled = true;
   const poll = async () => {
     if (token !== stickPreparation.token || jobToken !== state.jobToken) return;
@@ -2162,14 +2250,14 @@ function watchStickPreparation(task, jobId, jobToken) {
       const result = await api(`/api/jobs/${jobId}/motion-review/${task}`);
       if (token !== stickPreparation.token || jobToken !== state.jobToken) return;
       const progress = result.progress;
+      renderStickProgress(progress, result.status);
       if (progress) {
-        $('stick-data-progress').value = progress.percent;
-        message('stick-data-message', `${progress.completed}/${progress.total} clips finished · ${progress.name} · ${Number(progress.elapsed_seconds || 0).toFixed(1)}s on this clip · ${Number(progress.percent).toFixed(1)}% overall · ${etaText(progress.eta_seconds)}`);
+        message('stick-data-message', `${progress.completed}/${progress.total} videos finished. Completed movement data is saved and can be reused.`);
         renderStickPreparationLog(result);
-      } else { $('stick-data-progress').removeAttribute('value'); message('stick-data-message', result.message); }
+      } else { message('stick-data-message', result.message); }
       await refreshStickData(true);
       if (['queued', 'running'].includes(result.status)) { stickPreparation.timer = setTimeout(poll, 1500); return; }
-      stickPreparation.running = false; show('derive-sticks-cancel', false); show('stick-data-progress', false); $('derive-sticks').disabled = activeAnalysis();
+      stickPreparation.running = false; show('derive-sticks-cancel', false); $('derive-sticks').disabled = activeAnalysis();
       $('stick-sampling-ratio').disabled = activeAnalysis();
       updateFPVPreparationUI();
       renderStickPreparationLog(result);

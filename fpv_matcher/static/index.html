@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>FPV ↔ StickCam Matcher</title>
-  <link rel="stylesheet" href="/static/style.css?v=21">
-  <script type="module" src="/static/app.js?v=44"></script>
+  <link rel="stylesheet" href="/static/style.css?v=23">
+  <script type="module" src="/static/app.js?v=46"></script>
 </head>
 <body>
 <main>
@@ -84,7 +84,12 @@
       <div class="actions settings"><label>StickCam tracking <select id="stick-sampling-ratio"><option value="">Fixed extraction Hz</option><option value="0.5">0.5 × source fps · half the frames</option><option value="0.25">0.25 × source fps · quarter of the frames</option></select></label><span id="stick-sampling-preview" class="hint"></span></div>
       <p class="hint">Ratios use each clip’s detected average frame rate: 30 fps → 15 Hz or 7.5 Hz. Fewer frames reduce stick tracking work, but decoding still takes time and quick inputs can be missed. Fixed Hz uses the Extract setting below. FPV gyro and comparison Hz are independent; comparing at a higher Hz does not restore missing stick samples. Maximum tracking rate: 60 Hz.</p>
       <div class="actions"><button id="derive-sticks">Derive all calibrated StickCam videos</button><button id="derive-sticks-cancel" class="secondary hidden">Cancel derivation</button><button id="stick-data-refresh" class="secondary">Refresh cache status</button></div>
-      <progress id="stick-data-progress" class="hidden" max="100"></progress><p id="stick-data-message" class="hint" role="status"></p>
+      <div id="stick-progress-summary" class="stick-progress-summary hidden" aria-label="StickCam derivation progress">
+        <section class="stick-progress-card"><h4>Whole batch <span id="stick-batch-percent" class="badge"></span></h4><progress id="stick-data-progress" max="100" aria-label="Whole batch progress"></progress><p id="stick-batch-detail" class="hint" role="status"></p><p id="stick-batch-eta" class="hint"></p></section>
+        <section class="stick-progress-card"><h4>Current video <span id="stick-clip-percent" class="badge"></span></h4><p id="stick-current-name" class="stick-current-name"></p><progress id="stick-clip-progress" max="100" aria-label="Current video progress"></progress><p id="stick-clip-detail" class="hint" role="status"></p><p id="stick-clip-eta" class="hint"></p></section>
+        <p id="stick-estimate-note" class="hint stick-estimate-note">Estimates use observed processing speed and update as work progresses. Cached recordings are reused.</p>
+        <details class="stick-progress-videos"><summary>Progress by video</summary><div class="tablewrap stick-derivation-queue"><table><thead><tr><th>StickCam video</th><th>State</th><th>Progress</th><th>Time to process / remaining</th></tr></thead><tbody id="stick-progress-rows"></tbody></table></div></details>
+      </div><p id="stick-data-message" class="hint" role="status"></p>
       <div class="tablewrap stick-data-table"><table><thead><tr><th>StickCam video</th><th>Saved movement data</th><th>Samples / extraction rate</th><th>Last extraction time</th><th>Saved</th></tr></thead><tbody id="stick-data-rows"></tbody></table></div>
       <details><summary>Derivation log</summary><div id="stick-data-log" class="hint"></div></details>
     </details>

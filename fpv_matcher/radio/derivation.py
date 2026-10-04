@@ -143,19 +143,32 @@ def run(request_path):
     directory = Path(request["directory"])
     os.environ["FPV_MATCHER_DECODE"] = request.get("decode_mode", "auto")
     cv2.setNumThreads(1)
+    from fpv_matcher.radio.progress import StickBatchProgress, saved_timings
+    from fpv_matcher.video.metadata import probe_video
+    clips = request["clips"]
+    initial = []
+    for clip in clips:
+        clip["sample_fps"] = clip.get("sample_fps", request["sample_fps"])
+        if "duration_seconds" not in clip:
+            try:
+                clip["duration_seconds"] = probe_video(clip["path"])["duration"]
+            except (ValueError, RuntimeError, OSError):
+                clip["duration_seconds"] = 0
+        initial.append(cache_status(clip["path"], request["cache"], clip["calibration"],
+                                    clip["sample_fps"], clip.get("identity")))
     rows, total = [], len(request["clips"])
-    for index, clip in enumerate(request["clips"]):
+    reporter = StickBatchProgress(clips, [entry["status"] == "cached" for entry in initial],
+        lambda event: atomic_json(directory / "progress.json", event),
+        saved_timings(directory, clips, request.get("decode_mode", "auto"), request.get("algorithm")))
+    for index, clip in enumerate(clips):
         path = Path(clip["path"])
         fps = clip.get("sample_fps", request["sample_fps"])
         started = time.perf_counter()
+        reporter.start(index, rows)
         def report(event):
-            atomic_json(directory / "progress.json", {"stage": "stickcam", "name": clip["name"],
-                        "completed": index, "total": total, "clips": rows,
-                        "elapsed_seconds": round(time.perf_counter() - started, 2), "sample_fps": fps,
-                        **event, "percent": (index + float(event.get("percent", 0)) / 100) / total * 100})
-        report({"percent": 0})
+            reporter.update(event, rows)
         try:
-            before = cache_status(path, request["cache"], clip["calibration"], fps, clip.get("identity"))
+            before = initial[index]
             data = cached_sticks(path, request["cache"], clip["calibration"], fps, clip.get("identity"), report)
             stat = path.stat()
             if [stat.st_size, stat.st_mtime_ns] != clip["signature"]:
@@ -164,13 +177,15 @@ def run(request_path):
             elapsed = round(time.perf_counter() - started, 2)
             rows.append({"name": clip["name"], "status": "cached", "reused": reused,
                          "elapsed_seconds": elapsed, "extraction_seconds": None if reused else elapsed,
-                         "sample_fps": fps, "samples": len(data["time"]), **observation_status(data)})
+                         "sample_fps": fps, "duration_seconds": clip["duration_seconds"],
+                         "samples": len(data["time"]), **observation_status(data)})
         except (ValueError, RuntimeError, OSError, cv2.error) as exc:
             rows.append({"name": clip["name"], "status": "failed", "elapsed_seconds": round(time.perf_counter() - started, 2),
-                         "sample_fps": fps, "message": str(exc)})
-        report({"percent": 100, "eta_seconds": 0})
+                         "sample_fps": fps, "duration_seconds": clip["duration_seconds"], "message": str(exc)})
+        reporter.update({"percent": 100}, rows, finished=True)
     atomic_json(directory / "derivation.json", {"clips": rows, "sample_fps": request["sample_fps"],
                 "stick_sampling_ratio": request.get("stick_sampling_ratio"),
+                "batch_elapsed_seconds": round(time.monotonic() - reporter.started, 2),
                 "complete": sum(r["status"] == "cached" for r in rows), "total": total})
 
 
