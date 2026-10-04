@@ -32,6 +32,40 @@ A saved session turns a folder of FPV recordings and a folder of StickCam record
 
 Default extraction/comparison remain 30 Hz, minimum overlap 2 seconds, Wonky StickCam. Audio-first automatic acceptance needs more than the minimum overlap: at least eight seconds of useful audio support and three jointly agreeing independent sections, plus distinctive content and ownership/offset separation. These are conservative heuristics pending real-footage evaluation.
 
+## Quick Match implementation plan
+
+Quick Match is the fast, staged path for proposing flight pairs. It starts with inexpensive file/stream inspection and cached evidence, tries audio first, and performs motion extraction only for clips that remain unresolved. It proposes relationships and common ranges for review; it never silently confirms a pair from timestamps, durations or a single weak correlation.
+
+### 1. Scan and summarize both file lists
+
+Scan media metadata without decoding full-resolution frames. For every clip, record duration, file modified time, available audio streams, supported FPV embedded gyro/attitude, cached or derivable FPV visual motion, StickCam calibration state, and cached StickCam input data. Keep these checks bound to the source signature so a changed file cannot inherit stale availability or cached evidence.
+
+After scanning, show a compact, textual availability status beside each filename in the FPV and StickCam lists. The FPV list should show **Audio**, **Embedded gyro**, **Visual motion**, **Modified time**, and **Duration**. The StickCam list should show **Audio**, **Calibration**, **Derived inputs**, **Modified time**, and **Duration**. Distinguish **ready/cached**, **found but needs preparation**, **not available**, **needs calibration**, and **scan failed/unknown**. In particular, an audio stream being present is not the same as an audio fingerprint being prepared or a useful match having been found. Show invalid or default dates such as 1970 as suspect, not as reliable clocks.
+
+### 2. Match available audio first
+
+For clips with audio on both sides, reuse cached fingerprints or inspect useful boundary sections near the start and end first. Search for distinctive, agreeing sections and retain each section’s two clip-relative times, duration, and quality. The motor noise and unequal recording lengths mean whole-clip audio similarity is not a requirement. Audio evidence should be tested across competing candidates and owners; only confident content evidence creates a seed match.
+
+If audio is absent, continue directly to motion. If audio exists but cannot establish a confident match, run the motion fallback only for the unresolved clips. Preserve any confident audio matches while continuing on the remaining files.
+
+### 3. Expand verified matches using timestamps and durations
+
+For every seed match, record both the content-derived clip alignment and the difference between the files’ modified-time clocks. Check whether the timestamp difference agrees across independent matches before treating it as a session-level offset. Interpret the date source correctly: when filesystem modification time represents file completion, estimate recording start using the duration; when it is a capture/start time, use it directly. Treat absent, reset, or inconsistent clocks as unavailable for expansion.
+
+Once a clock offset is supported, combine it with each clip’s duration to map possible overlap intervals. Use those intervals to suggest one-to-one pairs and one-to-many groups, including consecutive O4 recordings that cover one StickCam flight. Duration and timestamps narrow candidates only after a content match has anchored the offset; neither is standalone proof. Keep the original per-file start offsets so the user can see the actual common start points.
+
+### 4. Use motion for the remaining clips
+
+For each unresolved FPV clip, use cached embedded gyro/attitude when supported. If it is absent, derive visual angular motion and save it against the source signature for reuse. For each unresolved StickCam clip, reuse valid calibration and saved inputs. If calibration is missing or uncertain, run the existing calibration suggestions and send only those clips to the calibration review step before deriving inputs.
+
+Compare FPV roll, pitch and yaw rates with expected rate-command signals calculated from calibrated StickCam axes and the saved rates profile. Search possible time shifts using repeated short sections, per-axis agreement and competing-candidate separation; do not require equal durations. Treat embedded gyro as stronger evidence than image-derived motion, and mark visual estimates as experimental. Stick throttle is a separate signal and must not be treated as a direct gyro axis. Cache every completed derivation so later Quick Match runs skip that work.
+
+### 5. Rank proposals and ask for review
+
+For each proposed relationship, show which evidence agreed, how many independent sections supported it, the time offset, modified-time difference, inferred common interval, source availability, and any weak or missing signals. Show one-to-many FPV groups together. Let the user accept, reject, adjust alignment, or continue scanning. Keep low-confidence and clock-only candidates as suggestions, and report why clips remain unmatched instead of forcing a pairing.
+
+**Acceptance gates:** file-list statuses accurately distinguish present, prepared, missing and failed evidence; absent audio reaches motion fallback; audio-found-but-inconclusive cases also reach fallback for unresolved clips; embedded gyro is preferred over derived visual motion; cached evidence is reused; a timestamp offset is used for split-file expansion only after content matches support it; unequal durations do not suppress real pairs; and no candidate becomes confirmed without user review.
+
 ### GPU and live extraction updates
 
 Tracking now automatically uses a compatible OpenCV CUDA runtime for LK flow, perspective crops and tip template matching, with an explicit CPU fallback. The RTX 3090 host has a locally built official CUDA-enabled OpenCV 4.14.0 environment; its current StickCam batch reports actual CUDA operations. SIFT/geometry/confidence validation remains on CPU, and reduced frames still cross host/device memory. Routine radio SIFT reacquisition is restricted to a generous region around the last accepted outline, with periodic full-frame searches and immediate full-frame fallback for invalid/large regions; appearance, geometry and confidence gates are unchanged. Per-video diagnostics now accumulate decode, radio shell, gimbal, flow, crop, template, upload and SIFT/match/validation times and local/global search counts. They are surfaced during a run and in the derivation log so CPU bottlenecks can be identified. No speed-up benchmark was run; stage times are diagnostic and some subtotals are included within the shell/gimbal totals. Backend choice does not invalidate existing StickCam caches; timing history distinguishes CUDA from CPU runs.
@@ -53,7 +87,13 @@ Visual motion v5 uses distributed features, native-rate intermediate tracking (o
 
 ## Remaining work, in priority order
 
-### 1. Establish accuracy on labelled real recordings
+### 1. Implement and evaluate Quick Match
+
+Build the scan/status badges in both file lists, then wire the audio-first path, unresolved-only motion fallback, cache reuse, clock-offset validation and duration-based one-to-many suggestions described above. Keep availability scanning lightweight and show progress/errors per file. Validate the status display for missing audio, missing gyro, uncalibrated StickCam, stale caches, invalid dates and unreadable files before relying on it to drive extraction.
+
+**Gate:** the known audio-confirmed pair is proposed quickly, an audio-less or audio-inconclusive case reaches motion, O4 fragments are grouped only after a supported anchor, and wrong/ambiguous candidates remain unconfirmed.
+
+### 2. Establish accuracy on labelled real recordings
 
 The known true pair is StickCam `DJI_20260406162534_0228_D.MP4` and FPV `DJI_20260406161138_0008_D.MP4`. The earlier study found repeated distinctive audio evidence around FPV 5.6s / StickCam 0s, while outline tracking drifted onto grass and stick-derived motion did not corroborate the pair. Evidence: [pair study](artifacts/pair-validation/0228-0008/README.md).
 
@@ -61,19 +101,19 @@ The new tracker and staged audio gates have not been run against that footage in
 
 **Gate:** repeated content support and correct common-start offsets on labelled clips, with ambiguous/wrong combinations staying unconfirmed. Human review remains required until these measurements justify a separate opt-in policy.
 
-### 2. Validate optional stabilization and exports
+### 3. Validate optional stabilization and exports
 
 Exercise native FFmpeg dynamic transforms on representative 1080p/4K, rotated and variable-frame-rate sources. Inspect pixel boundaries, the entire radio, gap transitions, equal counts, audio timing and Resolve import. The source-bound geometry logic cannot prove visibility between sampled observations or recover off-frame/occluded pixels. Abrupt full-frame fallbacks are visible, intentional limits.
 
 **Gate:** no artificial missing-pixel borders, no discarded radio corners, accurate shared timing and correct fallback reporting. Portrait integration of dynamic radio framing remains a separate deliverable.
 
-### 3. Improve unresolved matching science
+### 4. Improve unresolved matching science
 
 Prioritize embedded gyro/body-axis validation with rates and mount orientation. Experimental visual fallback now estimates relative 3D rotation with FOV/projection approximations and mount correction. It has not been validated against known gyro and is not a calibrated lens/pose system or gravity-aware dynamics. Inverted freestyle and parallax require the camera/lens/attitude model described in [FREESTYLE_MOTION_DESIGN.md](FREESTYLE_MOTION_DESIGN.md). Throttle/gravity coupling is not reliable matching evidence without vehicle/translation modeling.
 
 **Gate:** quality-qualified rotation correspondence on labelled flights before stronger automated claims. Covered tips remain gaps; a trained detector/reference library needs representative annotated footage, not just catalogue silhouettes.
 
-### 4. Improve operational convenience
+### 5. Improve operational convenience
 
 Controlled rescan/add/remove recordings in an established session, cross-session named pilot/radio profiles, source fingerprint strengthening where needed, better ETA models from measured workloads, bounded cache inspection/pruning, and durable distributed task scheduling remain follow-ups. Current relink handles existing filenames only; it does not discover new clips or mount an SMB share.
 
