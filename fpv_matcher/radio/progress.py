@@ -13,7 +13,7 @@ def timing_group(clip):
     return (calibration.get("stickcam_mode", "wonky"), bool(calibration.get("radio_outline")))
 
 
-def saved_timings(directory, clips, decode_mode, algorithm):
+def saved_timings(directory, clips, decode_mode, algorithm, tracking_backend="cpu"):
     """Use recent successful extraction timings, never cache lookup timings."""
     current = {clip["name"]: clip for clip in clips}
     observations = {}
@@ -32,6 +32,8 @@ def saved_timings(directory, clips, decode_mode, algorithm):
                 continue
             sources = {clip["name"]: clip for clip in prior["clips"]}
             for row in result["clips"]:
+                if row.get("tracking_backend", "cpu") != tracking_backend:
+                    continue
                 clip = sources[row["name"]]
                 duration = row.get("duration_seconds", clip.get("duration_seconds"))
                 # Earlier logs did not store duration. Recover it only for the
@@ -137,4 +139,6 @@ class StickBatchProgress:
                    "batch_elapsed_seconds": round(now - self.started, 1),
                    "batch_eta_seconds": round(batch_eta, 1) if batch_eta is not None else None,
                    "estimate_basis": "observed" if observed is not None or self.observations else "history" if self.historical else "estimating",
+                   **{key: value for key, value in self.event.items() if key.startswith("tracking_")},
+                   "live_inputs": self.event.get("live_inputs"),
                    "updated_at": time.time()})

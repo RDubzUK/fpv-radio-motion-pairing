@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--no-audio", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--tracking-backend", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--decode-mode", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--motion-source", choices=("auto", "gyro", "visual"), default="auto")
     parser.add_argument("--camera-uptilt-deg", type=float, default=0)
@@ -62,7 +63,7 @@ def main():
             make_plots=not args.no_plots,
             rate_profile=profile, motion_source=args.motion_source, camera_uptilt_deg=args.camera_uptilt_deg,
             imu_orientation=args.imu_orientation, gyro_video_offset=args.gyro_video_offset, decode_mode=args.decode_mode,
-            stick_sampling_ratio=args.stick_sampling_ratio,
+            stick_sampling_ratio=args.stick_sampling_ratio, tracking_backend=args.tracking_backend,
         )
     except (ValueError, OSError) as exc:
         parser.exit(1, f"Analysis failed: {exc}\n")

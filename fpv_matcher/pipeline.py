@@ -101,6 +101,7 @@ def run_batch(
     imu_orientation: str = "zXy",
     gyro_video_offset: float = 0,
     decode_mode: str = "auto",
+    tracking_backend: str = "auto",
     evidence_sources: dict | None = None,
     stick_sampling_ratio: float | None = None,
     matching_strategy: str = "selected",
@@ -153,6 +154,9 @@ def run_batch(
         raise ValueError("Configuration must be a JSON object")
     if decode_mode not in {"auto", "cpu", "cuda"}:
         raise ValueError("Choose automatic, CPU or CUDA decoding")
+    if tracking_backend not in {"auto", "cpu", "cuda"}:
+        raise ValueError("Choose automatic, CPU or CUDA tracking")
+    os.environ["FPV_MATCHER_TRACKING"] = tracking_backend
     os.environ["FPV_MATCHER_DECODE"] = decode_mode
     rate_profile = validate_rate_profile(rate_profile)
     motion_source, camera_uptilt_deg, imu_orientation, gyro_video_offset = validate_motion_settings(motion_source, camera_uptilt_deg, imu_orientation, gyro_video_offset)

@@ -13,6 +13,20 @@ On this machine the managed service is available at:
 
 The service binds to `0.0.0.0:8767`, runs independently of this coding session, and starts at user login. The LAN address can change with the network configuration.
 
+### GPU tracking and live inputs
+
+**Tracking processor** under **Saved StickCam movement data** defaults to **GPU when available**. CUDA-enabled OpenCV accelerates forward/reverse optical flow, perspective crops and stick template matching. CPU SIFT reacquisition, geometry, appearance checks and confidence checks remain active. The decoder still transfers reduced grayscale images into Python; this is a hybrid pipeline. Progress and derivation logs report the backend actually used, GPU operation count and a fallback reason. **CPU** explicitly disables GPU tracking; **CUDA only** reports an error if it cannot run. Decoder selection is independent. Current valid StickCam caches are reused with either processor.
+
+The live **Inputs as they are derived** chart shows the latest 20 seconds of provisional throttle, yaw, pitch and roll observations, with channel values and quality. It follows the selected stick Mode and preserves unobserved samples as gaps. It is available in newly started derivations; an existing worker cannot add live output midway through a run. The full validated recording is saved when extraction finishes.
+
+The standard PyPI OpenCV wheel is CPU-only. On this machine an official OpenCV 4.14.0 CUDA wheel has been built and installed in `.venv` for the RTX 3090. To reproduce it with an installed NVIDIA driver and CUDA toolkit, run `tools/build_opencv_cuda.sh` **after** normal environment setup. It builds official pinned sources under ignored `.gpu-build`, detects the first GPU's architecture and installs only into this project's environment. `FPV_CUDA_ARCH` and `FPV_BUILD_JOBS` override architecture and build concurrency. A normal `uv sync` may restore the CPU wheel; rerun the CUDA installer afterwards. The custom wheel depends on the installed CUDA runtime and is not a portable binary.
+
+### Improved visual motion and optional gap filling
+
+FPV visual preparation now distributes landmarks across the image, retains tracked landmarks independently of the diagnostic 2D affine fit and can reacquire large movements using mutual descriptor matches. **Track intermediate frames for fast motion** tracks at source frame rate, up to 120 Hz, then composes observed rotation increments into the selected output intervals. This uses more processing than tracking only at the output Hz; disable the option to favor speed. Embedded gyro remains preferred. Lens FOV/projection, stabilization, parallax, blur and featureless sky still limit image-derived rotation.
+
+The viewer reports reasons for missing rotation samples. **Fill short gaps** is off by default. When enabled, it linearly interpolates only between two observed samples whose total separation is within the selected 0.10–0.50 second span. Dashed segments identify those display estimates; they do not change the cache, observed coverage or matching evidence. Long gaps and leading/trailing gaps remain unfilled. Older algorithm caches are retained for review but must be re-derived to use the improved extraction. Accurate lens geometry and a comparison against known gyro are still needed to establish accuracy; no performance or accuracy gain has been measured for this version.
+
 Select a saved session in **Sessions** to rename it; the new name is saved with that session.
 
 ```bash

@@ -37,7 +37,7 @@ def sampled_frames(
     Only reduced grayscale frames cross into Python. Automatic CUDA falls back
     before yielding a frame; a midstream failure is reported rather than spliced.
     """
-    if not math.isfinite(sample_fps) or not 0 < sample_fps <= 60 or not math.isfinite(start) or start < 0:
+    if not math.isfinite(sample_fps) or not 0 < sample_fps <= 120 or not math.isfinite(start) or start < 0:
         raise ValueError("Invalid sampling rate or start time")
     info = probe_video(path)
     scale = min(1.0, (max_dimension or max(info["width"], info["height"])) / max(info["width"], info["height"]))

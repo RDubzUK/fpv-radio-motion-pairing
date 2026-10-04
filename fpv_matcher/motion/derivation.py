@@ -20,6 +20,18 @@ VERSION = LucasKanadeEstimator.algorithm_version
 MAX_DIMENSION = 960
 
 
+def previous_cache_path(path, cache, fps, identity=None, camera_profile=None):
+    """Older estimates remain reviewable; matching only uses the current version."""
+    profile = validate_profile(camera_profile)
+    profile.pop("track_full_rate", None)
+    config = {"sample_fps": float(fps), "max_dimension": MAX_DIMENSION, "camera_profile": profile}
+    for rate in (float(fps), int(fps) if float(fps).is_integer() else float(fps)):
+        target = Path(cache) / f"fpv.{_key(str(path), 'lk-rays-relative-camera-rotation-fov-v4', {**config, 'sample_fps': rate}, identity)}.npz"
+        if target.exists():
+            return target
+    return None
+
+
 def cache_path(path, cache, fps, identity=None, camera_profile=None):
     config = {"sample_fps": float(fps), "max_dimension": MAX_DIMENSION, "camera_profile": validate_profile(camera_profile)}
     target = Path(cache) / f"fpv.{_key(str(path), VERSION, config, identity)}.npz"
@@ -61,11 +73,17 @@ def load_saved_visual(path, cache, fps, identity=None, camera_profile=None):
     stat = source.stat()
     signature = (stat.st_size, stat.st_mtime_ns)
     target = cache_path(path, cache, fps, identity, camera_profile)
+    legacy = False
+    if not target.exists():
+        previous = previous_cache_path(path, cache, fps, identity, camera_profile)
+        if previous is not None:
+            target, legacy = previous, True
     with np.load(target, allow_pickle=False) as values:
         if str(values["cache_key"].item()) != target.stem.split(".", 1)[1]:
             raise ValueError("Invalid visual motion cache identity")
         data = {key: values[key] for key in values.files if key != "cache_key"}
     _validate(data)
+    data["previous_algorithm"] = np.asarray(legacy)
     current = source.stat()
     if (current.st_size, current.st_mtime_ns) != signature:
         raise ValueError("FPV source changed while reading its saved motion")
@@ -88,7 +106,9 @@ def _inspect(filename, modified, size, embedded=False):
         return {"status": "cached", "samples": len(times), "range": [float(times[0]), float(times[-1])],
                 "usable_percent": round(float(np.mean(quality > .1)) * 100, 1),
                 "extraction_seconds": float(data["extraction_seconds"].item()) if "extraction_seconds" in data else None,
-                "cached_at": modified / 1e9}
+                "cached_at": modified / 1e9,
+                "tracking_fps": float(data["tracking_fps"]) if "tracking_fps" in data else None,
+                "tracking_label": str(data["tracking_label"].item()) if "tracking_label" in data else "Earlier CPU extraction"}
 
 
 def embedded_status(path, cache, identity=None):
@@ -106,6 +126,11 @@ def cache_status(path, cache, fps, identity=None, camera_profile=None):
     try:
         target = cache_path(path, cache, fps, identity, camera_profile)
         if not target.exists():
+            previous = previous_cache_path(path, cache, fps, identity, camera_profile)
+            if previous is not None:
+                stat = previous.stat()
+                return {**_inspect(str(previous), stat.st_mtime_ns, stat.st_size),
+                        "status": "older_algorithm", "sample_fps": fps}
             return {"status": "not_derived", "sample_fps": fps}
         stat = target.stat()
         return {**_inspect(str(target), stat.st_mtime_ns, stat.st_size), "sample_fps": fps}
@@ -119,6 +144,7 @@ def run(request_path):
     request = json.loads(Path(request_path).read_text())
     directory = Path(request["directory"])
     os.environ["FPV_MATCHER_DECODE"] = request.get("decode_mode", "auto")
+    os.environ["FPV_MATCHER_TRACKING"] = request.get("tracking_backend", "auto")
     cv2.setNumThreads(1)
     rows, total, fps = [], len(request["clips"]), request["sample_fps"]
     for index, clip in enumerate(request["clips"]):

@@ -208,6 +208,7 @@ function clearSession() {
   fpvPreparation.token++; clearTimeout(fpvPreparation.timer); fpvPreparation.key = '';
   fpvPreparation.running = false; fpvPreparation.task = null; fpvPreparation.selected.clear(); state.fpvData = null;
   resetFPVVisualReview();
+  liveStickPreview=null; show('stick-live-preview',false);
   $('fpv-data-rows').replaceChildren(); $('fpv-data-log').replaceChildren();
   show('fpv-data-progress', false); show('fpv-preparation-cancel', false);
   resetMotionReview();
@@ -314,6 +315,8 @@ async function selectJob(id) {
   $('fpv-preparation-fps').value = job.settings.fpv_visual_fps || 30;
   $('visual-horizontal-fov').value = job.settings.visual_camera?.horizontal_fov_deg || 110;
   $('visual-projection').value = job.settings.visual_camera?.projection || 'rectilinear';
+  $('visual-track-full-rate').checked = job.settings.visual_camera?.track_full_rate !== false;
+  $('tracking-backend').value = job.settings.tracking_backend || 'auto';
   updateFPVSamplingUI();
   loadRateProfile(job.settings.rate_profile);
   selectSavedRatePreset(job.settings.rate_profile);
@@ -1509,7 +1512,9 @@ document.addEventListener('keydown', event => {
 window.addEventListener('pagehide', () => { pausePair(); state.uploadController?.abort(); });
 (async () => {
   try {
-    const system = await api('/api/system'); message('system', `${bytes(system.free_bytes)} free · local processing · LAN ready${system.ffmpeg && system.ffprobe ? '' : ' · install FFmpeg before analyzing'}`);
+    const system = await api('/api/system');
+    const tracking = system.tracking || {};
+    message('tracking-capability', tracking.available ? `CUDA available · ${tracking.device}. Accelerates optical flow, perspective crops and stick template matching. SIFT reacquisition and geometry/confidence checks use CPU.` : `CPU tracking · ${tracking.reason || 'GPU tracking unavailable'}`); message('system', `${bytes(system.free_bytes)} free · local processing · LAN ready${system.ffmpeg && system.ffprobe ? '' : ' · install FFmpeg before analyzing'}`);
     $('playback-proxy').checked = localStorage.getItem('fpv-fast-preview') !== '0';
     try { await loadRadioModels(); } catch (error) { message('radio-shape-message', error.message, true); }
     await history();
@@ -1886,7 +1891,7 @@ $('motion-audio-toggle').onchange = guarded(async () => {
 }, 'motion-audio-message');
 
 function readMotionSettings() {
-  return { visual_camera: readVisualCamera(), fpv_sampling_mode: $('fpv-preparation-mode').value, fpv_visual_fps: Number($('fpv-preparation-fps').value), stick_sampling_ratio: readStickSamplingRatio(), motion_source: $('use-fpv-gyro').checked ? ($('use-fpv-visual').checked ? 'auto' : 'gyro') : 'visual', camera_uptilt_deg: Number($('camera-uptilt-deg').value), imu_orientation: $('imu-orientation').value, gyro_video_offset: Number($('gyro-video-offset').value), decode_mode: $('decode-mode').value };
+  return { visual_camera: readVisualCamera(), fpv_sampling_mode: $('fpv-preparation-mode').value, fpv_visual_fps: Number($('fpv-preparation-fps').value), stick_sampling_ratio: readStickSamplingRatio(), motion_source: $('use-fpv-gyro').checked ? ($('use-fpv-visual').checked ? 'auto' : 'gyro') : 'visual', camera_uptilt_deg: Number($('camera-uptilt-deg').value), imu_orientation: $('imu-orientation').value, gyro_video_offset: Number($('gyro-video-offset').value), decode_mode: $('decode-mode').value, tracking_backend: $('tracking-backend').value };
 }
 function sectionsText(value) {
   if (!value) return 'Load signals or rerun matching to inspect section agreement.';
@@ -2135,6 +2140,11 @@ function legacyStickProgress(progress) {
 }
 function renderStickProgress(progress, status) {
   progress = legacyStickProgress(progress);
+  liveStickPreview = progress?.live_inputs || null;
+  show('stick-live-preview',!!liveStickPreview || ['queued','running'].includes(status));
+  show('stick-live-canvas',!!liveStickPreview);
+  if (liveStickPreview) { message('stick-live-detail',`${progress.name} · Mode ${liveStickPreview.stick_mode} · latest ${liveStickPreview.window_seconds}s of processed observations`); drawLiveStickInputs(); }
+  else if (['queued','running'].includes(status)) message('stick-live-detail','This worker started before live chart output was added. The next derivation will show its input observations here; this run continues without interruption.');
   show('stick-progress-summary');
   const running = ['queued', 'running'].includes(status);
   if (!progress) {
@@ -2153,6 +2163,7 @@ function renderStickProgress(progress, status) {
   $('stick-data-progress').value = percent; $('stick-clip-progress').value = clipPercent;
   message('stick-batch-percent',`${percent.toFixed(1)}%`); message('stick-clip-percent',`${clipPercent.toFixed(1)}%`);
   message('stick-current-name',progress.name);
+  message('stick-tracking-backend',progress.clip_status === 'reusing' ? 'Reusing saved movement data · no tracking required' : progress.tracking_label || 'Waiting for tracking backend');
   const failed = (progress.clips || []).filter(row => row.status === 'failed').length;
   const reused = (progress.clips || []).filter(row => row.reused).length;
   message('stick-batch-detail',`${progress.completed}/${progress.total} videos finished · ${reused} reused${failed ? ` · ${failed} failed` : ''}${Number.isFinite(progress.batch_elapsed_seconds) ? ` · ${time(progress.batch_elapsed_seconds + age)} elapsed` : ''}`);
@@ -2220,11 +2231,12 @@ async function refreshStickData(force = false) {
   }
   $('derive-sticks').disabled = activeAnalysis() || !!active || stickPreparation.running;
   $('stick-sampling-ratio').disabled = activeAnalysis() || !!active || stickPreparation.running;
+  $('tracking-backend').disabled = activeAnalysis() || !!active || stickPreparation.running || fpvPreparation.running;
 }
 function renderStickPreparationLog(result) {
   const list = $('stick-data-log'); list.replaceChildren();
   const rows = result.clips || result.progress?.clips || [];
-  for (const row of rows) list.append(el('div', `${row.name} · ${row.status === 'cached' ? row.reused ? `Reused saved movement data · ${Number(row.elapsed_seconds || 0).toFixed(2)}s cache lookup` : `Derived & saved · ${Number(row.extraction_seconds ?? row.elapsed_seconds ?? 0).toFixed(2)}s extraction` : `${row.message || row.status}${row.elapsed_seconds !== undefined ? ` · ${Number(row.elapsed_seconds).toFixed(2)}s elapsed` : ''}`}${row.sample_fps ? ` · ${row.sample_fps} Hz` : ''}${row.samples !== undefined ? ` · ${row.samples.toLocaleString()} samples` : ''}${row.current_cache && row.current_cache.status !== 'cached' ? ' · current settings now require fresh derivation' : ''}`));
+  for (const row of rows) list.append(el('div', `${row.name} · ${row.status === 'cached' ? row.reused ? `Reused saved movement data · ${Number(row.elapsed_seconds || 0).toFixed(2)}s cache lookup` : `Derived & saved · ${Number(row.extraction_seconds ?? row.elapsed_seconds ?? 0).toFixed(2)}s extraction` : `${row.message || row.status}${row.elapsed_seconds !== undefined ? ` · ${Number(row.elapsed_seconds).toFixed(2)}s elapsed` : ''}`}${row.tracking_label ? ` · ${row.tracking_label}` : ''}${row.sample_fps ? ` · ${row.sample_fps} Hz` : ''}${row.samples !== undefined ? ` · ${row.samples.toLocaleString()} samples` : ''}${row.current_cache && row.current_cache.status !== 'cached' ? ' · current settings now require fresh derivation' : ''}`));
   const current = result.progress;
   if (current?.name && current.elapsed_seconds !== undefined && !rows.some(row => row.name === current.name))
     list.append(el('div', `${current.name} · extracting · ${Number(current.elapsed_seconds).toFixed(2)}s elapsed at ${current.sample_fps || result.sample_fps || 'current'} Hz`));
@@ -2271,10 +2283,10 @@ function watchStickPreparation(task, jobId, jobToken) {
 }
 $('derive-sticks').onclick = guarded(async () => {
   const jobId = state.job.id, jobToken = state.jobToken;
-  const settings = { sample_fps: Number($('sample-fps').value), stick_sampling_ratio: readStickSamplingRatio(), decode_mode: $('decode-mode').value };
+  const settings = { sample_fps: Number($('sample-fps').value), stick_sampling_ratio: readStickSamplingRatio(), decode_mode: $('decode-mode').value, tracking_backend: $('tracking-backend').value };
   const task = await api(`/api/jobs/${jobId}/derive-sticks`, { method: 'POST', json: settings });
   if (jobToken !== state.jobToken) return;
-  state.job.settings.sample_fps = settings.sample_fps; state.job.settings.stick_sampling_ratio = settings.stick_sampling_ratio;
+  state.job.settings.sample_fps = settings.sample_fps; state.job.settings.stick_sampling_ratio = settings.stick_sampling_ratio; state.job.settings.tracking_backend = settings.tracking_backend;
   watchStickPreparation(task.id, jobId, jobToken);
 }, 'stick-data-message');
 $('derive-sticks-cancel').onclick = guarded(async () => {
@@ -2294,6 +2306,7 @@ function updateFPVPreparationUI() {
   $('derive-sticks').disabled = busy;
   $('sample-fps').disabled = busy;
   $('decode-mode').disabled = busy;
+  $('tracking-backend').disabled = busy;
   updateEvidenceSummary();
 }
 function embeddedMotionLabel(data) {
@@ -2315,13 +2328,13 @@ function renderFPVData() {
     const embedded = el('td', embeddedMotionLabel(clip.embedded));
     embedded.title = clip.embedded.message || '';
     if (clip.embedded.status === 'available') embedded.className = 'cache-ready';
-    const visual = clip.visual, status = el('td', {cached:'Derived · saved', other_rate:'Saved at another rate', not_derived:'Not derived', unavailable:'Source or cache unavailable'}[visual.status] || visual.status);
+    const visual = clip.visual, status = el('td', {cached:'Derived · saved', older_algorithm:'Earlier estimates · derive to upgrade', other_rate:'Saved at another rate', not_derived:'Not derived', unavailable:'Source or cache unavailable'}[visual.status] || visual.status);
     if (visual.status === 'cached') status.className = 'cache-ready';
     const requested = `${Number.isFinite(clip.source_fps) ? `${rateText(clip.source_fps)} fps → ` : ''}${Number.isFinite(clip.requested_fps) ? `${rateText(clip.requested_fps)} Hz requested` : 'Detecting frame rate…'}`;
     const details = el('td', `${requested}${visual.samples !== undefined ? ` · ${visual.samples.toLocaleString()} saved samples at ${rateText(visual.sample_fps)} Hz · ${visual.usable_percent}% usable tracking${visual.range ? ` · ${time(visual.range[0])}–${time(visual.range[1])}` : ''}` : ''}`);
     const elapsed = visual.extraction_seconds != null ? `${Number(visual.extraction_seconds).toFixed(2)} s extraction` : clip.last_preparation ? `${clip.last_preparation.status} · ${Number(clip.last_preparation.elapsed_seconds || 0).toFixed(2)} s` : 'Not recorded';
     const inspect = el('td');
-    if (['cached', 'other_rate'].includes(visual.status)) {
+    if (['cached', 'other_rate', 'older_algorithm'].includes(visual.status)) {
       const button = action('Review video + motion', guarded(() => openFPVVisualReview(clip.name, visual.sample_fps), 'fpv-data-message'));
       button.disabled = fpvPreparation.running; inspect.append(button);
     }
@@ -2386,7 +2399,7 @@ function watchFPVPreparation(task, jobId, jobToken) {
 async function startFPVPreparation(action, selected) {
   const jobId = state.job.id, jobToken = state.jobToken;
   const fps = Number($('fpv-preparation-fps').value), mode = $('fpv-preparation-mode').value, decode = $('fpv-preparation-decode').value;
-  const task = await api(`/api/jobs/${jobId}/prepare-fpv`, {method:'POST', json:{action, sample_fps:fps, decode_mode:decode,
+  const task = await api(`/api/jobs/${jobId}/prepare-fpv`, {method:'POST', json:{action, sample_fps:fps, decode_mode:decode, tracking_backend:$('tracking-backend').value,
     sampling_mode:mode, visual_camera:readVisualCamera(), camera_uptilt_deg:Number($('camera-uptilt-deg').value),
     ...(selected ? {names:[...fpvPreparation.selected]} : {})}});
   if (jobToken !== state.jobToken) return;
@@ -2403,8 +2416,8 @@ $('fpv-clear-selection').onclick = () => { fpvPreparation.selected.clear(); rend
 $('fpv-preparation-cancel').onclick = guarded(async () => {
   if (fpvPreparation.task) await api(`/api/jobs/${fpvPreparation.jobId}/motion-review/${fpvPreparation.task}/cancel`, {method:'POST'});
 }, 'fpv-data-message');
-function readVisualCamera() { return {horizontal_fov_deg:Number($('visual-horizontal-fov').value), projection:$('visual-projection').value}; }
-for (const id of ['visual-horizontal-fov','visual-projection']) $(id).onchange = guarded(async () => {
+function readVisualCamera() { return {horizontal_fov_deg:Number($('visual-horizontal-fov').value), projection:$('visual-projection').value,track_full_rate:$('visual-track-full-rate').checked}; }
+for (const id of ['visual-horizontal-fov','visual-projection','visual-track-full-rate']) $(id).onchange = guarded(async () => {
   const token = state.jobToken;
   const result = await api(path('/visual-camera'), {method:'PUT', json:readVisualCamera()});
   if (token !== state.jobToken) return;
@@ -2473,10 +2486,12 @@ async function refreshFPVVisualWindow(at = $('fpv-visual-review-video').currentT
   const controller = new AbortController(); fpvVisualReview.controller = controller;
   const timeout = setTimeout(()=>controller.abort(),30000);
   try {
-    const query = new URLSearchParams({sample_fps:fpvVisualReview.fps, start, end});
+    const query = new URLSearchParams({sample_fps:fpvVisualReview.fps, start, end, fill_gap_seconds:$('fpv-visual-fill-gaps').checked ? Number($('fpv-visual-gap-limit').value) : 0});
     const data = await api(path(`/fpv-data/${part(fpvVisualReview.name)}/visual?${query}`),{signal:controller.signal});
     if (token !== fpvVisualReview.token || jobToken !== state.jobToken || windowToken !== fpvVisualReview.windowToken) return;
     fpvVisualReview.data = data; drawFPVVisualReview();
+    const gaps = Object.entries(data.gap_reasons || {}).map(([label,count])=>`${label}: ${count}`).join(' · ');
+    message('fpv-visual-gap-summary', `${data.previous_algorithm ? 'Older algorithm — select this clip and Derive selected to use improved tracking. ' : ''}${data.tracking_label} · tracking ${rateText(data.tracking_fps)} Hz, saved ${rateText(data.sample_fps)} Hz. ${gaps ? `Missing output samples — ${gaps}. ` : ''}${data.fill_gap_seconds ? `${data.filled_samples} samples filled between valid observations (span ≤ ${data.fill_gap_seconds}s); dashed and excluded from matching.` : 'Gap filling is off.'}`);
   } catch (error) {
     if (token !== fpvVisualReview.token || jobToken !== state.jobToken || windowToken !== fpvVisualReview.windowToken) return;
     const detail = controller.signal.aborted ? 'Reading the saved visual chart timed out. Check the source connection and retry.' : `Could not read the saved visual chart: ${error.message}`;
@@ -2503,9 +2518,18 @@ function drawFPVVisualReview() {
     ctx.strokeStyle = '#ffffff18';
     for (const v of [-maximum,0,maximum]) { ctx.beginPath(); ctx.moveTo(left,y(v)); ctx.lineTo(right,y(v)); ctx.stroke(); ctx.fillText(v.toFixed(Math.abs(v) < 10 ? 2 : 0),2,y(v)+4); }
     ctx.save(); ctx.beginPath(); ctx.rect(left,top,right-left,bottom-top); ctx.clip();
-    ctx.strokeStyle = ['#fbc35c','#b794ff','#62d9e5'][index]; ctx.lineWidth = 1.4; ctx.beginPath(); let pen = false;
-    for (const [t,value] of trace.points) { if (value === null) { pen = false; continue; } if (pen) ctx.lineTo(x(t),y(value)); else ctx.moveTo(x(t),y(value)); pen = true; }
-    ctx.stroke();
+    ctx.strokeStyle = ['#fbc35c','#b794ff','#62d9e5'][index]; ctx.lineWidth = 1.4;
+    let previous = null;
+    for (const point of trace.points) {
+      const [t,value,estimated] = point;
+      if (value === null) { previous = null; continue; }
+      if (previous) {
+        ctx.setLineDash(estimated || previous[2] ? [4,4] : []);
+        ctx.beginPath(); ctx.moveTo(x(previous[0]),y(previous[1])); ctx.lineTo(x(t),y(value)); ctx.stroke();
+      }
+      previous = point;
+    }
+    ctx.setLineDash([]);
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x(at),top); ctx.lineTo(x(at),bottom); ctx.stroke(); ctx.restore();
     if (!trace.points.some(p=>p[1] !== null)) { ctx.fillStyle = '#a8aec9'; ctx.fillText('Tracking unavailable in this window',left+8,middle); }
   }
@@ -2527,12 +2551,38 @@ for (const event of ['timeupdate','seeked','pause']) $('fpv-visual-review-video'
 $('fpv-visual-review-close').onclick = resetFPVVisualReview;
 $('fpv-visual-review-window').onchange = guarded(()=>refreshFPVVisualWindow(),'fpv-visual-review-message');
 $('fpv-visual-review-follow').onchange = syncFPVVisualPlayback;
+for (const id of ['fpv-visual-fill-gaps','fpv-visual-gap-limit']) $(id).onchange = guarded(()=>refreshFPVVisualWindow(),'fpv-visual-review-message');
 function seekFPVVisual(at) { const video=$('fpv-visual-review-video'); video.pause(); video.currentTime=Math.max(0,Math.min(at,Number($('fpv-visual-review-seek').max))); syncFPVVisualPlayback(); }
 $('fpv-visual-review-seek').oninput = ()=>seekFPVVisual(Number($('fpv-visual-review-seek').value));
 $('fpv-visual-review-canvas').onclick = event=>{if(!fpvVisualReview.data)return;const rect=event.currentTarget.getBoundingClientRect(),[a,b]=fpvVisualReview.data.window;seekFPVVisual(a+Math.max(0,Math.min(1,(event.clientX-rect.left-65)/(rect.width-83)))*(b-a));};
 $('fpv-visual-review-canvas').onkeydown = event=>{if(['ArrowLeft','ArrowRight'].includes(event.key)){event.preventDefault();seekFPVVisual($('fpv-visual-review-video').currentTime+(event.key==='ArrowRight'?1:-1));}};
 new ResizeObserver(drawFPVVisualReview).observe($('fpv-visual-review-canvas'));
 
+let liveStickPreview = null;
+function drawLiveStickInputs() {
+  const canvas=$('stick-live-canvas'), preview=liveStickPreview;
+  if (!preview?.time?.length) return;
+  const rect=canvas.getBoundingClientRect(); if (rect.width < 10) return;
+  const ratio=devicePixelRatio || 1; canvas.width=Math.round(rect.width*ratio); canvas.height=Math.round(rect.height*ratio);
+  const ctx=canvas.getContext('2d'); ctx.scale(ratio,ratio); ctx.font='11px system-ui';
+  const order=preview.time.map((_,i)=>i).sort((a,b)=>preview.time[a]-preview.time[b]);
+  const first=preview.time[order[0]], last=preview.time[order[order.length-1]], span=Math.max(.1,last-first);
+  const left=78,right=rect.width-20,x=t=>left+(t-first)/span*(right-left);
+  const axes=['throttle','yaw','pitch','roll'], lane=(rect.height-26)/4;
+  for (const [laneIndex,axis] of axes.entries()) {
+    const top=laneIndex*lane+18, bottom=(laneIndex+1)*lane-5, middle=(top+bottom)/2;
+    const y=v=>middle-v*(bottom-top)/2;
+    ctx.fillStyle='#a8aec9'; ctx.fillText(axis[0].toUpperCase()+axis.slice(1),5,middle+4);
+    ctx.strokeStyle='#ffffff18';
+    for (const v of [-1,0,1]) { ctx.beginPath();ctx.moveTo(left,y(v));ctx.lineTo(right,y(v));ctx.stroke(); }
+    ctx.strokeStyle=['#fbc35c','#b794ff','#62d9e5','#61dca4'][laneIndex];ctx.lineWidth=1.5;ctx.beginPath();let pen=false;
+    for (const i of order) { const v=preview.channels[axis][i]; if(v===null){pen=false;continue;}if(pen)ctx.lineTo(x(preview.time[i]),y(v));else ctx.moveTo(x(preview.time[i]),y(v));pen=true; }
+    ctx.stroke(); const latest=preview.channels[axis].at(-1), q=preview.quality[axis].at(-1);
+    ctx.fillStyle=ctx.strokeStyle;ctx.fillText(latest===null?'Unobserved':`${latest.toFixed(2)} · quality ${q.toFixed(2)}`,Math.max(left,right-175),top+10);
+  }
+  ctx.fillStyle='#a8aec9';ctx.fillText(time(first,true),left,rect.height-4);ctx.fillText(time(last,true),right-55,rect.height-4);
+}
+new ResizeObserver(drawLiveStickInputs).observe($('stick-live-canvas'));
 let ratePresets = { presets: {}, default: null };
 async function loadRatePresets(selected = '') {
   ratePresets = await api('/api/rate-presets');
@@ -2716,7 +2766,7 @@ $('calibration-panel').addEventListener('toggle', guarded(async () => {
   if ($('calibration-panel').open && !calibrationLoad) await ensureCalibrationLoaded();
 }, 'calibration-message'));
 window.addEventListener('pagehide',rememberCalibrationDraft);
-$('prepare-stabilization').onclick=guarded(async()=>{if(!state.pair)return;const pair=state.pair,name=pair.radio_video,config=state.job.calibrations[name];if(!config?.radio_outline||config.skip_motion||config.exclude){await loadCalibration(name);throw new Error('Save a clear radio outline and both tips, then prepare this clip.');}const jobId=state.job.id,jobToken=state.jobToken,task=await api(path('/derive-sticks'),{method:'POST',json:{radio_names:[name],sample_fps:Number($('sample-fps').value),stick_sampling_ratio:readStickSamplingRatio(),decode_mode:$('decode-mode').value}});openPanel('calibration-panel');watchStickPreparation(task.id,jobId,jobToken);message('viewer-message','Preparing saved outline data for this StickCam only. When complete, choose Centered & level and export. Unsafe or lost-outline intervals retain original framing.');},'viewer-message');
+$('prepare-stabilization').onclick=guarded(async()=>{if(!state.pair)return;const pair=state.pair,name=pair.radio_video,config=state.job.calibrations[name];if(!config?.radio_outline||config.skip_motion||config.exclude){await loadCalibration(name);throw new Error('Save a clear radio outline and both tips, then prepare this clip.');}const jobId=state.job.id,jobToken=state.jobToken,task=await api(path('/derive-sticks'),{method:'POST',json:{radio_names:[name],sample_fps:Number($('sample-fps').value),stick_sampling_ratio:readStickSamplingRatio(),decode_mode:$('decode-mode').value,tracking_backend:$('tracking-backend').value}});openPanel('calibration-panel');watchStickPreparation(task.id,jobId,jobToken);message('viewer-message','Preparing saved outline data for this StickCam only. When complete, choose Centered & level and export. Unsafe or lost-outline intervals retain original framing.');},'viewer-message');
 
 // Audio review is independent of optical motion and calibration.
 let pairAudioToken=0, pairAudioData=null;

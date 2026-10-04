@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from fpv_matcher.video.acceleration import TrackingBackend
 from fpv_matcher.config import validate_calibration
 from fpv_matcher.radio.outline import RadioOutlineTracker
 from fpv_matcher.video.metadata import probe_video
@@ -52,7 +53,8 @@ class GimbalTracker:
     movement; perspective changes and occlusion still need visual review.
     """
 
-    def __init__(self, spec: dict, wonky: bool):
+    def __init__(self, spec: dict, wonky: bool, backend=None):
+        self.backend = backend or TrackingBackend()
         self.spec, self.wonky = spec, wonky
         self.x, self.y, self.width, self.height = (int(round(spec[k])) for k in ("x", "y", "width", "height"))
         self.transform = np.eye(3, dtype=np.float32)
@@ -66,7 +68,7 @@ class GimbalTracker:
     def _crop(self, frame):
         # Only warp the gimbal crop, never a full 4K frame for each stick.
         crop_transform = self.transform @ np.array([[1, 0, self.x], [0, 1, self.y], [0, 0, 1]], np.float32)
-        return cv2.warpPerspective(
+        return self.backend.warp(
             frame,
             crop_transform,
             (self.width, self.height),
@@ -211,11 +213,11 @@ class GimbalTracker:
                 if self.points is None or len(self.points) < 8:
                     self.points = self._features(previous)
                 if self.points is not None and len(self.points) >= 6:
-                    tracked, status, error = cv2.calcOpticalFlowPyrLK(
+                    tracked, status, error = self.backend.flow(
                         previous, current, self.points, None, winSize=(25, 25), maxLevel=3
                     )
                     if tracked is not None and status is not None and error is not None:
-                        backward, reverse_status, _ = cv2.calcOpticalFlowPyrLK(
+                        backward, reverse_status, _ = self.backend.flow(
                             current, previous, tracked, None, winSize=(25, 25), maxLevel=3
                         )
                         good = status.ravel().astype(bool) & (error.ravel() < 25)
@@ -257,7 +259,7 @@ class GimbalTracker:
         crop = self._crop(frame)
         if min(crop.shape) < max(self.template.shape):
             return self.gap("tip template exceeds crop")
-        response = cv2.matchTemplate(crop, self.template, cv2.TM_CCOEFF_NORMED)
+        response = self.backend.match(crop, self.template)
         response = np.nan_to_num(response, nan=-1, posinf=-1, neginf=-1)
         yy, xx = np.indices(response.shape)
         px, py = xx + (self.template.shape[1] - 1) / 2, yy + (self.template.shape[0] - 1) / 2
@@ -318,7 +320,8 @@ class GimbalTracker:
             cv2.circle(frame, tuple(location), 6, color, 2)
 
 
-def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | None = None, _frames=None):
+def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | None = None, _frames=None, backend=None):
+    backend = backend or TrackingBackend()
     info = probe_video(path)
     config = validate_calibration(config, (info["width"], info["height"]))
     reference_time = config["reference_time"]
@@ -327,12 +330,12 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
     scale = min(1.0, MAX_DIMENSION / max(info["width"], info["height"]))
     scaled = scaled_config(config, scale)
     trackers = [
-        GimbalTracker(scaled[side], scaled["stickcam_mode"] == "wonky")
+        GimbalTracker(scaled[side], scaled["stickcam_mode"] == "wonky", backend)
         for side in ("left_gimbal", "right_gimbal")
     ]
     outline_tracker = (
         RadioOutlineTracker(
-            scaled["radio_outline"], [scaled[side] for side in ("left_gimbal", "right_gimbal")], sample_fps
+            scaled["radio_outline"], [scaled[side] for side in ("left_gimbal", "right_gimbal")], sample_fps, backend
         )
         if "radio_outline" in scaled
         else None
@@ -381,11 +384,12 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
         previous = frame
 
 
-def iter_all_sticks(path, sample_fps, config):
-    yield from iter_sticks(path, sample_fps, config)
+def iter_all_sticks(path, sample_fps, config, backend=None):
+    backend = backend or TrackingBackend()
+    yield from iter_sticks(path, sample_fps, config, backend=backend)
     if config.get("reference_time", 0) > 0:
         frames = reverse_sampled_frames(path, sample_fps, MAX_DIMENSION, config["reference_time"])
-        backwards = iter_sticks(path, sample_fps, config, _frames=frames)
+        backwards = iter_sticks(path, sample_fps, config, _frames=frames, backend=backend)
         # Initialize at the same calibrated frame; it was already emitted by the forward pass.
         next(backwards, None)
         yield from backwards
@@ -407,13 +411,18 @@ def extract_sticks(path: str, sample_fps: float, config: dict, progress=None) ->
     if "radio_outline" in config:
         keys += ("radio_orientation_deg", "radio_orientation_quality")
     from fpv_matcher.progress import ExtractionProgress
-    reporter = ExtractionProgress(probe_video(path)["duration"], 0, progress)
+    backend = TrackingBackend()
+    from fpv_matcher.radio.live import LiveStickInputs
+    live = LiveStickInputs(sample_fps)
+    callback = (lambda event: progress({**event, **backend.status(), "live_inputs": live.snapshot()})) if progress else None
+    reporter = ExtractionProgress(probe_video(path)["duration"], 0, callback)
     rows = {key: [] for key in keys}
-    for timestamp, values, _, _ in iter_all_sticks(path, sample_fps, config):
+    for timestamp, values, _, _ in iter_all_sticks(path, sample_fps, config, backend):
+        live.append(timestamp, values)
         reporter.update(len(rows["time"]) / sample_fps)
         rows["time"].append(timestamp)
         for key, value in values.items():
             rows[key].append(value)
     reporter.update(0, complete=True)
     order = np.argsort(rows["time"])
-    return {k: np.asarray(v, float)[order] for k, v in rows.items()}
+    return {**{k: np.asarray(v, float)[order] for k, v in rows.items()}, **backend.metadata()}

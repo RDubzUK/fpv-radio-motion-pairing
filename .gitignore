@@ -1,4 +1,5 @@
 .venv/
+.gpu-build/
 __pycache__/
 *.py[cod]
 *.egg-info/

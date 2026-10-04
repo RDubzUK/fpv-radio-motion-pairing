@@ -11,7 +11,9 @@ import numpy as np
 
 
 class RadioOutlineTracker:
-    def __init__(self, outline, gimbals, sample_fps=30):
+    def __init__(self, outline, gimbals, sample_fps=30, backend=None):
+        from fpv_matcher.video.acceleration import TrackingBackend
+        self.backend = backend or TrackingBackend()
         self.outline = np.asarray(outline, np.float32).reshape(-1, 2)
         self.gimbals = gimbals
         self.transform = np.eye(3, dtype=np.float32)
@@ -65,7 +67,7 @@ class RadioOutlineTracker:
     def _appearance(self, frame, transform):
         """Check distributed shell patches against the original marked face."""
         local_to_frame = transform @ self.local_to_reference
-        crop = cv2.warpPerspective(frame, local_to_frame, self.reference.shape[::-1],
+        crop = self.backend.warp(frame, local_to_frame, self.reference.shape[::-1],
                                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderValue=127)
         crop = cv2.GaussianBlur(crop, (3, 3), 0)
         scores, sectors = [], []
@@ -181,11 +183,11 @@ class RadioOutlineTracker:
                 return anchored
         if self.points is None or len(self.points) < 8:
             return self._lost("radio not reacquired")
-        moved, status, error = cv2.calcOpticalFlowPyrLK(previous, current, self.points, None,
+        moved, status, error = self.backend.flow(previous, current, self.points, None,
                                                      winSize=(25, 25), maxLevel=3)
         if moved is None or status is None or error is None:
             return self._lost("shell flow lost")
-        backward, reverse_status, _ = cv2.calcOpticalFlowPyrLK(current, previous, moved, None,
+        backward, reverse_status, _ = self.backend.flow(current, previous, moved, None,
                                                              winSize=(25, 25), maxLevel=3)
         if backward is None or reverse_status is None:
             return self._lost("shell reverse flow lost")

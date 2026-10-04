@@ -32,6 +32,14 @@ A saved session turns a folder of FPV recordings and a folder of StickCam record
 
 Default extraction/comparison remain 30 Hz, minimum overlap 2 seconds, Wonky StickCam. Audio-first automatic acceptance needs more than the minimum overlap: at least eight seconds of useful audio support and three jointly agreeing independent sections, plus distinctive content and ownership/offset separation. These are conservative heuristics pending real-footage evaluation.
 
+### GPU and live extraction updates
+
+Tracking now automatically uses a compatible OpenCV CUDA runtime for LK flow, perspective crops and tip template matching, with an explicit CPU fallback. The RTX 3090 host has a locally built official CUDA-enabled OpenCV 4.14.0 environment; its current StickCam batch reports actual CUDA operations. SIFT/geometry/confidence validation remains on CPU, and reduced frames still cross host/device memory. No speed-up benchmark was run. Backend choice does not invalidate existing StickCam caches; timing history distinguishes CUDA from CPU runs.
+
+New StickCam derivations publish a bounded 20-second live preview of semantic inputs/quality through the existing progress file. It uses the selected Mode, preserves observation gaps and resets between disconnected forward/backward spans. Current workers finish with their existing code. The final deployment waits for extraction/exports to become idle before restarting the viewer.
+
+Visual motion v5 uses distributed features, native-rate intermediate tracking (optional, capped at 120 Hz), descriptor reacquisition and composed rotation increments. Saved output Hz remains independent. Gaps record rejection reasons. Optional short-gap interpolation is dashed and used only for viewing; it never becomes matching support or modifies the source cache. Older visual caches are reviewable and marked for upgrade. Real-footage/known-gyro evaluation remains the accuracy gate.
+
 ## Correctness rules
 
 - Originals are never modified. Preview fragments use a small, on-demand browser-compatible encoding; matching and exports use originals.

@@ -21,6 +21,7 @@ def chart_trace(data, key, label, unit, start, end, shift=0, budget=1800):
     values = np.asarray(data[key], float)
     quality = np.asarray(data.get(key + "_quality", data["quality"]), float)
     keep = (times >= start) & (times <= end)
+    estimated = np.asarray(data.get("_interpolated", np.zeros(len(times), bool)))[keep]
     times, values, quality = times[keep], values[keep], quality[keep]
     valid = np.isfinite(values) & np.isfinite(times) & (quality > 0.1)
     # Retain min/max and an invalid sample per bin: spikes and tracking gaps survive zoom-out.
@@ -34,18 +35,29 @@ def chart_trace(data, key, label, unit, start, end, shift=0, budget=1800):
         if len(bad):
             selected.append(bad[0])
         indices.extend(sorted(set(selected)))
+    # Preserve estimate boundaries so dashed bridges cannot become solid data
+    # during chart downsampling. This remains bounded by the payload budget.
+    changes = np.flatnonzero(np.diff(estimated.astype(int)))
+    if estimated.any():
+        indices = sorted(set(indices) | {int(i) for v in changes for i in (v, v+1)})
+        if len(indices) > budget:
+            # Prefer truthful gaps over a misleading solid line at wide zoom.
+            unfilled = {k: v for k, v in data.items() if k != "_interpolated"}
+            unfilled[key + "_quality"] = np.where(np.asarray(data["_interpolated"]), 0., data.get(key + "_quality", data["quality"]))
+            return chart_trace(unfilled, key, label, unit, start, end, shift, budget)
     finite = np.asarray(data[key], float)
     good_all = np.isfinite(finite) & (np.asarray(data.get(key + "_quality", data["quality"])) > 0.1)
     scale = float(np.percentile(np.abs(finite[good_all]), 95)) if good_all.any() else 1.0
     return {"key": key, "label": label, "unit": unit, "scale": max(scale, 1e-8),
-            "points": [[round(float(times[i]), 6), round(float(values[i]), 6) if valid[i] else None]
-                       for i in indices]}
+            "points": [[round(float(times[i]), 6), round(float(values[i]), 6) if valid[i] else None,
+                        bool(estimated[i])] for i in indices]}
 
 
 def run(request_path):
     request = json.loads(Path(request_path).read_text())
     directory, cache = Path(request["directory"]), Path(request["cache"])
     import cv2
+    os.environ["FPV_MATCHER_TRACKING"] = request.get("tracking_backend", "auto")
     cv2.setNumThreads(1)
     os.environ["FPV_MATCHER_DECODE"] = request.get("decode_mode", "auto")
     source = request["source"]

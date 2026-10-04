@@ -51,7 +51,11 @@ def cached_sticks(path, cache, calibration, fps, identity=None, progress=None):
     extractor = extract_review_sticks if "radio_outline" in config["config"] else extract_sticks
     from fpv_matcher.radio.modes import remap_cached_inputs
     def extract():
-        data = extractor(str(path), fps, config["config"], progress=progress)
+        from fpv_matcher.radio.live import remap_preview
+        def report(event):
+            if progress:
+                progress({**event, "live_inputs": remap_preview(event.get("live_inputs"), calibration.get("stick_mode", 2), calibration.get("signs"))})
+        data = extractor(str(path), fps, config["config"], progress=report if progress else None)
         return remap_cached_inputs(data, 2, config["config"].get("signs"))
     data = get_or_extract(str(path), cache, kind, algorithm, config, extract, identity, validate=_validate)
     return remap_cached_inputs(data, calibration.get("stick_mode", 2), calibration.get("signs"))
@@ -142,6 +146,7 @@ def run(request_path):
     request = json.loads(Path(request_path).read_text())
     directory = Path(request["directory"])
     os.environ["FPV_MATCHER_DECODE"] = request.get("decode_mode", "auto")
+    os.environ["FPV_MATCHER_TRACKING"] = request.get("tracking_backend", "auto")
     cv2.setNumThreads(1)
     from fpv_matcher.radio.progress import StickBatchProgress, saved_timings
     from fpv_matcher.video.metadata import probe_video
@@ -156,10 +161,12 @@ def run(request_path):
                 clip["duration_seconds"] = 0
         initial.append(cache_status(clip["path"], request["cache"], clip["calibration"],
                                     clip["sample_fps"], clip.get("identity")))
+    from fpv_matcher.video.acceleration import capabilities
+    expected_backend = "cuda" if request.get("tracking_backend", "auto") != "cpu" and capabilities().get("available") else "cpu"
     rows, total = [], len(request["clips"])
     reporter = StickBatchProgress(clips, [entry["status"] == "cached" for entry in initial],
         lambda event: atomic_json(directory / "progress.json", event),
-        saved_timings(directory, clips, request.get("decode_mode", "auto"), request.get("algorithm")))
+        saved_timings(directory, clips, request.get("decode_mode", "auto"), request.get("algorithm"), expected_backend))
     for index, clip in enumerate(clips):
         path = Path(clip["path"])
         fps = clip.get("sample_fps", request["sample_fps"])
@@ -178,7 +185,9 @@ def run(request_path):
             rows.append({"name": clip["name"], "status": "cached", "reused": reused,
                          "elapsed_seconds": elapsed, "extraction_seconds": None if reused else elapsed,
                          "sample_fps": fps, "duration_seconds": clip["duration_seconds"],
-                         "samples": len(data["time"]), **observation_status(data)})
+                         "samples": len(data["time"]),
+                         **{key: data[key].item() for key in data if key.startswith("tracking_")},
+                         **observation_status(data)})
         except (ValueError, RuntimeError, OSError, cv2.error) as exc:
             rows.append({"name": clip["name"], "status": "failed", "elapsed_seconds": round(time.perf_counter() - started, 2),
                          "sample_fps": fps, "duration_seconds": clip["duration_seconds"], "message": str(exc)})

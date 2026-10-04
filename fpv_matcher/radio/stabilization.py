@@ -14,9 +14,15 @@ def extract_review_sticks(path, sample_fps, calibration, progress=None):
     rows = []
     info = probe_video(path)
     from fpv_matcher.progress import ExtractionProgress
-    reporter = ExtractionProgress(info["duration"], 0, progress)
+    from fpv_matcher.video.acceleration import TrackingBackend
+    backend = TrackingBackend()
+    from fpv_matcher.radio.live import LiveStickInputs
+    live = LiveStickInputs(sample_fps)
+    callback = (lambda event: progress({**event, **backend.status(), "live_inputs": live.snapshot()})) if progress else None
+    reporter = ExtractionProgress(info["duration"], 0, callback)
     scale = min(1, MAX_DIMENSION / max(info["width"], info["height"]))
-    for timestamp, values, _, trackers in iter_all_sticks(path, sample_fps, calibration):
+    for timestamp, values, _, trackers in iter_all_sticks(path, sample_fps, calibration, backend):
+        live.append(timestamp, values)
         row = {"time": timestamp, **values}
         if "radio_outline" in calibration:
             tracker = trackers[-1]
@@ -32,7 +38,7 @@ def extract_review_sticks(path, sample_fps, calibration, progress=None):
     data = {key: np.asarray([r[key] for r in rows], float)[order] for key in rows[0]}
     if calibration.get("radio_rotation_deg") == 180:
         data["radio_reference_rotation"] = np.asarray(180)
-    return data
+    return {**data, **backend.metadata()}
 
 
 def review_poses(data, gyro=None):

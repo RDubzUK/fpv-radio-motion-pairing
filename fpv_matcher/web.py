@@ -40,7 +40,8 @@ from fpv_matcher.radio.stabilization import VERSION as OUTLINE_VERSION
 from fpv_matcher.matching.correlation import prepare, section_support
 from fpv_matcher.matching.evidence import normalize_sources, motion_enabled, audio_enabled_pair
 from fpv_matcher.motion.telemetry import VERSION as TELEMETRY_VERSION, validate_motion_settings, body_rates
-from fpv_matcher.motion.visual_rotation import validate_profile as validate_visual_camera, visual_body_rates
+from fpv_matcher.motion.visual_rotation import validate_profile as validate_visual_camera, visual_body_rates, display_interpolation, gap_summary
+from fpv_matcher.video.acceleration import capabilities as tracking_capabilities
 from zipfile import BadZipFile
 from fpv_matcher.motion.derivation import cache_status as fpv_cache_status, embedded_status, load_saved_visual, VERSION as VISUAL_VERSION
 from fpv_matcher.motion.sampling import visual_fps, MODES as VISUAL_SAMPLING_MODES
@@ -309,6 +310,14 @@ def relink_sources(job_id: str, body: dict = Body(...)):
     return {"relinked": len(replacements), "missing": missing}
 
 
+def _tracking_mode(value):
+    if value not in {"auto", "cpu", "cuda"}:
+        raise HTTPException(400, "Choose automatic, CPU or CUDA tracking")
+    if value == "cuda" and not tracking_capabilities().get("available"):
+        raise HTTPException(400, tracking_capabilities()["reason"])
+    return value
+
+
 @app.get("/api/system")
 def system_info():
     jobs.DATA.mkdir(parents=True, exist_ok=True)
@@ -320,6 +329,7 @@ def system_info():
         "free_bytes": space.free,
         "total_bytes": space.total,
         "max_file_bytes": MAX_FILE_SIZE,
+        "tracking": tracking_capabilities(),
         "analysis_slots": 1,
         "export_slots": 1,
         "data_directory": str(jobs.DATA),
@@ -585,7 +595,7 @@ def create_job(body: dict = Body(...)):
             "camera_uptilt_deg": 0,
             "imu_orientation": "zXy",
             "gyro_video_offset": 0,
-            "decode_mode": "auto",
+            "decode_mode": "auto", "tracking_backend": "auto",
         },
         "overrides": {},
         "exports": {},
@@ -1032,7 +1042,7 @@ def run_job(job_id: str, settings: dict = Body(default={})):
             k: v
             for k, v in settings.items()
             if k in job["settings"]
-            or k in {"rate_profile", "match_target_kind", "match_target_name", "match_target_names", "stop_on_confident_match", "allow_unconfigured_radio", "motion_source", "camera_uptilt_deg", "imu_orientation", "gyro_video_offset", "decode_mode", "evidence_sources", "stick_sampling_ratio", "matching_strategy", "fpv_sampling_mode", "fpv_visual_fps", "stick_mode", "visual_camera"}
+            or k in {"rate_profile", "match_target_kind", "match_target_name", "match_target_names", "stop_on_confident_match", "allow_unconfigured_radio", "motion_source", "camera_uptilt_deg", "imu_orientation", "gyro_video_offset", "decode_mode", "tracking_backend", "evidence_sources", "stick_sampling_ratio", "matching_strategy", "fpv_sampling_mode", "fpv_visual_fps", "stick_mode", "visual_camera"}
         },
     }
     try:
@@ -1093,6 +1103,7 @@ def run_job(job_id: str, settings: dict = Body(default={})):
         if options.get("decode_mode", "auto") not in {"auto", "cpu", "cuda"}:
             raise ValueError("Choose automatic, CPU or CUDA decoding")
         options.setdefault("decode_mode", "auto")
+        options["tracking_backend"] = _tracking_mode(options.get("tracking_backend", "auto"))
         radio_records = job["inputs"]["radio"]
         if options["match_target_kind"] == "radio":
             radio_records = [r for r in radio_records if r["name"] in options["match_target_names"]]
@@ -2147,7 +2158,7 @@ def start_motion_review(job_id: str, body: dict = Body(...)):
         "stick_sample_fps": radio_fps, "stick_sampling_ratio": ratio,
         "match_fps": compare_fps, "min_overlap": minimum,
         "calibration": job["calibrations"].get(radio_name), "rate_profile": profile,
-        "camera_uptilt_deg": uptilt, "imu_orientation": orientation, "gyro_video_offset": gyro_shift, "decode_mode": decode_mode,
+        "camera_uptilt_deg": uptilt, "imu_orientation": orientation, "gyro_video_offset": gyro_shift, "decode_mode": decode_mode, "tracking_backend": _tracking_mode(body.get("tracking_backend", job["settings"].get("tracking_backend", "auto"))),
         "fpv_identity": _fpv_source_identity(_record(job, "fpv", fpv_name)),
         "radio_identity": _fpv_source_identity(_record(job, "radio", radio_name)) if radio_name else None,
         "signatures": {kind: [p.stat().st_size, p.stat().st_mtime_ns]
@@ -2481,7 +2492,7 @@ def fpv_data_status(job_id: str, sample_fps: float | None = None, sampling_mode:
 
 @app.get("/api/jobs/{job_id}/fpv-data/{filename}/visual")
 def saved_fpv_visual(job_id: str, filename: str, sample_fps: float,
-                     start: float | None = None, end: float | None = None):
+                     start: float | None = None, end: float | None = None, fill_gap_seconds: float = 0.):
     job = get_job(job_id)
     source = _input_video(job, "fpv", filename)
     fps = _extraction_fps(sample_fps)
@@ -2494,11 +2505,18 @@ def saved_fpv_visual(job_id: str, filename: str, sample_fps: float,
     if not all(math.isfinite(v) for v in (a, b)) or not 0 <= a < b <= info["duration"]:
         raise HTTPException(400, "Choose a time window within the FPV video")
     data = visual_body_rates(data, job["settings"].get("camera_uptilt_deg", 0))
+    try:
+        display = display_interpolation(data, fill_gap_seconds)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     channels = [(key, key.title() + " · visual estimate", "°/s") for key in ("roll", "pitch", "yaw")]
     return {"fpv_video": filename, "sample_fps": fps, "window": [a, b], "duration": info["duration"],
             "motion_kind": "visual_rotation", "note": str(data["note"].item()), "visual_camera": validate_visual_camera(job["settings"].get("visual_camera")),
             "camera_uptilt_deg": job["settings"].get("camera_uptilt_deg", 0),
-            "traces": [chart_trace(data, key, label, unit, a, b) for key, label, unit in channels],
+            "previous_algorithm": bool(data.get("previous_algorithm", False)), "gap_reasons": gap_summary(data), "filled_samples": int(display["_interpolated"].sum()), "fill_gap_seconds": fill_gap_seconds,
+            "tracking_fps": float(data["tracking_fps"]) if "tracking_fps" in data else fps,
+            "tracking_label": str(data["tracking_label"].item()) if "tracking_label" in data else "Earlier CPU extraction",
+            "traces": [chart_trace(display, key, label, unit, a, b) for key, label, unit in channels],
             "usable_percent": round(float(np.mean(data["quality"] > .1)) * 100, 1)}
 
 
@@ -2545,13 +2563,13 @@ def prepare_session_fpv(job_id: str, body: dict = Body(...)):
         raise HTTPException(400, "Add FPV videos first")
     request = {"kind": "fpv-preparation", "action": action, "clips": clips, "sample_fps": fps,
                "sampling_mode": mode, "visual_camera": visual_camera,
-               "decode_mode": decode, "algorithm": VISUAL_VERSION, "telemetry_version": TELEMETRY_VERSION}
+               "decode_mode": decode, "tracking_backend": _tracking_mode(body.get("tracking_backend", job["settings"].get("tracking_backend", "auto"))), "algorithm": VISUAL_VERSION, "telemetry_version": TELEMETRY_VERSION}
     # Re-run incomplete tasks or deleted/corrupt caches; keep successful results reusable.
     if any(embedded_status(c["path"], jobs.DATA / "cache", c["identity"])["status"] == "unknown" or
            (action == "derive" and embedded_status(c["path"], jobs.DATA / "cache", c["identity"])["status"] == "unavailable" and
             fpv_cache_status(c["path"], jobs.DATA / "cache", c["sample_fps"], c["identity"], visual_camera)["status"] != "cached") for c in clips):
         request["attempt"] = uuid.uuid4().hex
-    jobs.update(job_id, lambda current: current["settings"].update(fpv_visual_fps=fps, fpv_sampling_mode=mode, visual_camera=visual_camera, camera_uptilt_deg=uptilt))
+    jobs.update(job_id, lambda current: current["settings"].update(fpv_visual_fps=fps, fpv_sampling_mode=mode, visual_camera=visual_camera, camera_uptilt_deg=uptilt, tracking_backend=request["tracking_backend"]))
     return _queue_signal_task(job_id, request, "preparation.json")
 
 
@@ -2671,12 +2689,12 @@ def derive_session_sticks(job_id: str, body: dict = Body(...)):
     if not clips:
         raise HTTPException(400, "Calibrate at least one StickCam video before deriving inputs")
     # A previous completed run can contain failed clips or a deleted cache: queue again if any current cache is missing.
-    request = {"kind": "stick-derivation", "clips": clips, "sample_fps": fps, "decode_mode": decode,
+    request = {"kind": "stick-derivation", "clips": clips, "sample_fps": fps, "decode_mode": decode, "tracking_backend": _tracking_mode(body.get("tracking_backend", job["settings"].get("tracking_backend", "auto"))),
                "stick_sampling_ratio": ratio,
                "algorithm": STICK_VERSION + OUTLINE_VERSION + FULL_SPAN_VERSION}
     if any(stick_cache_status(c["path"], jobs.DATA / "cache", c["calibration"], c["sample_fps"], c["identity"])["status"] != "cached" for c in clips):
         request["attempt"] = uuid.uuid4().hex
-    jobs.update(job_id, lambda current: current["settings"].update(sample_fps=fps, stick_sampling_ratio=ratio))
+    jobs.update(job_id, lambda current: current["settings"].update(sample_fps=fps, stick_sampling_ratio=ratio, tracking_backend=request["tracking_backend"]))
     return _queue_signal_task(job_id, request, "derivation.json")
 
 
