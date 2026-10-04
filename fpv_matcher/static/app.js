@@ -574,6 +574,8 @@ async function showFrame(reset = true, token = state.calToken) {
   const url = path(`/frame/radio/${part(name)}?at=${at}`);
   state.frameController?.abort();
   state.calibrationFrameReady = false; updateMarkTools();
+  $('cal-stage').setAttribute('aria-busy', 'true');
+  message('calibration-message', `Loading frame at ${time(at, true)}…`);
   const controller = new AbortController(), frameToken = ++state.frameToken;
   state.frameController = controller;
   let blob;
@@ -583,6 +585,7 @@ async function showFrame(reset = true, token = state.calToken) {
     blob = await response.blob();
   } catch (error) {
     if (controller.signal.aborted || token !== state.calToken || frameToken !== state.frameToken) return;
+    $('cal-stage').setAttribute('aria-busy', 'false');
     throw error;
   }
   if (token !== state.calToken || frameToken !== state.frameToken) return;
@@ -594,6 +597,8 @@ async function showFrame(reset = true, token = state.calToken) {
   if (token !== state.calToken || frameToken !== state.frameToken) return;
   state.calibration = nextCalibration;
   state.calibrationFrameReady = true; updateMarkTools();
+  $('cal-stage').setAttribute('aria-busy', 'false');
+  if (reset) message('calibration-message', `Showing frame at ${time(at, true)}. Review the markers before confirming.`);
   $('radio-rotation-deg').value = String(nextCalibration.radio_rotation_deg || 0);
   renderStickMode();
   drawRegions();
@@ -917,8 +922,9 @@ function updateMarkTools() {
   $('auto-regions').disabled = unavailable || activeAnalysis() || state.suggesting;
   $('auto-regions').textContent = state.suggesting ? 'Finding gimbal regions…' : 'Suggest gimbal regions';
   $('auto-regions').setAttribute('aria-busy', String(state.suggesting));
-  $('save-calibration').disabled = !state.calibration || activeAnalysis() || stickPreparation.running || state.suggesting || !!calibrationLoad;
+  $('save-calibration').disabled = !state.calibration || activeAnalysis() || stickPreparation.running || state.suggesting || !!calibrationLoad || (!state.calibrationFrameReady && !$('exclude-clip').checked && !$('skip-motion').checked);
   for (const id of ['load-frame', 'cal-preview', 'cal-frame-back', 'cal-frame-forward', 'reference-time']) $(id).disabled = !state.metadata || $('exclude-clip').checked || activeAnalysis() || state.suggesting;
+  $('cal-preview').disabled ||= !state.calibrationFrameReady;
   for (const id of ['skip-motion', 'exclude-clip', 'stickcam-mode', 'session-radio-label']) $(id).disabled = activeAnalysis() || state.suggesting;
   updateRadioOrientationUI();
 }
