@@ -11,7 +11,7 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const calibrationScan = { id: null, jobId: null, token: 0, timer: null, running: false, rows: [] };
 const segmentScan = {token:0, timer:null, task:null, running:false};
 const fpvPreparation = {key:'', refreshed:0, token:0, task:null, jobId:null, timer:null, running:false, selected:new Set()};
-const fpvVisualReview = {token:0, windowToken:0, name:null, fps:null, data:null, duration:0, frame:null, pending:false};
+const fpvVisualReview = {token:0, windowToken:0, name:null, fps:null, data:null, duration:0, frame:null, pending:false, controller:null};
 const radioOrientation = { token: 0, timer: null, task: null, running: false, result: null };
 const part = value => encodeURIComponent(value);
 const path = suffix => `/api/jobs/${state.job.id}${suffix}`;
@@ -2421,10 +2421,13 @@ $('decode-mode').addEventListener('change', () => { $('fpv-preparation-decode').
 
 // Playback inspection reads the saved cache directly and cannot trigger extraction.
 function resetFPVVisualReview() {
+  fpvVisualReview.controller?.abort(); fpvVisualReview.controller = null;
   fpvVisualReview.token++; fpvVisualReview.windowToken++; fpvVisualReview.data = null;
   fpvVisualReview.name = null; fpvVisualReview.pending = false;
   cancelAnimationFrame(fpvVisualReview.frame);
   const video = $('fpv-visual-review-video'); video.pause(); releasePreview(video); video.removeAttribute('src'); video.load();
+  const canvas = $('fpv-visual-review-canvas'); canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+  $('fpv-visual-review-seek').disabled = true; $('fpv-visual-review-window').disabled = true;
   show('fpv-visual-review', false);
 }
 async function openFPVVisualReview(name, fps) {
@@ -2433,18 +2436,30 @@ async function openFPVVisualReview(name, fps) {
   const current = () => token === fpvVisualReview.token && jobToken === state.jobToken;
   show('fpv-visual-review'); $('fpv-visual-review-title').textContent = name;
   message('fpv-visual-review-message', 'Reading saved visual estimates…');
-  const metadata = await api(path(`/metadata/fpv/${part(name)}`));
+  $('fpv-visual-review').scrollIntoView({behavior:'smooth', block:'start'});
+  try {
+  const controller = new AbortController(); fpvVisualReview.controller = controller;
+  const timeout = setTimeout(()=>controller.abort(),30000);
+  let metadata;
+  try { metadata = await api(path(`/metadata/fpv/${part(name)}`),{signal:controller.signal}); }
+  catch (error) { if (current() && controller.signal.aborted) throw new Error('Reading video metadata timed out. Check the source connection and try Review video + motion again.'); throw error; }
+  finally { clearTimeout(timeout); }
   if (!current()) return;
   fpvVisualReview.duration = metadata.duration;
   $('fpv-visual-review-seek').max = Math.max(0, metadata.duration - 1 / (metadata.fps || 30));
   $('fpv-visual-review-seek').value = 0;
   await refreshFPVVisualWindow(0);
   if (!current()) return;
-  $('fpv-visual-review').scrollIntoView({behavior:'smooth', block:'start'});
+  if (!fpvVisualReview.data) throw new Error('No saved visual chart was returned');
+  $('fpv-visual-review-seek').disabled = false; $('fpv-visual-review-window').disabled = false;
+  message('fpv-visual-review-message', 'Visual chart ready. Loading video preview…');
   await loadVideo($('fpv-visual-review-video'), 'fpv', name, current, 'fpv-visual-review-message', false, 0);
   if (!current()) return;
   message('fpv-visual-review-message', `Saved ${rateText(fps)} Hz angular estimates · ${fpvVisualReview.data.usable_percent}% usable rotation tracking · FOV ${fpvVisualReview.data.visual_camera?.horizontal_fov_deg}° · camera uptilt ${fpvVisualReview.data.camera_uptilt_deg}°. Approximate lens geometry; compare the estimated Roll/Pitch/Yaw with playback.`);
   syncFPVVisualPlayback();
+  } catch (error) {
+    if (current()) message('fpv-visual-review-message', `Could not open this review: ${error.message}. Retry Review video + motion.`,true);
+  }
 }
 async function refreshFPVVisualWindow(at = $('fpv-visual-review-video').currentTime) {
   if (!fpvVisualReview.name || !state.job) return;
@@ -2454,12 +2469,20 @@ async function refreshFPVVisualWindow(at = $('fpv-visual-review-video').currentT
   const end = Math.min(fpvVisualReview.duration, start + width);
   if (!(end > start)) return;
   fpvVisualReview.pending = true;
+  fpvVisualReview.controller?.abort();
+  const controller = new AbortController(); fpvVisualReview.controller = controller;
+  const timeout = setTimeout(()=>controller.abort(),30000);
   try {
     const query = new URLSearchParams({sample_fps:fpvVisualReview.fps, start, end});
-    const data = await api(path(`/fpv-data/${part(fpvVisualReview.name)}/visual?${query}`));
+    const data = await api(path(`/fpv-data/${part(fpvVisualReview.name)}/visual?${query}`),{signal:controller.signal});
     if (token !== fpvVisualReview.token || jobToken !== state.jobToken || windowToken !== fpvVisualReview.windowToken) return;
     fpvVisualReview.data = data; drawFPVVisualReview();
-  } finally { if (windowToken === fpvVisualReview.windowToken) fpvVisualReview.pending = false; }
+  } catch (error) {
+    if (token !== fpvVisualReview.token || jobToken !== state.jobToken || windowToken !== fpvVisualReview.windowToken) return;
+    const detail = controller.signal.aborted ? 'Reading the saved visual chart timed out. Check the source connection and retry.' : `Could not read the saved visual chart: ${error.message}`;
+    message('fpv-visual-review-message',detail,true);
+    throw new Error(detail);
+  } finally { clearTimeout(timeout); if (windowToken === fpvVisualReview.windowToken) fpvVisualReview.pending = false; }
 }
 function drawFPVVisualReview() {
   const data = fpvVisualReview.data, canvas = $('fpv-visual-review-canvas'); if (!data) return;

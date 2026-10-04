@@ -125,7 +125,10 @@ def estimate_rotation(source, target, size, delta, profile):
 def visual_body_rates(data, uptilt=0):
     from scipy.spatial.transform import Rotation
     from fpv_matcher.motion.telemetry import validate_motion_settings
-    _, uptilt, _, _ = validate_motion_settings("visual", uptilt, "zxy", 0)
+    # Visual camera axes are right/down/forward. Z/X/Y is a proper cyclic
+    # rotation into body forward/right/down; lowercase would negate all axes
+    # and describe an impossible reflection instead of a rotation.
+    _, uptilt, _, _ = validate_motion_settings("visual", uptilt, "ZXY", 0)
     vectors = np.column_stack([data[k] for k in ("z", "x", "y")])
     body = Rotation.from_euler("y", uptilt, degrees=True).apply(vectors)
     return {**data, "roll": body[:, 0], "pitch": body[:, 1], "yaw": body[:, 2],
