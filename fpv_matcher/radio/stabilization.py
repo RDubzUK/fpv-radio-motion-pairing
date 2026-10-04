@@ -29,7 +29,10 @@ def extract_review_sticks(path, sample_fps, calibration, progress=None):
         raise ValueError("No StickCam tracking samples")
     reporter.update(0, complete=True)
     order = np.argsort([r["time"] for r in rows])
-    return {key: np.asarray([r[key] for r in rows], float)[order] for key in rows[0]}
+    data = {key: np.asarray([r[key] for r in rows], float)[order] for key in rows[0]}
+    if calibration.get("radio_rotation_deg") == 180:
+        data["radio_reference_rotation"] = np.asarray(180)
+    return data
 
 
 def review_poses(data, gyro=None):
@@ -38,6 +41,10 @@ def review_poses(data, gyro=None):
         return [], "Mark and save the radio outline to enable the centred preview."
     times = data["time"]
     corners = np.asarray([np.column_stack((data[f"outline_{i}_x"], data[f"outline_{i}_y"])) for i in range(4)]).transpose(1, 0, 2)
+    if float(data.get("radio_reference_rotation", 0)) == 180:
+        # Pose consumers level the edge from corner 0 to 1. Reorder corners
+        # into the radio's physical upright order without moving source pixels.
+        corners = np.roll(corners, 2, axis=1)
     quality = data["radio_orientation_quality"]
     angles = np.unwrap(np.arctan2(corners[:, 1, 1] - corners[:, 0, 1], corners[:, 1, 0] - corners[:, 0, 0]))
     gyro_angle = None

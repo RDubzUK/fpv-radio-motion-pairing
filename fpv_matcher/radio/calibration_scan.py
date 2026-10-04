@@ -11,11 +11,12 @@ import numpy as np
 from fpv_matcher.pipeline import atomic_json
 from fpv_matcher.radio.auto_calibration import suggest_gimbal_regions
 from fpv_matcher.radio.reference import suggest_from_reference
+from fpv_matcher.radio.orientation import rotation_from_regions
 from fpv_matcher.radio.tips import suggest_visible_tip
 from fpv_matcher.video.frames import jpeg_frame
 from fpv_matcher.video.metadata import probe_video
 
-VERSION = "calibration-five-second-reference-search-v1"
+VERSION = "calibration-five-second-reference-orientation-v2"
 
 
 def _frame(path, at):
@@ -36,6 +37,8 @@ def _proposal(image, references):
     for reference in references:
         candidate = suggest_from_reference(reference["image"], image, reference["outline"], reference["regions"])
         if candidate is not None:
+            if reference.get("orientation_confirmed"):
+                candidate["radio_rotation_deg"] = rotation_from_regions(candidate["regions"])["rotation_deg"]
             proposals.append({**candidate, "reference_clip": reference["name"]})
     proposal = max(proposals, key=lambda p: (sum("tip_x" in r for r in p["regions"].values()), p["reference_inliers"])) if proposals else suggest_gimbal_regions(image)
     for region in proposal["regions"].values():
@@ -62,6 +65,7 @@ def run(request_path):
             image = _frame(reference["path"], config["reference_time"])
             sx, sy = image.shape[1] / info["width"], image.shape[0] / info["height"]
             references.append({"name": reference["name"], "image": image,
+                "orientation_confirmed": config.get("radio_orientation_confirmed", False),
                 "outline": [[x * sx, y * sy] for x, y in config["radio_outline"]],
                 "regions": {side: _scale_region(config[side], sx, sy) for side in ("left_gimbal", "right_gimbal")}})
         except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, cv2.error) as exc:
@@ -90,6 +94,7 @@ def run(request_path):
                     rank = (bool(outline), 2 - len(proposal["missing_tips"]), proposal.get("reference_inliers", 0))
                     sx, sy = info["width"] / proposal["frame_width"], info["height"] / proposal["frame_height"]
                     config = {"stickcam_mode": clip.get("stickcam_mode", "wonky"), "reference_time": float(at),
+                        "radio_rotation_deg": proposal.get("radio_rotation_deg") or 0, "radio_orientation_confirmed": False,
                         "signs": {axis: 1 for axis in ("roll", "pitch", "yaw", "throttle")},
                         **{side: _scale_region(region, sx, sy) for side, region in proposal["regions"].items()}}
                     if outline:

@@ -20,6 +20,9 @@ FULL_SPAN_VERSION = "reference-backward-tracking-v1"
 
 def specification(calibration, fps):
     calibration = validate_calibration(calibration)
+    calibration.pop("radio_orientation_confirmed", None)
+    if calibration.get("radio_rotation_deg") == 0:
+        calibration.pop("radio_rotation_deg")  # Preserve existing upright caches.
     outline = "radio_outline" in calibration
     return ("radio-review" if outline else "radio",
             (ALGORITHM_VERSION + OUTLINE_VERSION if outline else ALGORITHM_VERSION) + (FULL_SPAN_VERSION if calibration["reference_time"] > 0 else ""),

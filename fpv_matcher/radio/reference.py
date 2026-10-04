@@ -8,7 +8,7 @@ import numpy as np
 from fpv_matcher.radio.tips import suggest_reference_tip
 
 
-def suggest_from_reference(reference, frame, outline, regions):
+def suggest_from_reference(reference, frame, outline, regions, detect_tips=True):
     """Return editable landmarks only when distributed feature matches agree.
 
     Reference images must belong to confirmed calibrations. This recognises a
@@ -105,11 +105,14 @@ def suggest_from_reference(reference, frame, outline, regions):
             "tip_radius": max(3.0, min(new_width, new_height) * 0.035),
             "threshold": region.get("threshold", 70), "polarity": region.get("polarity", "dark"),
         }
-        tip = suggest_reference_tip(reference, frame, transform, region, result[side])
+        tip = suggest_reference_tip(reference, frame, transform, region, result[side]) if detect_tips else None
         if tip is not None:
             result[side].update(tip)
     return {
-        "radio_outline": mapped_outline.tolist(), "regions": result,
+        # Keep shell corners in image order. Physical gimbal identities are
+        # independent; an inverted target puts physical left on image right.
+        "radio_outline": (np.roll(mapped_outline, 2, axis=0) if mapped_outline[1, 0] < mapped_outline[0, 0]
+                          else mapped_outline).tolist(), "regions": result,
         "detection_method": "saved radio reference", "reference_inliers": count,
         "reference_coverage": float(coverage), "reference_error_px": error,
     }

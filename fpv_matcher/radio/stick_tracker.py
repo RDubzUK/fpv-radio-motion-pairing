@@ -334,6 +334,11 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
             for tracker in trackers
         ]
         left, right = detected
+        # Crops are expressed in the calibration frame's axes. Relative shell
+        # tracking handles later movement; an inverted reference reverses both
+        # directions. Physical left/right gimbal labels are kept separately.
+        if config.get("radio_rotation_deg", 0) == 180:
+            left, right = (-left[0], -left[1], left[2]), (-right[0], -right[1], right[2])
         values = {
             "yaw": left[0],
             "throttle": -left[1],

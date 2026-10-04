@@ -67,6 +67,14 @@ The selection applies to preparing StickCam data, matching and motion comparison
 
 The command line equivalent is `--stick-sampling-ratio 0.5` or `--stick-sampling-ratio 0.25`; omit it to use `--sample-fps` for StickCam.
 
+#### Upside-down StickCam and the session radio
+
+In **Frame & calibration → Session radio & orientation**, select **Upright (0°)** or **Upside down (180°)** for the calibration frame. Regions refer to the radio's physical controls when viewed upright; the physical left gimbal appears on the image's right when inverted. Changing orientation swaps existing region labels when needed. Review both regions and tips before confirming the calibration. Inverted extraction reverses both stick directions in the reference frame; later camera motion remains handled by relative radio tracking. The centred radio preview also uses the confirmed upright basis. Calibration images remain in their recorded orientation so markers keep source coordinates.
+
+Once you have a clear, calibrated radio with its outline, enter its model or a custom name and click **Confirm radio & use this frame as reference**. This saves the expected shape and appearance for the session. Subsequent clips are checked automatically when opened, or with **Check midpoint** / **Check all clip orientations**. Checks try the midpoint, then nearby ±5/±10 second frames if needed, requiring distributed feature matches on the saved radio face. The suggested identity is the confirmed reference's label, rather than a manufacturer guess from an unverified silhouette. You can correct the label and replace the reference.
+
+The review shows the sampled frame with the matched outline and physical gimbal labels, plus a separate result for the current calibration frame. **Use suggested calibration orientation** applies a draft; **Confirm calibration** saves it. A different orientation at the midpoint is flagged rather than applying a clip-wide flip. Obscured radios, failed appearance matches and near-sideways views remain unknown and can be set manually. Results persist with the session and are keyed to the reference revision, source signature and calibration time; image-only checks do not derive the whole clip. Upright movement caches remain reusable; an inverted calibration uses a distinct movement cache.
+
 For each recording:
 
 1. Choose a frame where both gimbals and stick tips are visible. Thumbed and pinched grips both work: click the centre of the visible stick tip, not the thumb or finger.

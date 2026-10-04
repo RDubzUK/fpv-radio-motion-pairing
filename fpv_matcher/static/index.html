@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>FPV ↔ StickCam Matcher</title>
   <link rel="stylesheet" href="/static/style.css?v=10">
-  <script type="module" src="/static/app.js?v=29"></script>
+  <script type="module" src="/static/app.js?v=30"></script>
 </head>
 <body>
 <main>
@@ -44,6 +44,17 @@
       <div id="cal-stage" class="cal-stage"><img id="cal-image" alt="StickCam calibration frame"><video id="cal-video" class="hidden" muted playsinline preload="metadata"></video><canvas id="roi-canvas" aria-label="Draw gimbal regions and select stick tips"></canvas></div>
       <aside class="calibration-controls" aria-label="StickCam frame and calibration controls">
         <h3>Frame &amp; calibration</h3>
+        <details id="radio-orientation-section" open><summary>Session radio &amp; orientation</summary>
+          <label class="field">Radio name / model<input id="session-radio-label" type="text" maxlength="100" list="radio-models" placeholder="Name your radio or choose a model"></label>
+          <datalist id="radio-models"><option value="RadioMaster TX16S"><option value="RadioMaster Boxer"><option value="RadioMaster GX12"><option value="HelloRadioSky"><option value="Jumper"><option value="My session radio"></datalist>
+          <div class="actions"><button id="confirm-session-radio" class="secondary">Confirm radio &amp; use this frame as reference</button><button id="check-radio-midpoint" class="secondary">Check midpoint</button><button id="check-radio-all" class="secondary">Check all clip orientations</button><button id="cancel-radio-orientation" class="secondary hidden">Cancel orientation check</button></div>
+          <p id="session-radio-message" class="hint"></p>
+          <label>Radio at this calibration frame<select id="radio-rotation-deg"><option value="0">Upright · 0°</option><option value="180">Upside down · 180°</option></select></label>
+          <p class="hint">Left/right mean the radio’s physical controls viewed upright. When upside down, physical left appears on the right of the image. Keep the frame as recorded; this setting corrects stick directions. Review the labelled regions after changing it.</p>
+          <progress id="radio-orientation-progress" class="hidden" max="100"></progress><p id="radio-orientation-message" class="hint" role="status"></p>
+          <div id="radio-orientation-result" class="hidden"><img id="radio-orientation-image" class="diagnostic" alt="StickCam frame near the midpoint for radio orientation review"><p id="radio-orientation-evidence" class="hint"></p><button id="apply-radio-orientation" class="secondary">Use suggested calibration orientation</button></div>
+          <p class="hint">Confirm a clear radio outline and both sticks once as the session reference. Shape and distributed face details then identify that same radio near each clip’s midpoint (retrying ±5s / ±10s), and at its calibration frame. Unknown results need manual review. The model label is yours to confirm; a silhouette alone cannot identify a model reliably.</p>
+        </details>
         <div class="actions calibration-frame-controls"><label>Reference frame <input id="reference-time" type="number" min="0" step="0.1" value="0"> s</label><span id="cal-duration" class="badge"></span><button id="load-frame" class="secondary">Show frame</button><button id="cal-frame-back" class="secondary">−5s</button><button id="cal-frame-forward" class="secondary">+5s</button><button id="auto-regions" class="secondary">Suggest gimbal regions</button><button id="cal-preview" class="secondary">Play reference video</button><button id="cal-pause" class="secondary hidden">Pause</button></div>
         <div class="marker-group"><h4>Mark the controls</h4><div class="actions" id="mark-tools"><button data-tool="box:left_gimbal" class="secondary">1. Left region</button><button data-tool="box:right_gimbal" class="secondary">2. Right region</button><button data-tool="tip:left_gimbal" class="secondary">3. Left tip</button><button data-tool="tip:right_gimbal" class="secondary">4. Right tip</button><button data-tool="center:left_gimbal" class="secondary">Left neutral centre</button><button data-tool="center:right_gimbal" class="secondary">Right neutral centre</button><button data-tool="radio-outline" class="secondary">Track radio outline</button></div><p class="hint">Optional: mark shell corners clockwise from top left. This helps track the radio face and its orientation.</p></div>
         <div class="actions calibration-save-controls"><button id="save-calibration">Confirm calibration &amp; next clip</button></div>

@@ -190,6 +190,7 @@ def _public(job):
             "source",
             "label",
             "calibration_reviews",
+            "radio_orientation_checks",
             "settings_defaults_version",
         )
     }
@@ -216,6 +217,8 @@ def _public(job):
     ]
     result["calibration_scans"] = [{"id": key, **value} for key, value in job.get("charts", {}).items()
                                    if value.get("kind") == "calibration-scan"]
+    profile = job.get("radio_profile")
+    result["radio_profile"] = {k: profile[k] for k in ("label", "revision", "name", "reference_time", "radio_rotation_deg")} if profile else None
     return result
 
 
@@ -590,13 +593,16 @@ def suggest_calibration(job_id: str, filename: str, at: float = 0, request: dict
     import cv2
     import numpy as np
 
-    from fpv_matcher.radio.auto_calibration import suggest_gimbal_regions
+    from fpv_matcher.radio.orientation import rotation_from_regions, suggest_upright_regions
     from fpv_matcher.radio.reference import suggest_from_reference
     from fpv_matcher.radio.tips import suggest_visible_tip
 
     job = get_job(job_id)
     _record(job, "radio", filename)
     try:
+        rotation = request.get("radio_rotation_deg", job["calibrations"].get(filename, {}).get("radio_rotation_deg", 0))
+        if rotation not in {0, 180}:
+            raise ValueError("Choose upright or upside down for this calibration frame")
         frame = calibration_frame(job_id, "radio", filename, at)
         image = cv2.imdecode(np.frombuffer(frame.body, np.uint8), cv2.IMREAD_GRAYSCALE)
         if image is None:
@@ -618,6 +624,13 @@ def suggest_calibration(job_id: str, filename: str, at: float = 0, request: dict
                 and len(config.get("radio_outline", [])) == 4
                 and all(side in config for side in ("left_gimbal", "right_gimbal"))
             ][:3]
+            profile = job.get("radio_profile")
+            if profile:
+                source = _input_video(job, "radio", profile["name"])
+                if [source.stat().st_size, source.stat().st_mtime_ns] != profile["signature"]:
+                    raise ValueError("Session radio reference source changed; confirm a new reference")
+                references = [(profile["name"], profile["calibration"])] + [r for r in references if r[0] != profile["name"] and r[1].get("radio_orientation_confirmed")]
+                references = references[:3]
             for reference_name, config in references:
                 try:
                     reference_response = calibration_frame(job_id, "radio", reference_name, config["reference_time"])
@@ -636,13 +649,18 @@ def suggest_calibration(job_id: str, filename: str, at: float = 0, request: dict
                     }
                     candidate = suggest_from_reference(reference, image, reference_outline, regions)
                     if candidate is not None:
+                        if config.get("radio_orientation_confirmed"):
+                            guessed = rotation_from_regions(candidate["regions"])["rotation_deg"]
+                            if guessed is not None:
+                                candidate["radio_rotation_deg"] = guessed
                         proposal = {**candidate, "reference_clip": reference_name}
                         break
                 except (HTTPException, OSError, ValueError, KeyError, subprocess.SubprocessError):
                     # An unreadable/deleted reference must not block this clip.
                     continue
         if proposal is None:
-            proposal = suggest_gimbal_regions(image, outline)
+            proposal = suggest_upright_regions(image, outline, rotation)
+            proposal["radio_rotation_deg"] = rotation
         for region in proposal["regions"].values():
             if "tip_x" not in region:
                 tip = suggest_visible_tip(image, region)
@@ -1558,12 +1576,14 @@ def _chart_worker(job_id, chart_id):
             kind = request.get("kind", "motion-review")
             scanning = kind == "gyro-scan"
             messages = {"gyro-scan": "Comparing cached StickCam inputs with session FPV telemetry.",
+                        "radio-orientation": "Checking the session radio around each clip's midpoint.",
                         "audio-review": "Reading cached audio or decoding waveform envelopes.",
                         "calibration-scan": "Finding visible radio outlines and gimbals at five-second intervals.",
                         "stick-derivation": "Deriving calibrated StickCam recordings; cached signals are reused."}
             status("running", messages.get(kind, "Reading FPV motion and tracking StickCam; cached signals are reused."))
             log = (directory / "worker.log").open("w")
             module = {"gyro-scan": "fpv_matcher.motion.gyro_scan", "audio-review": "fpv_matcher.audio.review",
+                      "radio-orientation": "fpv_matcher.radio.orientation",
                       "calibration-scan": "fpv_matcher.radio.calibration_scan",
                       "stick-derivation": "fpv_matcher.radio.derivation"}.get(kind, "fpv_matcher.motion.review")
             process = subprocess.Popen([sys.executable, "-u", "-m", module, str(directory / "request.json")],
@@ -1585,7 +1605,15 @@ def _chart_worker(job_id, chart_id):
             detail = (directory / "worker.log").read_text(errors="replace")[-1200:]
             status("failed", detail.splitlines()[-1] if detail else "Signal extraction failed")
         else:
+            if kind == "radio-orientation":
+                result = json.loads((directory / "orientation.json").read_text())
+                def save_orientation(current):
+                    if (current.get("radio_profile") or {}).get("revision") == result["profile_revision"]:
+                        current.setdefault("radio_orientation_checks", {}).update({row["name"]: {**row, "task_id": chart_id}
+                                                                                  for row in result["clips"]})
+                jobs.update(job_id, save_orientation)
             status("complete", {"gyro-scan": "Gyro correlation scan ready", "audio-review": "Audio waveforms ready",
+                                "radio-orientation": "Radio orientation suggestions ready for review",
                                 "calibration-scan": "Calibration proposals ready for review",
                                 "stick-derivation": "StickCam preparation finished; inspect per-video results"}.get(kind, "Motion signals ready"))
     except Exception as exc:
@@ -1757,6 +1785,89 @@ def _extraction_fps(value):
         raise HTTPException(400, "Choose an extraction rate from 1 to 30 Hz") from None
 
 
+@app.put("/api/jobs/{job_id}/session-radio")
+def confirm_session_radio(job_id: str, body: dict = Body(...)):
+    job = get_job(job_id)
+    if job["status"] in {"queued", "running", "cancelling"}:
+        raise HTTPException(409, "Wait for matching to finish before changing the session radio")
+    name = body.get("radio_video")
+    path = _input_video(job, "radio", name)
+    config = job["calibrations"].get(name)
+    if not config or config.get("skip_motion") or config.get("exclude") or len(config.get("radio_outline", [])) != 4:
+        raise HTTPException(400, "Save a calibration with the radio outline and both sticks before confirming this reference")
+    info = _metadata(job, "radio", name)
+    try:
+        config = validate_calibration(config, (info["width"], info["height"]))
+        if any("tip_x" not in config[s] for s in ("left_gimbal", "right_gimbal")):
+            raise ValueError("Confirm both stick tips before saving the session radio")
+        label = body.get("label", "")
+        if not isinstance(label, str) or not label.strip() or len(label.strip()) > 100:
+            raise ValueError("Enter a radio name/model (up to 100 characters); a custom label is fine")
+        from fpv_matcher.radio.orientation import rotation_from_regions
+        if rotation_from_regions({s: config[s] for s in ("left_gimbal", "right_gimbal")})["rotation_deg"] != config.get("radio_rotation_deg", 0):
+            raise ValueError("Check physical left/right gimbal labels and orientation first; use a clearer, more level reference frame")
+        config["radio_orientation_confirmed"] = True
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    profile = {"label": label.strip(), "name": name, "path": str(path), "revision": uuid.uuid4().hex,
+               "signature": [path.stat().st_size, path.stat().st_mtime_ns], "calibration": config,
+               "width": info["width"], "height": info["height"], "reference_time": config["reference_time"],
+               "radio_rotation_deg": config.get("radio_rotation_deg", 0)}
+    def save(current):
+        current.update(radio_profile=profile, radio_orientation_checks={})
+    jobs.update(job_id, save)
+    return {"profile": {k: profile[k] for k in ("label", "revision", "name", "reference_time", "radio_rotation_deg")}}
+
+
+@app.post("/api/jobs/{job_id}/radio-orientation")
+def check_radio_orientation(job_id: str, body: dict = Body(default={})):
+    from fpv_matcher.radio.orientation import VERSION
+    job = get_job(job_id)
+    if job["status"] in {"queued", "running", "cancelling"}:
+        raise HTTPException(409, "Wait for matching to finish before starting orientation checks")
+    profile = job.get("radio_profile")
+    if not profile:
+        raise HTTPException(400, "Confirm one calibrated radio as this session's reference first")
+    path = _input_video(job, "radio", profile["name"])
+    if [path.stat().st_size, path.stat().st_mtime_ns] != profile["signature"]:
+        raise HTTPException(409, "The session radio reference source changed; confirm it again")
+    name = body.get("radio_video")
+    records = [_record(job, "radio", name)] if name else job["inputs"]["radio"]
+    clips = []
+    for record in records:
+        config = job["calibrations"].get(record["name"], {})
+        if config.get("exclude"):
+            continue
+        path = _input_video(job, "radio", record["name"])
+        info = _metadata(job, "radio", record["name"])
+        at = body.get("reference_time", config.get("reference_time", 0)) if name else config.get("reference_time", 0)
+        try:
+            at = float(at)
+            if not math.isfinite(at) or not 0 <= at < info["duration"]:
+                raise ValueError("Choose a calibration frame inside the clip")
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        clips.append({"name": record["name"], "path": str(path), "duration": info["duration"],
+                      "calibration_time": at, "signature": [path.stat().st_size, path.stat().st_mtime_ns]})
+    if not clips:
+        raise HTTPException(400, "No included StickCam clips to check")
+    return _queue_signal_task(job_id, {"kind": "radio-orientation", "version": VERSION, "reference": profile,
+                              "profile_revision": profile["revision"], "clips": clips}, "orientation.json")
+
+
+@app.get("/api/jobs/{job_id}/radio-orientation/{chart_id}/frame/{index}")
+def radio_orientation_frame(job_id: str, chart_id: str, index: int):
+    job = get_job(job_id)
+    task = job.get("charts", {}).get(chart_id)
+    directory = _chart_directory(job_id, chart_id)
+    if not task or task.get("kind") != "radio-orientation" or task["status"] != "complete" or index < 0:
+        raise HTTPException(404, "Orientation frame not available")
+    result = json.loads((directory / "orientation.json").read_text())
+    if index >= len(result["clips"]) or not result["clips"][index].get("image_file"):
+        raise HTTPException(404, "Orientation frame not available")
+    return FileResponse(directory / f"frame-{index}.jpg", media_type="image/jpeg")
+
+
 @app.post("/api/jobs/{job_id}/calibration-scan")
 def start_calibration_scan(job_id: str, body: dict = Body(...)):
     from fpv_matcher.radio.calibration_scan import VERSION
@@ -1785,7 +1896,16 @@ def start_calibration_scan(job_id: str, body: dict = Body(...)):
                       "signature": [path.stat().st_size, path.stat().st_mtime_ns]})
     if not clips:
         raise HTTPException(400, "All recordings already have saved calibrations. Use Find radio on one selected clip to propose a replacement.")
+    profile = job.get("radio_profile")
+    if profile:
+        path = _input_video(job, "radio", profile["name"])
+        if [path.stat().st_size, path.stat().st_mtime_ns] != profile["signature"]:
+            raise HTTPException(409, "Session radio reference source changed; confirm a new reference")
+        references.append({"name": profile["name"], "path": str(path), "calibration": profile["calibration"],
+                           "signature": profile["signature"]})
     for reference_name, config in job["calibrations"].items():
+        if profile and (reference_name == profile["name"] or not config.get("radio_orientation_confirmed")):
+            continue
         if config.get("skip_motion") or config.get("exclude") or len(config.get("radio_outline", [])) != 4:
             continue
         path = _input_video(job, "radio", reference_name)
@@ -1956,6 +2076,12 @@ def motion_review(job_id: str, chart_id: str, start: float | None = None, end: f
             status = {**status, "progress": json.loads(progress_path.read_text())}
         return status
     request = json.loads((directory / "request.json").read_text())
+    if request.get("kind") == "radio-orientation":
+        result = json.loads((directory / "orientation.json").read_text())
+        for index, row in enumerate(result["clips"]):
+            if row.get("image_file"):
+                row["image_url"] = f"/api/jobs/{job_id}/radio-orientation/{chart_id}/frame/{index}"
+        return {**status, **result}
     if request.get("kind") == "calibration-scan":
         result = json.loads((directory / "calibration-review.json").read_text())
         for row in result["clips"]:

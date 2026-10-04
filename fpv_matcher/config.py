@@ -15,6 +15,11 @@ def validate_calibration(config: dict, dimensions: tuple[int, int] | None = None
     if not isinstance(config, dict):
         raise ValueError("Calibration must be a JSON object")
     result = copy.deepcopy(config)
+    if "radio_rotation_deg" in result:
+        rotation = finite(result["radio_rotation_deg"], "Radio reference orientation")
+        if rotation not in {0, 180}:
+            raise ValueError("Radio reference orientation must be upright (0) or upside down (180)")
+        result["radio_rotation_deg"] = int(rotation)
     mode = result.setdefault("stickcam_mode", "fixed")
     if mode not in {"fixed", "wonky"}:
         raise ValueError("StickCam mode must be fixed or wonky")

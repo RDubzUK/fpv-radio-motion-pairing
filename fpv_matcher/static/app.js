@@ -8,6 +8,7 @@ const state = { job: null, results: null, source: 'upload', busy: false, uploadC
   calibrationName: null, calibrationProposalId: null, calibrationDrafts: {} };
 const clone = value => JSON.parse(JSON.stringify(value));
 const calibrationScan = { id: null, jobId: null, token: 0, timer: null, running: false, rows: [] };
+const radioOrientation = { token: 0, timer: null, task: null, running: false, result: null };
 const part = value => encodeURIComponent(value);
 const path = suffix => `/api/jobs/${state.job.id}${suffix}`;
 const show = (id, visible = true) => $(id).classList.toggle('hidden', !visible);
@@ -90,7 +91,7 @@ function renderVideoLists() {
   const mode = $('match-target-kind').value;
   for (const kind of ['fpv', 'radio']) {
     const records = state.job.inputs[kind], list = $(`${kind}-video-list`);
-    const hash = JSON.stringify([mode, [...state.targets[kind]], records.map(r => [r.name, r.metadata?.duration, calibrated(state.job.calibrations[r.name]), !!state.job.calibrations[r.name]?.exclude, state.stickData?.clips.find(c => c.name === r.name)]), activeAnalysis()]);
+    const hash = JSON.stringify([mode, [...state.targets[kind]], records.map(r => [r.name, r.metadata?.duration, calibrated(state.job.calibrations[r.name]), !!state.job.calibrations[r.name]?.exclude, state.stickData?.clips.find(c => c.name === r.name), state.job.calibrations[r.name]?.radio_rotation_deg, state.job.radio_orientation_checks?.[r.name]?.status, state.job.radio_orientation_checks?.[r.name]?.midpoint_rotation_deg]), activeAnalysis()]);
     if (list.dataset.hash === hash) continue;
     list.dataset.hash = hash; list.replaceChildren(); $(`${kind}-list-title`).textContent = `${kind === 'fpv' ? 'FPV' : 'StickCam'} videos (${records.length})`;
     for (const record of records) {
@@ -99,7 +100,10 @@ function renderVideoLists() {
       check.onchange = () => { if (check.checked) state.targets[kind].add(record.name); else state.targets[kind].delete(record.name); updateSelectionSummary(); };
       const cached = state.stickData?.clips.find(c => c.name === record.name);
       const status = kind === 'radio' ? (cached?.status === 'cached' ? 'Movement cached' : cached?.status === 'other_rate' ? `Saved at ${cached.sample_fps} Hz · needs ${cached.requested_fps} Hz` : calibrated(state.job.calibrations[record.name]) ? 'Calibrated · needs derivation' : 'Needs calibration') : bytes(record.size);
-      label.append(check, el('span', record.name), el('small', `${clipDuration(record)} · ${status}`));
+      const orientation = kind === 'radio' ? state.job.radio_orientation_checks?.[record.name] : null;
+      const savedRotation = state.job.calibrations[record.name]?.radio_rotation_deg;
+      const orientationText = savedRotation === 180 ? ' · inverted reference confirmed' : orientation ? ` · midpoint ${orientation.midpoint_rotation_deg === 180 ? 'inverted' : orientation.midpoint_rotation_deg === 0 ? 'upright' : 'unknown'}` : '';
+      label.append(check, el('span', record.name), el('small', `${clipDuration(record)} · ${status}${orientationText}`));
       list.append(label);
     }
   }
@@ -142,6 +146,7 @@ function updateJobUI() {
   renderExtractionProgress();
   message('analysis-message', state.job.message, state.job.status === 'failed');
   ['save-calibration', 'check-tracking', 'copy-regions'].forEach(id => $(id).disabled = activeAnalysis());
+  updateRadioOrientationUI();
   $('stick-sampling-ratio').disabled = activeAnalysis() || stickPreparation.running;
   updateMarkTools();
   for (const id of ['auto-find-radio', 'auto-find-all']) $(id).disabled = activeAnalysis() || calibrationScan.running || !completeInputs;
@@ -176,6 +181,8 @@ function clearSession() {
   stickPreparation.running = false; stickPreparation.task = null; state.stickData = null;
   show('derive-sticks-cancel', false); show('stick-data-progress', false); $('stick-data-log').replaceChildren();
   calibrationScan.token++; clearTimeout(calibrationScan.timer); calibrationScan.id = null; calibrationScan.rows = []; calibrationScan.running = false;
+  radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
+  $('session-radio-label').value = ''; show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
   state.calibrationName = state.calibrationProposalId = null; state.calibrationDrafts = {};
   show('auto-calibration-review', false); show('auto-find-cancel', false); show('auto-calibration-progress', false); message('auto-calibration-message', '');
   state.jobToken++; state.calToken++; state.viewerToken++;
@@ -253,6 +260,7 @@ async function selectJob(id) {
   clearSession(); const token = state.jobToken;
   const job = await api(`/api/jobs/${id}`); if (token !== state.jobToken) return;
   state.job = job; state.source = job.source; localStorage.setItem('fpv-session', id);
+  $('session-radio-label').value = job.radio_profile?.label || '';
   $('rename-session-label').value = job.label || ''; show('rename-session-controls');
   setSource(job.source); updateJobUI();
   const oldDefaults = {sample_fps:15, match_fps:7.5, min_overlap:5}, newDefaults = {sample_fps:30, match_fps:30, min_overlap:2};
@@ -434,6 +442,9 @@ async function loadCalibration(name) {
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas'); show('tracking-check', false);
   state.calibrationName = name; state.calibrationProposalId = state.calibrationDrafts[name]?.proposalId || null;
   state.tool = state.drag = null; state.calibration = clone(state.calibrationDrafts[name]?.config || state.job.calibrations[name] || emptyCalibration());
+  $('radio-rotation-deg').value = String(state.calibration.radio_rotation_deg || 0);
+  radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
+  show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
   $('fixed-camera').checked = state.calibration.stickcam_mode !== 'wonky'; $('skip-motion').checked = !!state.calibration.skip_motion;
   $('exclude-clip').checked = !!state.calibration.exclude;
   $('camera-label').textContent = $('fixed-camera').checked ? 'Fixed StickCam' : 'Wonky StickCam';
@@ -471,6 +482,7 @@ async function showFrame(reset = true, token = state.calToken) {
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas');
   const nextCalibration = clone(state.calibration);
   if (reset && Math.abs(at - nextCalibration.reference_time) > .01) {
+    nextCalibration.radio_orientation_confirmed = false;
     for (const side of ['left_gimbal', 'right_gimbal']) {
       if (nextCalibration.stickcam_mode === 'wonky') delete nextCalibration[side];
       else if (nextCalibration[side]) { delete nextCalibration[side].tip_x; delete nextCalibration[side].tip_y; }
@@ -500,9 +512,106 @@ async function showFrame(reset = true, token = state.calToken) {
   state.frameURL = objectURL;
   if (token !== state.calToken || frameToken !== state.frameToken) return;
   state.calibration = nextCalibration;
+  $('radio-rotation-deg').value = String(nextCalibration.radio_rotation_deg || 0);
   drawRegions();
+  updateRadioOrientationUI();
+  if (state.job.radio_profile && !activeAnalysis()) checkRadioOrientation(false, true).catch(error => message('radio-orientation-message', error.message, true));
 }
 $('calibration-clip').onchange = guarded(() => loadCalibration($('calibration-clip').value), 'calibration-message');
+function updateRadioOrientationUI() {
+  const profile = state.job?.radio_profile, unavailable = !state.metadata || $('exclude-clip').checked || activeAnalysis();
+  message('session-radio-message', profile ? `Confirmed: ${profile.label} · reference ${profile.name} at ${time(profile.reference_time)}. Predictions identify this saved appearance; the model label can be corrected above.` : 'Confirm one clear, calibrated radio view to establish the expected appearance for this session.');
+  $('radio-rotation-deg').disabled = unavailable;
+  $('confirm-session-radio').disabled = unavailable || $('skip-motion').checked || radioOrientation.running;
+  for (const id of ['check-radio-midpoint','check-radio-all']) $(id).disabled = unavailable || !profile || radioOrientation.running;
+  const row = radioOrientation.result;
+  $('apply-radio-orientation').disabled = unavailable || !row || ![0,180].includes(row.calibration_rotation_deg)
+    || row.profile_revision !== profile?.revision || row.name !== $('calibration-clip').value
+    || Math.abs(row.calibration_time - Number($('reference-time').value)) > .01;
+}
+function applyRadioRotation(rotation) {
+  if (!state.calibration) return;
+  const left = state.calibration.left_gimbal, right = state.calibration.right_gimbal;
+  if (left && right) {
+    const physicalLeftOnImageLeft = left.x + left.center_x < right.x + right.center_x;
+    if ((rotation === 0 && !physicalLeftOnImageLeft) || (rotation === 180 && physicalLeftOnImageLeft))
+      [state.calibration.left_gimbal, state.calibration.right_gimbal] = [right, left];
+  }
+  state.calibration.radio_rotation_deg = rotation; state.calibration.radio_orientation_confirmed = false;
+  $('radio-rotation-deg').value = String(rotation); drawRegions();
+  message('radio-orientation-message', `${rotation === 180 ? 'Upside down' : 'Upright'} at this calibration frame. Check physical left/right regions and tips, then confirm calibration to save. Corrected stick directions require movement data derived with this orientation.`);
+  updateRadioOrientationUI();
+}
+function renderRadioOrientation(row) {
+  radioOrientation.result = row || null;
+  show('radio-orientation-result', !!row); updateRadioOrientationUI();
+  if (!row) return;
+  const describe = value => value === 180 ? 'upside down (180°)' : value === 0 ? 'upright (0°)' : 'unknown';
+  message('radio-orientation-message', `${row.message}${row.orientation_changes ? ' Orientation differs between the calibration frame and midpoint; do not use a blanket clip-wide direction flip.' : ''}`);
+  const evidence = row.evidence;
+  message('radio-orientation-evidence', `Expected radio: ${row.radio_label}. Near midpoint at ${time(row.image_at ?? row.calibration_time)}: ${describe(row.midpoint_rotation_deg)}. Calibration frame at ${time(row.calibration_time)}: ${describe(row.calibration_rotation_deg)}.${evidence ? ` Saved appearance matched: ${evidence.inliers} inliers, ${Math.round(evidence.coverage * 100)}% distributed outline coverage, ${Number(evidence.error_px).toFixed(2)} px projection error.` : ' No clear reference match.'}`);
+  if (row.image_url) $('radio-orientation-image').src = row.image_url;
+  else if (row.image_file && row.task_id) $('radio-orientation-image').src = `/api/jobs/${state.job.id}/radio-orientation/${row.task_id}/frame/${row.frame_index}`;
+  else $('radio-orientation-image').removeAttribute('src');
+  show('radio-orientation-image', !!row.image_url || !!row.image_file);
+}
+async function checkRadioOrientation(all = false, automatic = false) {
+  if (!state.job?.radio_profile || !state.metadata || activeAnalysis() || $('exclude-clip').checked) return;
+  if (radioOrientation.running) { if (automatic) return; throw new Error('Wait for the current orientation check or cancel it.'); }
+  const jobId = state.job.id, jobToken = state.jobToken, name = $('calibration-clip').value, frameTime = Number($('reference-time').value);
+  const token = ++radioOrientation.token;
+  radioOrientation.running = true; updateRadioOrientationUI();
+  message('radio-orientation-message', 'Checking the radio near the midpoint and at the calibration frame…');
+  try {
+    const task = await api(`/api/jobs/${jobId}/radio-orientation`, {method:'POST', json:all ? {} : {radio_video:name, reference_time:frameTime}});
+    if (token !== radioOrientation.token || jobToken !== state.jobToken) return;
+    radioOrientation.task = task.id; show('radio-orientation-progress'); show('cancel-radio-orientation');
+    const poll = async () => {
+      if (token !== radioOrientation.token || jobToken !== state.jobToken) return;
+      try {
+        const result = await api(`/api/jobs/${jobId}/motion-review/${task.id}`);
+        if (token !== radioOrientation.token || jobToken !== state.jobToken) return;
+        if (['queued','running'].includes(result.status)) {
+          const p = result.progress;
+          if (p) { $('radio-orientation-progress').value = p.percent; message('radio-orientation-message', `${p.name} · checking ${time(p.at)} · ${Number(p.percent).toFixed(1)}%`); }
+          else $('radio-orientation-progress').removeAttribute('value');
+          radioOrientation.timer = setTimeout(poll, 1500); return;
+        }
+        radioOrientation.running = false; show('radio-orientation-progress', false); show('cancel-radio-orientation', false); updateRadioOrientationUI();
+        if (result.status !== 'complete') { message('radio-orientation-message', result.message, result.status === 'failed'); return; }
+        if (result.profile_revision !== state.job.radio_profile?.revision) return;
+        state.job.radio_orientation_checks ??= {};
+        for (const row of result.clips) state.job.radio_orientation_checks[row.name] = {...row, task_id:task.id};
+        renderRadioOrientation(result.clips.find(row => row.name === $('calibration-clip').value));
+        renderVideoLists();
+        if (all) message('session-radio-message', `${state.job.radio_profile.label} · ${result.clips.length} clips checked, ${result.clips.filter(r => r.status === 'suggested').length} orientation suggestions. Open each clip to review; unknown results require manual orientation.`);
+      } catch(error) {
+        radioOrientation.running = false; show('radio-orientation-progress', false); show('cancel-radio-orientation', false); updateRadioOrientationUI();
+        message('radio-orientation-message', error.message, true);
+      }
+    };
+    await poll();
+  } catch(error) { if (token === radioOrientation.token) { radioOrientation.running = false; updateRadioOrientationUI(); } throw error; }
+}
+$('radio-rotation-deg').onchange = () => applyRadioRotation(Number($('radio-rotation-deg').value));
+$('apply-radio-orientation').onclick = () => applyRadioRotation(radioOrientation.result.calibration_rotation_deg);
+$('check-radio-midpoint').onclick = guarded(() => checkRadioOrientation(), 'radio-orientation-message');
+$('check-radio-all').onclick = guarded(() => checkRadioOrientation(true), 'radio-orientation-message');
+$('cancel-radio-orientation').onclick = guarded(async () => {
+  if (radioOrientation.task) await api(`/api/jobs/${state.job.id}/motion-review/${radioOrientation.task}/cancel`, {method:'POST'});
+}, 'radio-orientation-message');
+$('confirm-session-radio').onclick = guarded(async () => {
+  const jobId = state.job.id, jobToken = state.jobToken, name = $('calibration-clip').value;
+  const label = $('session-radio-label').value.trim();
+  if (!label) throw new Error('Enter the radio model or a custom name to confirm it.');
+  if (state.calibration.radio_outline?.length !== 4) throw new Error('Mark the radio outline, both gimbals and both tips before confirming this reference.');
+  await saveCalibration(false);
+  if (jobToken !== state.jobToken || name !== $('calibration-clip').value) return;
+  const saved = await api(`/api/jobs/${jobId}/session-radio`, {method:'PUT', json:{radio_video:name, label}});
+  if (jobToken !== state.jobToken) return;
+  state.job.radio_profile = saved.profile; state.job.radio_orientation_checks = {}; updateRadioOrientationUI();
+  await checkRadioOrientation();
+}, 'radio-orientation-message');
 function proposalConfirmed(row) { return row.confirmed || state.job?.calibration_reviews?.[row.name]?.proposal_id === calibrationScan.id; }
 function nextCalibrationProposal(exclude = '') {
   return calibrationScan.rows.find(row => row.name !== exclude && row.calibration && !proposalConfirmed(row));
@@ -595,9 +704,13 @@ $('auto-regions').onclick = guarded(async () => {
   const previousCalibration = JSON.stringify(state.calibration);
   const outlined = state.calibration.radio_outline?.length === 4;
   message('calibration-message', outlined ? 'Checking gimbal rims inside the radio outline…' : 'Checking saved radio references and visible gimbal rims…');
-  const proposal = await api(path(`/calibration/${part(name)}/suggest?at=${referenceTime}`), { method: 'POST', json: { radio_outline: state.calibration.radio_outline || [] } });
+  const proposal = await api(path(`/calibration/${part(name)}/suggest?at=${referenceTime}`), { method: 'POST', json: { radio_outline: state.calibration.radio_outline || [], radio_rotation_deg: state.calibration.radio_rotation_deg || 0 } });
   if (token !== state.calToken || jobToken !== state.jobToken || frameToken !== state.frameToken || previousCalibration !== JSON.stringify(state.calibration)) return;
   const sx = state.metadata.width / proposal.frame_width, sy = state.metadata.height / proposal.frame_height;
+  if (proposal.radio_rotation_deg !== undefined) {
+    state.calibration.radio_rotation_deg = proposal.radio_rotation_deg; state.calibration.radio_orientation_confirmed = false;
+    $('radio-rotation-deg').value = String(proposal.radio_rotation_deg);
+  }
   if (proposal.radio_outline) state.calibration.radio_outline = proposal.radio_outline.map(([x, y]) => [x * sx, y * sy]);
   for (const side of ['left_gimbal', 'right_gimbal']) {
     const spec = proposal.regions[side];
@@ -631,6 +744,7 @@ function updateMarkTools() {
   $('check-tracking').disabled = unavailable || activeAnalysis();
   $('auto-regions').disabled = unavailable || activeAnalysis();
   $('load-frame').disabled = $('cal-preview').disabled = !state.metadata || $('exclude-clip').checked;
+  updateRadioOrientationUI();
 }
 $('skip-motion').onchange = updateMarkTools;
 $('exclude-clip').onchange = updateMarkTools;
@@ -716,6 +830,7 @@ function currentCalibrationConfig() {
   if ($('exclude-clip').checked) config = { exclude: true };
   else if ($('skip-motion').checked) config = { skip_motion: true, stickcam_mode: $('fixed-camera').checked ? 'fixed' : 'wonky' };
   else {
+    config.radio_rotation_deg = Number($('radio-rotation-deg').value); config.radio_orientation_confirmed = true;
     if (!calibrated(config)) throw new Error('Draw both regions and click both tips, or choose audio-only matching.');
     if (config.radio_outline && config.radio_outline.length !== 4) throw new Error('Mark all four radio outline corners, or click the outline tool again to start over.');
     for (const side of ['left_gimbal', 'right_gimbal']) {
