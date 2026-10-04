@@ -121,7 +121,8 @@ Prioritise capture validity before lowering matching thresholds: absolute appear
 - Hide Add recordings after sources are ready; make every major panel collapsible and add Collapse all / Expand all. Explicit navigation opens the target; polling keeps collapse choices.
 
 - Mark FPV visual motion and StickCam derived inputs as Experimental in matching controls.
-- Mirror the calibration view horizontally by default for a 180° reference, map pointer/marker geometry to original coordinates, preserve readable labels/source corner order, and retain the existing physical stick-axis correction.
+- Rotate the calibration view 180° by default for an inverted reference, map pointer/marker geometry to original coordinates, preserve readable labels/source corner order, and retain the existing physical stick-axis correction.
+- Use a StickCam mode dropdown with Wonky as the default and Fixed as the other option; restore each saved clip's configured mode.
 - Make session radio replacement explicit; retire old proposals/checks while preserving confirmed calibrations for review.
 - Put folder selection above the scrollable list, enlarge the dialog within the viewport, and label FPV versus StickCam selection.
 

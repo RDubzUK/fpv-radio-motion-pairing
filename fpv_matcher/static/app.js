@@ -5,7 +5,7 @@ const state = { job: null, results: null, source: 'upload', busy: false, uploadC
   calibration: null, metadata: null, tool: null, drag: null, pair: null, page: 0,
   playing: false, startingPlayback: false, animation: null, lastCorrection: 0,
   frameController: null, frameURL: null, frameToken: 0, offsetToken: 0, targets: {fpv: new Set(), radio: new Set()},
-  calibrationMirrorOverride: null, calibrationName: null, calibrationProposalId: null, calibrationDrafts: {} };
+  calibrationRotationOverride: null, calibrationName: null, calibrationProposalId: null, calibrationDrafts: {} };
 const clone = value => JSON.parse(JSON.stringify(value));
 const calibrationScan = { id: null, jobId: null, token: 0, timer: null, running: false, rows: [] };
 const segmentScan = {token:0, timer:null, task:null, running:false};
@@ -211,6 +211,7 @@ function clearSession() {
   radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
   $('session-radio-label').value = 'auto'; renderRadioShape(); show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
   state.calibrationName = state.calibrationProposalId = null; state.calibrationDrafts = {};
+  state.calibrationRotationOverride = null; $('stickcam-mode').value = 'wonky';
   show('auto-calibration-review', false); show('auto-find-cancel', false); show('auto-calibration-progress', false); message('auto-calibration-message', '');
   show('inputs-panel'); show('delete-session-confirmation', false);
   for (const panel of document.querySelectorAll('[data-major-panel]')) panel.open = true;
@@ -477,13 +478,12 @@ async function loadCalibration(name) {
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas'); show('tracking-check', false);
   state.calibrationName = name; state.calibrationProposalId = state.calibrationDrafts[name]?.proposalId || null;
   state.tool = state.drag = null; state.calibration = clone(state.calibrationDrafts[name]?.config || state.job.calibrations[name] || emptyCalibration());
-  state.calibrationMirrorOverride = null;
+  state.calibrationRotationOverride = null;
   $('radio-rotation-deg').value = String(state.calibration.radio_rotation_deg || 0);
   radioOrientation.token++; clearTimeout(radioOrientation.timer); radioOrientation.running = false; radioOrientation.result = null;
   show('radio-orientation-result', false); show('radio-orientation-progress', false); show('cancel-radio-orientation', false);
-  $('fixed-camera').checked = state.calibration.stickcam_mode !== 'wonky'; $('skip-motion').checked = !!state.calibration.skip_motion;
+  $('stickcam-mode').value = state.calibration.stickcam_mode === 'fixed' ? 'fixed' : 'wonky'; $('skip-motion').checked = !!state.calibration.skip_motion;
   $('exclude-clip').checked = !!state.calibration.exclude;
-  $('camera-label').textContent = $('fixed-camera').checked ? 'Fixed StickCam' : 'Wonky StickCam';
   $('reference-time').value = state.calibration.reference_time || 0;
   const spec = state.calibration.left_gimbal;
   $('tip-radius').value = spec?.tip_radius || 10; $('tip-threshold').value = spec?.threshold ?? 70; $('tip-polarity').value = spec?.polarity || 'dark';
@@ -584,7 +584,7 @@ function updateRadioOrientationUI() {
   message('session-radio-message', profile ? `Confirmed: ${profile.label} · reference ${profile.name} at ${time(profile.reference_time)}. Predictions identify this saved appearance; the model label can be corrected above.` : 'Confirm one clear, calibrated radio view to establish the expected appearance for this session.');
   $('radio-rotation-deg').disabled = unavailable;
   $('confirm-session-radio').textContent = profile ? 'Change session radio using this frame' : 'Confirm radio & use this frame as reference';
-  $('cal-mirror-horizontal').disabled = unavailable;
+  $('cal-rotate-180').disabled = unavailable;
   $('confirm-session-radio').disabled = unavailable || $('skip-motion').checked || radioOrientation.running;
   for (const id of ['check-radio-midpoint','check-radio-all']) $(id).disabled = unavailable || !profile || radioOrientation.running;
   const row = radioOrientation.result;
@@ -600,7 +600,7 @@ function applyRadioRotation(rotation) {
     if ((rotation === 0 && !physicalLeftOnImageLeft) || (rotation === 180 && physicalLeftOnImageLeft))
       [state.calibration.left_gimbal, state.calibration.right_gimbal] = [right, left];
   }
-  state.calibrationMirrorOverride = null; state.drag = null;
+  state.calibrationRotationOverride = null; state.drag = null;
   state.calibration.radio_rotation_deg = rotation; state.calibration.radio_orientation_confirmed = false;
   $('radio-rotation-deg').value = String(rotation); drawRegions();
   message('radio-orientation-message', `${rotation === 180 ? 'Upside down' : 'Upright'} at this calibration frame. Check physical left/right regions and tips, then confirm calibration to save. Corrected stick directions require movement data derived with this orientation.`);
@@ -704,7 +704,7 @@ async function openCalibrationProposal(row) {
   if (jobToken !== state.jobToken || !state.metadata || $('calibration-clip').value !== row.name) return;
   if (!row.calibration || proposalConfirmed(row)) return;
   state.calibration = clone(row.calibration); state.calibrationProposalId = scanId;
-  $('fixed-camera').checked = state.calibration.stickcam_mode === 'fixed'; $('camera-label').textContent = $('fixed-camera').checked ? 'Fixed StickCam' : 'Wonky StickCam';
+  $('stickcam-mode').value = state.calibration.stickcam_mode === 'fixed' ? 'fixed' : 'wonky';
   $('skip-motion').checked = false; $('exclude-clip').checked = false; $('reference-time').value = row.at;
   $('tip-radius').value = state.calibration.left_gimbal.tip_radius; $('tip-threshold').value = state.calibration.left_gimbal.threshold; $('tip-polarity').value = state.calibration.left_gimbal.polarity;
   await showFrame(false);
@@ -727,7 +727,7 @@ async function startCalibrationSearch(all = false) {
   const jobId = state.job.id, jobToken = state.jobToken;
   const task = await api(`/api/jobs/${jobId}/calibration-scan`, {method:'POST', json: {
     radio_video: all ? null : $('calibration-clip').value, start: all ? 0 : Number($('reference-time').value),
-    radio_model: $('session-radio-label').value, search_seconds: Number($('auto-search-seconds').value), stickcam_mode: all ? 'wonky' : $('fixed-camera').checked ? 'fixed' : 'wonky'
+    radio_model: $('session-radio-label').value, search_seconds: Number($('auto-search-seconds').value), stickcam_mode: all ? 'wonky' : $('stickcam-mode').value
   }});
   if (jobToken !== state.jobToken) return;
   watchCalibrationScan(task.id, jobId, jobToken);
@@ -803,11 +803,10 @@ $('auto-regions').onclick = guarded(async () => {
   const tipMessage = missingTips.length ? `Could not reliably locate the ${missingTips.map(side => side.startsWith('left') ? 'left' : 'right').join(' and ')} tip${missingTips.length > 1 ? 's' : ''}; click the corresponding tip tool to mark ${missingTips.length > 1 ? 'them' : 'it'}.` : 'Both current stick tips are suggested. Review all markers, adjust any point, then save or check tracking.';
   message('calibration-message', `${proposal.reference_clip ? `Located a saved radio reference from ${proposal.reference_clip}.` : `Suggested gimbal housings${outlined ? ' inside the marked outline' : ''}.`} ${proposal.shape_matches?.length ? `Shape candidates: ${proposal.shape_matches.map(row => row.label).join(', ')}. ` : ''}${proposal.shape_message || ''} ${tipMessage} Circles mark tips; crosses mark estimated neutral centres.`);
 }, 'calibration-message');
-$('fixed-camera').onchange = () => {
+$('stickcam-mode').onchange = () => {
   if (!state.calibration) return;
-  state.calibration.stickcam_mode = $('fixed-camera').checked ? 'fixed' : 'wonky';
-  $('camera-label').textContent = $('fixed-camera').checked ? 'Fixed StickCam' : 'Wonky StickCam';
-  message('calibration-message', $('fixed-camera').checked ? 'Fixed mode tracks tips inside these regions.' : 'Wonky mode also tracks the housing. Include detailed housing edges around each gimbal.');
+  state.calibration.stickcam_mode = $('stickcam-mode').value;
+  message('calibration-message', $('stickcam-mode').value === 'fixed' ? 'Fixed mode tracks tips inside these regions.' : 'Wonky mode also tracks the housing. Include detailed housing edges around each gimbal.');
 };
 function updateMarkTools() {
   const unavailable = $('skip-motion').checked || $('exclude-clip').checked || !state.metadata;
@@ -826,13 +825,15 @@ for (const button of document.querySelectorAll('[data-tool]')) button.onclick = 
   document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item === button));
   message('calibration-message', state.tool === 'radio-outline' ? 'Click the radio body corners in order: top left, top right, bottom right, bottom left. Stay on the shell and avoid including your hands.' : state.tool.startsWith('box') ? 'Drag a rectangle around the complete gimbal and its housing.' : state.tool.startsWith('tip') ? 'Click the centre of the visible stick tip.' : 'Click the neutral gimbal centre (where the tip would be at rest).');
 };
-function calibrationMirrored() { return state.calibrationMirrorOverride ?? state.calibration?.radio_rotation_deg === 180; }
-$('cal-mirror-horizontal').onchange = () => { state.calibrationMirrorOverride = $('cal-mirror-horizontal').checked; state.drag = null; drawRegions(); };
+function calibrationViewRotated() { return state.calibrationRotationOverride ?? state.calibration?.radio_rotation_deg === 180; }
+$('cal-rotate-180').onchange = () => { state.calibrationRotationOverride = $('cal-rotate-180').checked; state.drag = null; drawRegions(); };
 function coordinates(event) {
   const bounds = $('roi-canvas').getBoundingClientRect();
   const x = (event.clientX - bounds.left) / bounds.width * state.metadata.width;
-  return { x: Math.max(0, Math.min(state.metadata.width - 1, calibrationMirrored() ? state.metadata.width - x : x)),
-    y: Math.max(0, Math.min(state.metadata.height - 1, (event.clientY - bounds.top) / bounds.height * state.metadata.height)) };
+  const y = (event.clientY - bounds.top) / bounds.height * state.metadata.height;
+  const rotated = calibrationViewRotated();
+  return { x: Math.max(0, Math.min(state.metadata.width - 1, rotated ? state.metadata.width - x : x)),
+    y: Math.max(0, Math.min(state.metadata.height - 1, rotated ? state.metadata.height - y : y)) };
 }
 $('roi-canvas').onpointerdown = event => {
   if (!state.metadata || !state.tool || $('skip-motion').checked || $('exclude-clip').checked || activeAnalysis()) return;
@@ -849,9 +850,9 @@ $('roi-canvas').onpointerup = event => {
     if (outline.length >= 4) state.calibration.radio_outline = [];
     state.calibration.radio_outline = [...(state.calibration.radio_outline || []), [Math.round(end.x), Math.round(end.y)]];
     const count = state.calibration.radio_outline.length;
-    if (count === 4 && calibrationMirrored()) {
+    if (count === 4 && calibrationViewRotated()) {
       const points = state.calibration.radio_outline;
-      state.calibration.radio_outline = [points[1], points[0], points[3], points[2]];
+      state.calibration.radio_outline = [points[2], points[3], points[0], points[1]];
     }
     message('calibration-message', count === 4 ? 'Radio outline saved in this calibration. Check the orientation trace during the tracking preview.' : `Radio outline: ${count}/4 corners marked.`);
   } else if (kind === 'box') {
@@ -870,14 +871,14 @@ $('roi-canvas').onpointerup = event => {
 $('roi-canvas').onpointercancel = () => { state.drag = null; drawRegions(); };
 function drawRegions() {
   const canvas = $('roi-canvas'), context = canvas.getContext('2d'); context.clearRect(0, 0, canvas.width, canvas.height);
-  const mirrored = calibrationMirrored();
-  $('cal-stage').classList.toggle('cal-mirrored', mirrored); $('cal-mirror-horizontal').checked = mirrored;
+  const rotated = calibrationViewRotated();
+  $('cal-stage').classList.toggle('cal-rotated-180', rotated); $('cal-rotate-180').checked = rotated;
   context.save();
-  if (mirrored) { context.translate(canvas.width, 0); context.scale(-1, 1); }
+  if (rotated) { context.translate(canvas.width, canvas.height); context.scale(-1, -1); }
   // Geometry uses source coordinates; draw labels normally so they remain readable.
   const label = (text, x, y) => {
     context.save();
-    if (mirrored) { context.setTransform(1, 0, 0, 1, 0, 0); x = canvas.width - x - context.measureText(text).width; }
+    if (rotated) { context.setTransform(1, 0, 0, 1, 0, 0); x = canvas.width - x - context.measureText(text).width; y = canvas.height - y; }
     context.fillText(text, x, y); context.restore();
   };
   const line = Math.max(2, canvas.width / 500); context.lineWidth = line; context.font = `${Math.max(14, canvas.width / 70)}px system-ui`;
@@ -904,7 +905,7 @@ function drawRegions() {
     for (const point of outline.slice(1)) context.lineTo(point[0], point[1]);
     if (outline.length === 4) context.closePath();
     context.stroke();
-    outline.forEach(([x, y], index) => { context.beginPath(); context.arc(x, y, line * 3, 0, Math.PI * 2); context.fill(); label(String(mirrored && outline.length === 4 ? [1,0,3,2].indexOf(index) + 1 : index + 1), x + line * 3, y - line * 3); });
+    outline.forEach(([x, y], index) => { context.beginPath(); context.arc(x, y, line * 3, 0, Math.PI * 2); context.fill(); label(String(rotated && outline.length === 4 ? [2,3,0,1].indexOf(index) + 1 : index + 1), x + line * 3, y - line * 3); });
   }
   if (state.drag?.kind === 'box') { const { start, current } = state.drag; context.strokeStyle = '#fff'; context.strokeRect(start.x, start.y, current.x - start.x, current.y - start.y); }
   context.restore();
@@ -918,8 +919,9 @@ function currentCalibrationConfig() {
   delete config.exclude; delete config.skip_motion;
   if (config.radio_outline?.length === 0) delete config.radio_outline;
   if ($('exclude-clip').checked) config = { exclude: true };
-  else if ($('skip-motion').checked) config = { skip_motion: true, stickcam_mode: $('fixed-camera').checked ? 'fixed' : 'wonky' };
+  else if ($('skip-motion').checked) config = { skip_motion: true, stickcam_mode: $('stickcam-mode').value };
   else {
+    config.stickcam_mode = $('stickcam-mode').value;
     config.radio_rotation_deg = Number($('radio-rotation-deg').value); config.radio_orientation_confirmed = true;
     if (!calibrated(config)) throw new Error('Draw both regions and click both tips, or choose audio-only matching.');
     if (config.radio_outline && config.radio_outline.length !== 4) throw new Error('Mark all four radio outline corners, or click the outline tool again to start over.');
