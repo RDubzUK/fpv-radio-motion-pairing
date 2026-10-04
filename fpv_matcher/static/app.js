@@ -2138,6 +2138,34 @@ function legacyStickProgress(progress) {
   result.queue = queue;
   return result;
 }
+function stickTrackingStageText(data) {
+  if (!data) return '';
+  const seconds = key => Number.isFinite(Number(data[key])) ? Math.max(0, Number(data[key])) : 0;
+  const count = key => Number.isFinite(Number(data[key])) ? Math.max(0, Math.trunc(Number(data[key]))) : 0;
+  const showTime = value => `${value.toFixed(1)}s`;
+  const stages = [];
+  if (data.tracking_decoded_frames !== undefined)
+    stages.push(`decode ${showTime(seconds('tracking_decode_seconds'))} · ${count('tracking_decoded_frames').toLocaleString()} frames`);
+  if (data.tracking_shell_seconds !== undefined) {
+    const roi = count('tracking_outline_roi_searches'), full = count('tracking_outline_global_searches');
+    const searches = roi + full ? ` · SIFT ${showTime(seconds('tracking_outline_sift_seconds'))} / matches ${showTime(seconds('tracking_outline_match_seconds'))} / checks ${showTime(seconds('tracking_outline_validation_seconds'))}; ${roi} local / ${full} full searches` : '';
+    stages.push(`radio ${showTime(seconds('tracking_shell_seconds'))}${searches}`);
+  }
+  if (data.tracking_stick_seconds !== undefined) stages.push(`gimbals ${showTime(seconds('tracking_stick_seconds'))}`);
+  if (data.tracking_flow_calls !== undefined || data.tracking_warp_calls !== undefined || data.tracking_template_calls !== undefined) {
+    const ops = [];
+    if (count('tracking_flow_calls')) ops.push(`flow ${showTime(seconds('tracking_flow_seconds'))}`);
+    if (count('tracking_warp_calls')) ops.push(`crops ${showTime(seconds('tracking_warp_seconds'))}`);
+    if (count('tracking_template_calls')) ops.push(`tips ${showTime(seconds('tracking_template_seconds'))}`);
+    if (ops.length) stages.push(`ops: ${ops.join(', ')}`);
+  }
+  if (count('tracking_gpu_operations')) {
+    const gpu = ['tracking_cuda_flow_seconds', 'tracking_cuda_warp_seconds', 'tracking_cuda_template_seconds']
+      .reduce((sum, key) => sum + seconds(key), 0);
+    stages.push(`CUDA ${showTime(gpu)} · ${count('tracking_gpu_operations').toLocaleString()} ops / ${count('tracking_gpu_uploads').toLocaleString()} uploads`);
+  }
+  return stages.length ? `Stage time so far · ${stages.join(' · ')}` : '';
+}
 function renderStickProgress(progress, status) {
   progress = legacyStickProgress(progress);
   liveStickPreview = progress?.live_inputs || null;
@@ -2151,6 +2179,7 @@ function renderStickProgress(progress, status) {
     if (!running) { show('stick-progress-summary',false); return; }
     for (const id of ['stick-data-progress','stick-clip-progress']) $(id).removeAttribute('value');
     message('stick-batch-percent',''); message('stick-clip-percent',''); message('stick-current-name','Waiting for processing to start');
+    message('stick-tracking-stages','');
     message('stick-batch-detail','Queued · the timer starts when processing begins.');
     message('stick-batch-eta','Estimating after processing starts…'); message('stick-clip-detail',''); message('stick-clip-eta','');
     $('stick-progress-rows').replaceChildren(); return;
@@ -2164,6 +2193,7 @@ function renderStickProgress(progress, status) {
   message('stick-batch-percent',`${percent.toFixed(1)}%`); message('stick-clip-percent',`${clipPercent.toFixed(1)}%`);
   message('stick-current-name',progress.name);
   message('stick-tracking-backend',progress.clip_status === 'reusing' ? 'Reusing saved movement data · no tracking required' : progress.tracking_label || 'Waiting for tracking backend');
+  message('stick-tracking-stages',stickTrackingStageText(progress));
   const failed = (progress.clips || []).filter(row => row.status === 'failed').length;
   const reused = (progress.clips || []).filter(row => row.reused).length;
   message('stick-batch-detail',`${progress.completed}/${progress.total} videos finished · ${reused} reused${failed ? ` · ${failed} failed` : ''}${Number.isFinite(progress.batch_elapsed_seconds) ? ` · ${time(progress.batch_elapsed_seconds + age)} elapsed` : ''}`);
@@ -2236,7 +2266,19 @@ async function refreshStickData(force = false) {
 function renderStickPreparationLog(result) {
   const list = $('stick-data-log'); list.replaceChildren();
   const rows = result.clips || result.progress?.clips || [];
-  for (const row of rows) list.append(el('div', `${row.name} · ${row.status === 'cached' ? row.reused ? `Reused saved movement data · ${Number(row.elapsed_seconds || 0).toFixed(2)}s cache lookup` : `Derived & saved · ${Number(row.extraction_seconds ?? row.elapsed_seconds ?? 0).toFixed(2)}s extraction` : `${row.message || row.status}${row.elapsed_seconds !== undefined ? ` · ${Number(row.elapsed_seconds).toFixed(2)}s elapsed` : ''}`}${row.tracking_label ? ` · ${row.tracking_label}` : ''}${row.sample_fps ? ` · ${row.sample_fps} Hz` : ''}${row.samples !== undefined ? ` · ${row.samples.toLocaleString()} samples` : ''}${row.current_cache && row.current_cache.status !== 'cached' ? ' · current settings now require fresh derivation' : ''}`));
+  for (const row of rows) {
+    const details = [row.name, row.status === 'cached'
+      ? row.reused ? `Reused saved movement data · ${Number(row.elapsed_seconds || 0).toFixed(2)}s cache lookup`
+        : `Derived & saved · ${Number(row.extraction_seconds ?? row.elapsed_seconds ?? 0).toFixed(2)}s extraction`
+      : `${row.message || row.status}${row.elapsed_seconds !== undefined ? ` · ${Number(row.elapsed_seconds).toFixed(2)}s elapsed` : ''}`];
+    if (row.tracking_label) details.push(row.tracking_label);
+    if (row.sample_fps) details.push(`${row.sample_fps} Hz`);
+    if (row.samples !== undefined) details.push(`${row.samples.toLocaleString()} samples`);
+    if (row.current_cache && row.current_cache.status !== 'cached') details.push('current settings now require fresh derivation');
+    const stages = stickTrackingStageText(row);
+    if (stages) details.push(stages);
+    list.append(el('div', details.join(' · ')));
+  }
   const current = result.progress;
   if (current?.name && current.elapsed_seconds !== undefined && !rows.some(row => row.name === current.name))
     list.append(el('div', `${current.name} · extracting · ${Number(current.elapsed_seconds).toFixed(2)}s elapsed at ${current.sample_fps || result.sample_fps || 'current'} Hz`));

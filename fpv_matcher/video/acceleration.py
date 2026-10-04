@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from collections import OrderedDict
 from functools import lru_cache
 
@@ -49,6 +50,34 @@ class TrackingBackend:
         self.reason = "CPU selected" if self.mode == "cpu" else info.get("reason", "")
         self.device = info.get("device", "")
         self.calls = 0
+        self.metrics = {
+            "tracking_gpu_upload_seconds": 0.0,
+            "tracking_gpu_uploads": 0,
+            "tracking_flow_seconds": 0.0,
+            "tracking_flow_calls": 0,
+            "tracking_cuda_flow_seconds": 0.0,
+            "tracking_cpu_flow_seconds": 0.0,
+            "tracking_warp_seconds": 0.0,
+            "tracking_warp_calls": 0,
+            "tracking_cuda_warp_seconds": 0.0,
+            "tracking_cpu_warp_seconds": 0.0,
+            "tracking_template_seconds": 0.0,
+            "tracking_template_calls": 0,
+            "tracking_cuda_template_seconds": 0.0,
+            "tracking_cpu_template_seconds": 0.0,
+            "tracking_decode_seconds": 0.0,
+            "tracking_decoded_frames": 0,
+            "tracking_shell_seconds": 0.0,
+            "tracking_stick_seconds": 0.0,
+            "tracking_outline_roi_searches": 0,
+            "tracking_outline_global_searches": 0,
+            "tracking_outline_roi_successes": 0,
+            "tracking_outline_global_successes": 0,
+            "tracking_outline_sift_seconds": 0.0,
+            "tracking_outline_match_seconds": 0.0,
+            "tracking_outline_validation_seconds": 0.0,
+            "tracking_outline_reacquire_seconds": 0.0,
+        }
         self.frames = OrderedDict()
         self.lk = self.matcher = None
         if self.mode == "cuda" and not self.cuda:
@@ -81,44 +110,87 @@ class TrackingBackend:
             self.frames.move_to_end(id(frame))
             return pair[1]
         gpu = cv2.cuda_GpuMat()
+        started = time.perf_counter()
         gpu.upload(np.ascontiguousarray(frame))
+        self.record("tracking_gpu_upload_seconds", time.perf_counter() - started)
+        self.record("tracking_gpu_uploads")
         return self._remember(frame, gpu)
 
+    def record(self, metric, amount=1.0):
+        """Accumulate small, per-clip diagnostics without logging each frame."""
+        if metric in self.metrics:
+            self.metrics[metric] += amount
+
     def flow(self, previous, current, points, _unused=None, winSize=(25, 25), maxLevel=3):
-        if self.cuda:
-            try:
-                p = cv2.cuda_GpuMat()
-                p.upload(np.asarray(points, np.float32).reshape(1, -1, 2))
-                moved, status, error = self.lk.calc(self._gpu(previous), self._gpu(current), p, None,
-                                                   status=cv2.cuda_GpuMat(), err=cv2.cuda_GpuMat())
-                self.calls += 1
-                return moved.download().reshape(-1, 1, 2), status.download().reshape(-1, 1), error.download().reshape(-1, 1)
-            except cv2.error as exc:
-                self._fallback(exc)
-        return cv2.calcOpticalFlowPyrLK(previous, current, points, None, winSize=winSize, maxLevel=maxLevel)
+        started = time.perf_counter()
+        self.record("tracking_flow_calls")
+        try:
+            if self.cuda:
+                gpu_started = time.perf_counter()
+                try:
+                    p = cv2.cuda_GpuMat()
+                    upload_started = time.perf_counter()
+                    p.upload(np.asarray(points, np.float32).reshape(1, -1, 2))
+                    self.record("tracking_gpu_upload_seconds", time.perf_counter() - upload_started)
+                    self.record("tracking_gpu_uploads")
+                    moved, status, error = self.lk.calc(self._gpu(previous), self._gpu(current), p, None,
+                                                       status=cv2.cuda_GpuMat(), err=cv2.cuda_GpuMat())
+                    self.calls += 1
+                    result = (moved.download().reshape(-1, 1, 2), status.download().reshape(-1, 1),
+                              error.download().reshape(-1, 1))
+                    self.record("tracking_cuda_flow_seconds", time.perf_counter() - gpu_started)
+                    return result
+                except cv2.error as exc:
+                    self._fallback(exc)
+            cpu_started = time.perf_counter()
+            result = cv2.calcOpticalFlowPyrLK(previous, current, points, None, winSize=winSize, maxLevel=maxLevel)
+            self.record("tracking_cpu_flow_seconds", time.perf_counter() - cpu_started)
+            return result
+        finally:
+            self.record("tracking_flow_seconds", time.perf_counter() - started)
 
     def warp(self, frame, transform, size, flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderValue=127):
-        if self.cuda:
-            try:
-                gpu = cv2.cuda.warpPerspective(self._gpu(frame), transform, size, flags=flags,
-                                               borderMode=cv2.BORDER_CONSTANT, borderValue=borderValue)
-                crop = gpu.download()
-                self._remember(crop, gpu)
-                self.calls += 1
-                return crop
-            except cv2.error as exc:
-                self._fallback(exc)
-        return cv2.warpPerspective(frame, transform, size, flags=flags, borderValue=borderValue)
+        started = time.perf_counter()
+        self.record("tracking_warp_calls")
+        try:
+            if self.cuda:
+                gpu_started = time.perf_counter()
+                try:
+                    gpu = cv2.cuda.warpPerspective(self._gpu(frame), transform, size, flags=flags,
+                                                   borderMode=cv2.BORDER_CONSTANT, borderValue=borderValue)
+                    crop = gpu.download()
+                    self._remember(crop, gpu)
+                    self.calls += 1
+                    self.record("tracking_cuda_warp_seconds", time.perf_counter() - gpu_started)
+                    return crop
+                except cv2.error as exc:
+                    self._fallback(exc)
+            cpu_started = time.perf_counter()
+            result = cv2.warpPerspective(frame, transform, size, flags=flags, borderValue=borderValue)
+            self.record("tracking_cpu_warp_seconds", time.perf_counter() - cpu_started)
+            return result
+        finally:
+            self.record("tracking_warp_seconds", time.perf_counter() - started)
 
     def match(self, crop, template):
-        if self.cuda:
-            try:
-                result = self.matcher.match(self._gpu(crop), self._gpu(template)).download()
-                self.calls += 1
-                return result
-            except cv2.error as exc:
-                self._fallback(exc)
-        return cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+        started = time.perf_counter()
+        self.record("tracking_template_calls")
+        try:
+            if self.cuda:
+                gpu_started = time.perf_counter()
+                try:
+                    result = self.matcher.match(self._gpu(crop), self._gpu(template)).download()
+                    self.calls += 1
+                    self.record("tracking_cuda_template_seconds", time.perf_counter() - gpu_started)
+                    return result
+                except cv2.error as exc:
+                    self._fallback(exc)
+            cpu_started = time.perf_counter()
+            result = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+            self.record("tracking_cpu_template_seconds", time.perf_counter() - cpu_started)
+            return result
+        finally:
+            self.record("tracking_template_seconds", time.perf_counter() - started)
 
     def status(self):
         backend = "cuda" if self.cuda else "cpu"
@@ -126,7 +198,9 @@ class TrackingBackend:
         if not self.cuda and self.calls:
             backend = "cuda_then_cpu"
         return {"tracking_backend": backend, "tracking_label": label,
-                "tracking_gpu_operations": self.calls, "tracking_fallback": self.reason}
+                "tracking_gpu_operations": self.calls, "tracking_fallback": self.reason,
+                **{key: round(value, 3) if key.endswith("_seconds") else int(value)
+                   for key, value in self.metrics.items()}}
 
     def metadata(self):
         return {key: np.asarray(value) for key, value in self.status().items()}

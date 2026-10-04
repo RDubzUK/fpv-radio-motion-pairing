@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import time
 
 
 class RadioOutlineTracker:
@@ -24,6 +25,7 @@ class RadioOutlineTracker:
         self.detector = cv2.SIFT_create(nfeatures=1200, contrastThreshold=0.025)
         self.anchor_interval = max(1, round(float(sample_fps) * 0.75))
         self.retry_interval = max(1, round(float(sample_fps) * 0.3))
+        self.global_interval = max(1, round(float(sample_fps) * 2.0))
         self.index = 0
         self.reason = "not initialized"
 
@@ -131,6 +133,13 @@ class RadioOutlineTracker:
         return None, 0.0
 
     def _accept(self, transform, source, target, inliers, frame, method):
+        started = time.perf_counter()
+        try:
+            return self._accept_candidate(transform, source, target, inliers, frame, method)
+        finally:
+            self.backend.record("tracking_outline_validation_seconds", time.perf_counter() - started)
+
+    def _accept_candidate(self, transform, source, target, inliers, frame, method):
         if transform is None or inliers is None or not self._geometry(transform, frame):
             return None
         selected = inliers.ravel().astype(bool)
@@ -151,34 +160,77 @@ class RadioOutlineTracker:
         self.quality, self.reason = float(quality), method
         return self.transform.copy(), self.quality
 
-    def _reacquire(self, frame):
+    def _search_region(self, frame, full_frame):
+        height, width = frame.shape[:2]
+        if full_frame:
+            return frame, 0, 0, True
+        try:
+            moved = cv2.perspectiveTransform(self.outline[None], self.transform)[0]
+            if not np.isfinite(moved).all():
+                raise ValueError("invalid projected radio outline")
+            low, high = moved.min(axis=0), moved.max(axis=0)
+            span = high - low
+            # Search a generous neighborhood around the last accepted pose.
+            # Large/uncertain crops automatically fall back to a full-frame search.
+            pad = np.maximum(48, span * 1.0)
+            x1, y1 = np.floor(low - pad).astype(int)
+            x2, y2 = np.ceil(high + pad).astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 - x1 < 64 or y2 - y1 < 64 or (x2 - x1) * (y2 - y1) >= width * height * .7:
+                raise ValueError("radio search region is too large or too small")
+            return frame[y1:y2, x1:x2], x1, y1, False
+        except (ValueError, cv2.error, OverflowError):
+            return frame, 0, 0, True
+
+    def _reacquire(self, frame, full_frame=False):
         if self.descriptors is None or len(self.descriptors) < 8:
             return None
-        keys, descriptors = self.detector.detectAndCompute(frame, None)
-        if descriptors is None or len(descriptors) < 8:
-            return None
-        matcher = cv2.BFMatcher()
-        reverse = {pair[0].queryIdx: pair[0].trainIdx
-                   for pair in matcher.knnMatch(descriptors, self.descriptors, k=2)
-                   if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance}
-        matches = [pair[0] for pair in matcher.knnMatch(self.descriptors, descriptors, k=2)
-                   if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance
-                   and reverse.get(pair[0].trainIdx) == pair[0].queryIdx]
-        if len(matches) < 8:
-            return None
-        source = np.float32([self.keys[match.queryIdx].pt for match in matches])
-        target = np.float32([keys[match.trainIdx].pt for match in matches])
-        transform, inliers = cv2.findHomography(source, target, cv2.RANSAC, 2.5)
-        return self._accept(transform, source, target, inliers, frame, "reference reacquired")
+        started = time.perf_counter()
+        search, offset_x, offset_y, global_search = self._search_region(frame, full_frame)
+        kind = "global" if global_search else "roi"
+        self.backend.record(f"tracking_outline_{kind}_searches")
+        try:
+            sift_started = time.perf_counter()
+            try:
+                keys, descriptors = self.detector.detectAndCompute(search, None)
+            finally:
+                self.backend.record("tracking_outline_sift_seconds", time.perf_counter() - sift_started)
+            if descriptors is None or len(descriptors) < 8:
+                return None
+            match_started = time.perf_counter()
+            try:
+                matcher = cv2.BFMatcher()
+                reverse = {pair[0].queryIdx: pair[0].trainIdx
+                           for pair in matcher.knnMatch(descriptors, self.descriptors, k=2)
+                           if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance}
+                matches = [pair[0] for pair in matcher.knnMatch(self.descriptors, descriptors, k=2)
+                           if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance
+                           and reverse.get(pair[0].trainIdx) == pair[0].queryIdx]
+                if len(matches) < 8:
+                    return None
+                source = np.float32([self.keys[match.queryIdx].pt for match in matches])
+                target = np.float32([keys[match.trainIdx].pt for match in matches])
+                target += np.array([offset_x, offset_y], np.float32)
+                transform, inliers = cv2.findHomography(source, target, cv2.RANSAC, 2.5)
+            finally:
+                self.backend.record("tracking_outline_match_seconds", time.perf_counter() - match_started)
+            accepted = self._accept(transform, source, target, inliers, frame, "reference reacquired")
+            if accepted is not None:
+                self.backend.record(f"tracking_outline_{kind}_successes")
+            return accepted
+        finally:
+            self.backend.record("tracking_outline_reacquire_seconds", time.perf_counter() - started)
 
     def update(self, previous, current):
         self.index += 1
         # Sparse absolute anchors complement cheaper flow. Failure to find an
         # anchor never promotes arbitrary current-frame features to references.
-        if self.index % self.anchor_interval == 0 or (
-            self.points is None and self.index % self.retry_interval == 0
-        ):
-            anchored = self._reacquire(current)
+        full_frame_due = self.index % self.global_interval == 0
+        local_due = (self.index % self.retry_interval == 0 if self.points is None
+                     else self.index % self.anchor_interval == 0)
+        if full_frame_due or local_due:
+            anchored = self._reacquire(current, full_frame=full_frame_due)
             if anchored is not None:
                 return anchored
         if self.points is None or len(self.points) < 8:

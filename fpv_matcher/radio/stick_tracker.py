@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -341,16 +342,27 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
         else None
     )
     previous = None
-    frames = _frames if _frames is not None else sampled_frames(path, sample_fps, MAX_DIMENSION, start=reference_time, duration=duration)
-    for timestamp, frame in frames:
+    frames = iter(_frames if _frames is not None else
+                  sampled_frames(path, sample_fps, MAX_DIMENSION, start=reference_time, duration=duration))
+    while True:
+        decode_started = time.perf_counter()
+        try:
+            timestamp, frame = next(frames)
+        except StopIteration:
+            break
+        backend.record("tracking_decode_seconds", time.perf_counter() - decode_started)
+        backend.record("tracking_decoded_frames")
+        shell_started = time.perf_counter()
         if outline_tracker is None:
             body_transform, body_quality = None, 0.0
         elif previous is None:
             body_transform, body_quality = outline_tracker.initialize(frame)
         else:
             body_transform, body_quality = outline_tracker.update(previous, frame)
+        backend.record("tracking_shell_seconds", time.perf_counter() - shell_started)
         if body_quality < 0.35:
             body_transform = None
+        stick_started = time.perf_counter()
         if previous is not None and outline_tracker is not None and body_transform is None:
             detected = [tracker.gap("radio face unobserved") for tracker in trackers]
         else:
@@ -364,6 +376,7 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
             # A known shell loss must not silently switch to gimbal/background
             # features and report apparently observed controls.
             detected = [tracker.gap("radio face unobserved") for tracker in trackers]
+        backend.record("tracking_stick_seconds", time.perf_counter() - stick_started)
         left, right = detected
         # Crops are expressed in the calibration frame's axes. Relative shell
         # tracking handles later movement; an inverted reference reverses both

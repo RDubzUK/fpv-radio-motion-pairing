@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>FPV ↔ StickCam Matcher</title>
   <link rel="stylesheet" href="/static/style.css?v=24">
-  <script type="module" src="/static/app.js?v=49"></script>
+  <script type="module" src="/static/app.js?v=50"></script>
 </head>
 <body>
 <main>
@@ -86,7 +86,7 @@
       <div class="actions"><button id="derive-sticks">Derive all calibrated StickCam videos</button><button id="derive-sticks-cancel" class="secondary hidden">Cancel derivation</button><button id="stick-data-refresh" class="secondary">Refresh cache status</button></div>
       <div id="stick-progress-summary" class="stick-progress-summary hidden" aria-label="StickCam derivation progress">
         <section class="stick-progress-card"><h4>Whole batch <span id="stick-batch-percent" class="badge"></span></h4><progress id="stick-data-progress" max="100" aria-label="Whole batch progress"></progress><p id="stick-batch-detail" class="hint" role="status"></p><p id="stick-batch-eta" class="hint"></p></section>
-        <section class="stick-progress-card"><h4>Current video <span id="stick-clip-percent" class="badge"></span></h4><p id="stick-current-name" class="stick-current-name"></p><progress id="stick-clip-progress" max="100" aria-label="Current video progress"></progress><p id="stick-clip-detail" class="hint" role="status"></p><p id="stick-tracking-backend" class="hint"></p><p id="stick-clip-eta" class="hint"></p></section>
+        <section class="stick-progress-card"><h4>Current video <span id="stick-clip-percent" class="badge"></span></h4><p id="stick-current-name" class="stick-current-name"></p><progress id="stick-clip-progress" max="100" aria-label="Current video progress"></progress><p id="stick-clip-detail" class="hint" role="status"></p><p id="stick-tracking-backend" class="hint"></p><p id="stick-tracking-stages" class="hint" role="status"></p><p id="stick-clip-eta" class="hint"></p></section>
         <p id="stick-estimate-note" class="hint stick-estimate-note">Estimates use observed processing speed and update as work progresses. Cached recordings are reused.</p>
         <section id="stick-live-preview" class="hidden" aria-label="Live derived StickCam inputs"><h4>Inputs as they are derived</h4><p id="stick-live-detail" class="hint" role="status"></p><canvas id="stick-live-canvas" aria-label="Recent throttle, yaw, pitch and roll input observations"></canvas><p class="hint">Recent normalized stick inputs (−1 to +1), before flight-controller rates. Gaps mean an input was not observed. This preview is provisional; the full recording is saved after extraction completes. Backward tracking before the reference frame is shown in chronological order.</p></section>
         <details class="stick-progress-videos"><summary>Progress by video</summary><div class="tablewrap stick-derivation-queue"><table><thead><tr><th>StickCam video</th><th>State</th><th>Progress</th><th>Time to process / remaining</th></tr></thead><tbody id="stick-progress-rows"></tbody></table></div></details>
