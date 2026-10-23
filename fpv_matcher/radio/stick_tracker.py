@@ -61,6 +61,8 @@ class GimbalTracker:
         self.transform = np.eye(3, dtype=np.float32)
         self.points, self.template, self.reference, self.last_tip = None, None, None, None
         self.last_quality = 0.0
+        self.housing_quality = 0.0
+        self.match_score = self.match_margin = 0.0
         self.locked = True
         self.lost_frames = 0
         self.tip_lost_frames = 0
@@ -251,7 +253,9 @@ class GimbalTracker:
         return self.detect(current, housing_quality)
 
     def detect(self, frame, housing_quality, body_transform=None, body_quality=1.0):
-        if housing_quality < .35 or not self._visible(frame):
+        self.match_score = self.match_margin = 0.0
+        self.housing_quality = float(housing_quality) if self._visible(frame) else 0.0
+        if self.housing_quality < .35:
             return self.gap("housing unobserved or outside frame")
         if self.template is None or float(self.template.std()) < 6:
             # An unspecified/flat tip cannot be inferred from a dark housing
@@ -274,6 +278,7 @@ class GimbalTracker:
         exclusion = max(3, min(self.template.shape) * 1.2)
         alternatives[(xx - location[0]) ** 2 + (yy - location[1]) ** 2 < exclusion ** 2] = -1
         alternative = float(cv2.minMaxLoc(alternatives)[1])
+        self.match_score, self.match_margin = float(score), float(score - alternative)
         # Reacquiring an occluded cap requires stronger independent appearance.
         minimum = .76 if self.tip_lost_frames else .70
         margin = .08 if self.tip_lost_frames else .06
@@ -301,6 +306,41 @@ class GimbalTracker:
         x, y = np.clip(normalized, -1, 1)
         return float(x), float(y), quality
 
+    def apply_landmark(self, frame, pixel):
+        """Use a marked source-frame tip only with an observed gimbal pose.
+
+        Re-anchor the appearance for subsequent frames. A moving tip cannot
+        establish the radio's position or orientation when housing is lost.
+        """
+        self.landmark_reason = "radio/gimbal pose unobserved"
+        if self.housing_quality < .35 or not self._visible(frame):
+            return None
+        try:
+            inverse = np.linalg.inv(self.transform)
+            position = cv2.perspectiveTransform(np.float32(pixel).reshape(1, 1, 2), inverse)[0, 0]
+            position = position - np.array([self.x, self.y])
+        except (np.linalg.LinAlgError, cv2.error):
+            return None
+        normalized = (position - [self.spec["center_x"], self.spec["center_y"]]) / [self.spec["travel_x"], self.spec["travel_y"]]
+        if (not np.isfinite(position).all() or not np.isfinite(normalized).all()
+                or not 0 <= position[0] < self.width or not 0 <= position[1] < self.height
+                or (np.abs(normalized) > 1.08).any()):
+            self.landmark_reason = "marked tip outside its calibrated gimbal travel"
+            return None
+        crop = self._crop(frame)
+        radius = max(3, round(self.spec["tip_radius"]))
+        tx, ty = np.rint(position).astype(int)
+        self.template = None
+        if radius <= tx < self.width - radius and radius <= ty < self.height - radius:
+            candidate = crop[ty - radius:ty + radius + 1, tx - radius:tx + radius + 1].copy()
+            if candidate.size and float(candidate.std()) >= 6:
+                self.template = candidate
+        self.last_tip, self.last_quality = position.copy(), min(1., self.housing_quality)
+        self.tip_lost_frames = 0
+        self.landmark_reason = self.reason = "user tip landmark"
+        x, y = np.clip(normalized, -1, 1)
+        return float(x), float(y), self.last_quality
+
     def annotate(self, frame):
         color = (60, 240, 120) if self.last_quality > 0.4 else (70, 90, 255)
         corners = np.array(
@@ -321,7 +361,7 @@ class GimbalTracker:
             cv2.circle(frame, tuple(location), 6, color, 2)
 
 
-def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | None = None, _frames=None, backend=None):
+def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | None = None, _frames=None, backend=None, _reverse=False):
     backend = backend or TrackingBackend()
     info = probe_video(path)
     config = validate_calibration(config, (info["width"], info["height"]))
@@ -329,21 +369,36 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
     if reference_time >= info["duration"]:
         raise ValueError("Calibration frame is past the end of the recording")
     scale = min(1.0, MAX_DIMENSION / max(info["width"], info["height"]))
-    scaled = scaled_config(config, scale)
-    trackers = [
-        GimbalTracker(scaled[side], scaled["stickcam_mode"] == "wonky", backend)
-        for side in ("left_gimbal", "right_gimbal")
-    ]
-    outline_tracker = (
-        RadioOutlineTracker(
-            scaled["radio_outline"], [scaled[side] for side in ("left_gimbal", "right_gimbal")], sample_fps, backend
-        )
-        if "radio_outline" in scaled
-        else None
-    )
+    active_config = config
+    def make_trackers(calibration):
+        scaled = scaled_config(calibration, scale)
+        sticks = [GimbalTracker(scaled[side], scaled["stickcam_mode"] == "wonky", backend)
+                  for side in ("left_gimbal", "right_gimbal")]
+        shell = (RadioOutlineTracker(scaled["radio_outline"],
+                 [scaled[side] for side in ("left_gimbal", "right_gimbal")], sample_fps, backend)
+                 if "radio_outline" in scaled else None)
+        return sticks, shell
+    trackers, outline_tracker = make_trackers(active_config)
     previous = None
     frames = iter(_frames if _frames is not None else
                   sampled_frames(path, sample_fps, MAX_DIMENSION, start=reference_time, duration=duration))
+    from fpv_matcher.radio.landmarks import landmark_frames, validate_landmarks
+    landmarks = validate_landmarks(config.get("tracking_landmarks", []), info["duration"], (info["width"], info["height"]))
+    upper = min(info["duration"], reference_time + duration) if duration is not None else info["duration"]
+    selected = [point for point in landmarks if
+                (point["time"] <= reference_time if _reverse else reference_time <= point["time"] < upper)]
+    landmark_at = {point["time"]: point for point in selected}
+    if selected:
+        def decode_landmark(at):
+            decoder = sampled_frames(path, sample_fps, MAX_DIMENSION, start=at, duration=1 / sample_fps)
+            try:
+                result = next(decoder, None)
+                if result is None:
+                    raise ValueError(f"Could not decode tracking landmark at {at:.4f}s")
+                return result[1]
+            finally:
+                decoder.close()
+        frames = landmark_frames(frames, selected, decode_landmark, reverse=_reverse)
     while True:
         decode_started = time.perf_counter()
         try:
@@ -352,6 +407,16 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
             break
         backend.record("tracking_decode_seconds", time.perf_counter() - decode_started)
         backend.record("tracking_decoded_frames")
+        point = landmark_at.get(round(timestamp, 4))
+        if point and abs(point["time"] - timestamp) > 1e-6:
+            point = None
+        snapshot = point.get("calibration") if point else None
+        if snapshot:
+            active_config = {**config, **snapshot}
+            if "radio_outline" not in snapshot:
+                active_config.pop("radio_outline", None)
+            trackers, outline_tracker = make_trackers(active_config)
+            previous = None
         shell_started = time.perf_counter()
         if outline_tracker is None:
             body_transform, body_quality = None, 0.0
@@ -359,6 +424,13 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
             body_transform, body_quality = outline_tracker.initialize(frame)
         else:
             body_transform, body_quality = outline_tracker.update(previous, frame)
+        if snapshot and outline_tracker is not None:
+            # A reviewed full-frame calibration observes this pose directly.
+            # Subsequent frames still require independent optical tracking.
+            outline_tracker.transform = np.eye(3, dtype=np.float32)
+            outline_tracker.quality = body_quality = 1.
+            outline_tracker.reason = "user calibration landmark"
+            body_transform = outline_tracker.transform.copy()
         backend.record("tracking_shell_seconds", time.perf_counter() - shell_started)
         if body_quality < 0.35:
             body_transform = None
@@ -376,21 +448,46 @@ def iter_sticks(path: str, sample_fps: float, config: dict, duration: float | No
             # A known shell loss must not silently switch to gimbal/background
             # features and report apparently observed controls.
             detected = [tracker.gap("radio face unobserved") for tracker in trackers]
+            for tracker in trackers:
+                tracker.housing_quality = 0.0
+                tracker.match_score = tracker.match_margin = 0.0
+        flags = {"left_tip_landmark": 0., "right_tip_landmark": 0., "frame_calibration_landmark": float(bool(snapshot))} if landmarks else {}
+        if point:
+            for index, side in enumerate(("left_tip", "right_tip")):
+                if side not in point and not snapshot:
+                    continue
+                if side in point:
+                    pixel = np.asarray(point[side]) * np.array([frame.shape[1], frame.shape[0]])
+                else:
+                    spec = snapshot[("left_gimbal", "right_gimbal")[index]]
+                    pixel = np.array([spec["x"] + spec["tip_x"], spec["y"] + spec["tip_y"]]) * scale
+                anchored = trackers[index].apply_landmark(frame, pixel)
+                flags[side + "_landmark"] = 1. if anchored is not None else -1.
+                if anchored is not None:
+                    detected[index] = anchored
         backend.record("tracking_stick_seconds", time.perf_counter() - stick_started)
         left, right = detected
         # Crops are expressed in the calibration frame's axes. Relative shell
         # tracking handles later movement; an inverted reference reverses both
         # directions. Physical left/right gimbal labels are kept separately.
-        if config.get("radio_rotation_deg", 0) == 180:
+        if active_config.get("radio_rotation_deg", 0) == 180:
             left, right = (-left[0], -left[1], left[2]), (-right[0], -right[1], right[2])
         from fpv_matcher.radio.modes import assigned_inputs
-        values = {**assigned_inputs(left, right, config["stick_mode"]), "quality": (left[2] + right[2]) / 2}
+        values = {**assigned_inputs(left, right, config["stick_mode"]), "quality": (left[2] + right[2]) / 2, **flags}
         if outline_tracker is not None:
             values["radio_orientation_deg"] = outline_tracker.orientation()
             values["radio_orientation_quality"] = outline_tracker.quality
             trackers_with_outline = [*trackers, outline_tracker]
         else:
             trackers_with_outline = trackers
+            values["radio_orientation_deg"] = values["radio_orientation_quality"] = 0.
+        from fpv_matcher.radio.tracking_review import geometry_values
+        values.update(geometry_values(trackers, scale))
+        values["radio_reference_rotation_deg"] = float(active_config.get("radio_rotation_deg", 0))
+        corners = (cv2.perspectiveTransform(outline_tracker.outline[None], outline_tracker.transform)[0] / scale
+                   if outline_tracker is not None else np.zeros((4, 2)))
+        for index, position in enumerate(np.nan_to_num(corners, nan=0., posinf=0., neginf=0.)):
+            values[f"outline_{index}_x"], values[f"outline_{index}_y"] = position
         for axis in ("roll", "pitch", "yaw", "throttle"):
             values[axis] *= config["signs"][axis]
         yield timestamp, values, frame, trackers_with_outline
@@ -402,7 +499,7 @@ def iter_all_sticks(path, sample_fps, config, backend=None):
     yield from iter_sticks(path, sample_fps, config, backend=backend)
     if config.get("reference_time", 0) > 0:
         frames = reverse_sampled_frames(path, sample_fps, MAX_DIMENSION, config["reference_time"])
-        backwards = iter_sticks(path, sample_fps, config, _frames=frames, backend=backend)
+        backwards = iter_sticks(path, sample_fps, config, _frames=frames, backend=backend, _reverse=True)
         # Initialize at the same calibrated frame; it was already emitted by the forward pass.
         next(backwards, None)
         yield from backwards
@@ -421,8 +518,11 @@ def extract_sticks(path: str, sample_fps: float, config: dict, progress=None) ->
         "throttle_quality",
         "quality",
     )
-    if "radio_outline" in config:
-        keys += ("radio_orientation_deg", "radio_orientation_quality")
+    from fpv_matcher.radio.tracking_review import GEOMETRY_KEYS
+    keys += ("radio_orientation_deg", "radio_orientation_quality", "radio_reference_rotation_deg", *GEOMETRY_KEYS,
+             *(f"outline_{corner}_{axis}" for corner in range(4) for axis in ("x", "y")))
+    if config.get("tracking_landmarks"):
+        keys += ("left_tip_landmark", "right_tip_landmark", "frame_calibration_landmark")
     from fpv_matcher.progress import ExtractionProgress
     backend = TrackingBackend()
     from fpv_matcher.radio.live import LiveStickInputs

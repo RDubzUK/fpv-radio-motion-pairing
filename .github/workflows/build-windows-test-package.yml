@@ -1,0 +1,54 @@
+name: Windows portable test package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2025
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.1.0
+
+      - name: Set up Rust for the vendored telemetry parser
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install locked project dependencies
+        run: uv sync --frozen --python 3.11
+
+      - name: Install Windows bundler
+        run: uv pip install --python .venv\Scripts\python.exe "pyinstaller==6.22.3"
+
+      - name: Build portable application folder
+        run: .venv\Scripts\python.exe -m PyInstaller --clean --noconfirm tools\windows.spec
+
+      - name: Add launch instructions
+        shell: pwsh
+        run: |
+          Copy-Item packaging\windows\README.txt "dist\FPV Matcher\README.txt"
+          Copy-Item packaging\windows\Start-FPV-Matcher.bat "dist\FPV Matcher\Start-FPV-Matcher.bat"
+          Copy-Item packaging\windows\Start-FPV-Matcher-LAN.bat "dist\FPV Matcher\Start-FPV-Matcher-LAN.bat"
+
+      - name: Create shareable zip
+        shell: pwsh
+        run: Compress-Archive -Path "dist\FPV Matcher\*" -DestinationPath "dist\FPV-Matcher-Windows-x64.zip" -CompressionLevel Optimal
+
+      - name: Upload portable test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: FPV-Matcher-Windows-x64
+          path: dist/FPV-Matcher-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30

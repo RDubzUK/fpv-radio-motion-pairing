@@ -29,4 +29,4 @@ where = ["."]
 include = ["fpv_matcher*"]
 
 [tool.setuptools.package-data]
-fpv_matcher = ["static/*.html", "static/*.css", "static/*.js"]
+fpv_matcher = ["static/*.html", "static/*.css", "static/*.js", "static/brand/*", "static/brand/fonts/*"]

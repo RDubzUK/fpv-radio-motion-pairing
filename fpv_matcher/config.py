@@ -28,6 +28,18 @@ def validate_calibration(config: dict, dimensions: tuple[int, int] | None = None
     result["reference_time"] = finite(result.get("reference_time", 0), "Reference time")
     if result["reference_time"] < 0:
         raise ValueError("Reference time must be non-negative")
+    if "tracking_landmarks" in result:
+        from fpv_matcher.radio.landmarks import validate_landmarks
+        landmarks = validate_landmarks(result["tracking_landmarks"], dimensions=dimensions)
+        if landmarks:
+            result["tracking_landmarks"] = landmarks
+        else:
+            result.pop("tracking_landmarks")
+    if "capture_tracking_geometry" in result:
+        if not isinstance(result["capture_tracking_geometry"], bool):
+            raise ValueError("Tracking geometry capture must be true or false")
+        if not result["capture_tracking_geometry"]:
+            result.pop("capture_tracking_geometry")
     for side in ("left_gimbal", "right_gimbal"):
         spec = result.get(side)
         if not isinstance(spec, dict):

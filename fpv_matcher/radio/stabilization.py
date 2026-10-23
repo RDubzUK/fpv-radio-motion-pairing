@@ -1,10 +1,9 @@
 """Radio review poses. Outline observations anchor camera gyro gap prediction."""
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
-from fpv_matcher.radio.stick_tracker import MAX_DIMENSION, iter_all_sticks
+from fpv_matcher.radio.stick_tracker import iter_all_sticks
 from fpv_matcher.video.metadata import probe_video
 
 VERSION = "radio-review-perspective-valid-gaps-v2"
@@ -20,15 +19,9 @@ def extract_review_sticks(path, sample_fps, calibration, progress=None):
     live = LiveStickInputs(sample_fps)
     callback = (lambda event: progress({**event, **backend.status(), "live_inputs": live.snapshot()})) if progress else None
     reporter = ExtractionProgress(info["duration"], 0, callback)
-    scale = min(1, MAX_DIMENSION / max(info["width"], info["height"]))
-    for timestamp, values, _, trackers in iter_all_sticks(path, sample_fps, calibration, backend):
+    for timestamp, values, _, _ in iter_all_sticks(path, sample_fps, calibration, backend):
         live.append(timestamp, values)
         row = {"time": timestamp, **values}
-        if "radio_outline" in calibration:
-            tracker = trackers[-1]
-            corners = cv2.perspectiveTransform(tracker.outline[None], tracker.transform)[0] / scale
-            for i, point in enumerate(corners):
-                row[f"outline_{i}_x"], row[f"outline_{i}_y"] = point
         reporter.update(len(rows) / sample_fps)
         rows.append(row)
     if not rows:
@@ -47,7 +40,10 @@ def review_poses(data, gyro=None):
         return [], "Mark and save the radio outline to enable the centred preview."
     times = data["time"]
     corners = np.asarray([np.column_stack((data[f"outline_{i}_x"], data[f"outline_{i}_y"])) for i in range(4)]).transpose(1, 0, 2)
-    if float(data.get("radio_reference_rotation", 0)) == 180:
+    if "radio_reference_rotation_deg" in data:
+        inverted = np.asarray(data["radio_reference_rotation_deg"]) == 180
+        corners[inverted] = np.roll(corners[inverted], 2, axis=1)
+    elif float(data.get("radio_reference_rotation", 0)) == 180:
         # Pose consumers level the edge from corner 0 to 1. Reorder corners
         # into the radio's physical upright order without moving source pixels.
         corners = np.roll(corners, 2, axis=1)

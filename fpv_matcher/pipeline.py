@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import math
 import os
 import time
 import threading
@@ -19,20 +21,16 @@ from fpv_matcher.audio.evidence import POLICY_VERSION as AUDIO_POLICY_VERSION, a
 from fpv_matcher.cache.fingerprints import get_or_extract
 from fpv_matcher.config import calibration_for
 from fpv_matcher.matching.assignment import assign, assign_segments, candidate_margin
-from fpv_matcher.matching.evidence import normalize_sources, motion_enabled, audio_enabled_pair
+from fpv_matcher.matching.evidence import normalize_sources, motion_enabled, audio_enabled_pair, precise_motion_enabled
+from fpv_matcher.radio.activity import cached_activity, cache_status as activity_cache_status, specification as activity_specification
+from fpv_matcher.matching import activity as activity_matching
 from fpv_matcher.matching.correlation import MatchResult, compare, prepare, section_support
 from fpv_matcher.motion.derivation import cached_visual_motion, cache_status as visual_cache_status, embedded_status
 from fpv_matcher.motion.sampling import visual_fps
 from fpv_matcher.motion.telemetry import cached_telemetry, body_rates, validate_motion_settings
 from fpv_matcher.radio.rates import apply_rate_profile, validate_rate_profile
 from fpv_matcher.video.metadata import filename_timestamp, format_timestamp, probe_video
-
-
-def atomic_json(path: Path, value: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False), encoding="utf-8")
-    os.replace(temporary, path)
+from fpv_matcher.storage import atomic_json
 
 
 def infer_clock_difference(radio_times, fpv_times, results, scores, audio, allow_single_anchor=False):
@@ -76,6 +74,25 @@ def infer_clock_difference(radio_times, fpv_times, results, scores, audio, allow
     return delta, confidence, len(chosen)
 
 
+def _sample_paths(paths, percent, modified_times=None):
+    """Choose a deterministic, time-spread subset while preserving the full pool."""
+    paths = list(paths)
+    if percent == 100 or len(paths) <= 1:
+        return paths, []
+    count = min(len(paths), max(1, math.ceil(len(paths) * percent / 100)))
+    modified_times = modified_times or {}
+    def order_key(path):
+        timestamp = filename_timestamp(path.name)
+        if timestamp is None:
+            timestamp = modified_times.get(path.name, {}).get("timestamp")
+        return (timestamp is None, timestamp if timestamp is not None else path.name.casefold(), path.name.casefold())
+    ordered = sorted(paths, key=order_key)
+    indexes = sorted({min(len(ordered) - 1, int((i + .5) * len(ordered) / count)) for i in range(count)})
+    selected = [ordered[index] for index in indexes]
+    names = {path.name for path in selected}
+    return selected, [path for path in paths if path.name not in names]
+
+
 def run_batch(
     fpv_paths: list[Path],
     radio_paths: list[Path],
@@ -109,6 +126,10 @@ def run_batch(
     fpv_visual_fps: float | None = None,
     visual_camera: dict | None = None,
     stick_mode: int = 2,
+    match_sample_percent: int = 100,
+    audio_boundary: int = 30,
+    audio_adaptive: bool = True,
+    audio_retry_limit: int = 120,
 ) -> dict:
     from fpv_matcher.motion.visual_rotation import validate_profile, visual_body_rates
     from fpv_matcher.radio.modes import validate_mode
@@ -131,11 +152,17 @@ def run_batch(
         raise ValueError("Minimum score must be between zero and one")
     if matching_strategy not in {"selected", "automatic"}:
         raise ValueError("Choose automatic or selected-source matching")
+    if match_sample_percent not in {10, 25, 50, 100}:
+        raise ValueError("Quick Match sample must be 10%, 25%, 50% or all recordings")
+    if audio_boundary not in {30, 60, 120, 300} or audio_retry_limit not in {30, 60, 120, 300} or not isinstance(audio_adaptive, bool):
+        raise ValueError("Choose audio boundary/retry limits of 30, 60, 120 or 300 seconds")
     if not fpv_paths or not radio_paths:
         raise ValueError("Provide at least one recording of each type")
     requested_fpv, requested_radio = list(fpv_paths), list(radio_paths)
     if match_target_kind not in {"all", "fpv", "radio"}:
         raise ValueError("Match target must be all, fpv, or radio")
+    if not isinstance(config, dict):
+        raise ValueError("Configuration must be a JSON object")
     if match_target_kind != "all":
         available = requested_fpv if match_target_kind == "fpv" else requested_radio
         names = match_target_names or ([match_target_name] if match_target_name else [])
@@ -148,10 +175,20 @@ def run_batch(
             fpv_paths = selected
         else:
             radio_paths = selected
+    excluded_radio = [p.name for p in radio_paths if config.get("clips", {}).get(p.name, {}).get("exclude")]
+    radio_paths = [p for p in radio_paths if p.name not in excluded_radio]
+    if match_target_kind != "fpv":
+        fpv_paths = [p for p in fpv_paths if p.name not in config.get("no_counterpart", [])]
+    full_fpv_paths, full_radio_paths = list(fpv_paths), list(radio_paths)
+    modified_times = config.get("modified_times", {})
+    fpv_paths, deferred_fpv_paths = _sample_paths(fpv_paths, 100 if match_target_kind == "radio" else match_sample_percent, modified_times.get("fpv"))
+    radio_paths, deferred_radio_paths = _sample_paths(radio_paths, match_sample_percent if match_target_kind == "radio" else 100, modified_times.get("radio"))
+    if audio_boundary not in {30, 60, 120, 300} or audio_retry_limit not in {30, 60, 120, 300} or not isinstance(audio_adaptive, bool):
+        raise ValueError("Choose audio boundary/retry limits of 30, 60, 120 or 300 seconds")
+    if not fpv_paths or not radio_paths:
+        raise ValueError("The selected Quick Match sample must include at least one recording of each type")
     considered_fpv = [path.name for path in fpv_paths]
     considered_radio = [path.name for path in radio_paths]
-    if not isinstance(config, dict):
-        raise ValueError("Configuration must be a JSON object")
     if decode_mode not in {"auto", "cpu", "cuda"}:
         raise ValueError("Choose automatic, CPU or CUDA decoding")
     if tracking_backend not in {"auto", "cpu", "cuda"}:
@@ -162,11 +199,11 @@ def run_batch(
     motion_source, camera_uptilt_deg, imu_orientation, gyro_video_offset = validate_motion_settings(motion_source, camera_uptilt_deg, imu_orientation, gyro_video_offset)
     evidence_sources = normalize_sources(evidence_sources, motion_source, audio_enabled)
     use_motion = motion_enabled(evidence_sources)
+    use_precise_motion = precise_motion_enabled(evidence_sources)
+    use_activity = evidence_sources["gimbal_activity"] and use_motion
     audio_enabled = audio_enabled_pair(evidence_sources)
     motion_source = ("auto" if evidence_sources["fpv_gyro"] and evidence_sources["fpv_visual"]
                      else "gyro" if evidence_sources["fpv_gyro"] else "visual")
-    excluded_radio = [p.name for p in radio_paths if config.get("clips", {}).get(p.name, {}).get("exclude")]
-    radio_paths = [p for p in radio_paths if p.name not in excluded_radio]
     if not radio_paths:
         raise ValueError("Keep at least one StickCam recording in this analysis")
     if use_motion and allow_unconfigured_radio and not audio_enabled and matching_strategy != "automatic":
@@ -190,20 +227,23 @@ def run_batch(
     cv2.setNumThreads(1)
     errors, clips = [], {"fpv": [], "radio": []}
     identities = config.get("identities", {})
-    extraction_base, extraction_span = 0., 25.
+    extraction_base, extraction_span = 0., 10. if audio_enabled else 25.
     total, completed = len(fpv_paths) + len(radio_paths), 0
 
     def extraction_progress(kind, path, event, phase="motion"):
         with progress_lock:
+            if kind == "radio" and use_activity and use_precise_motion and phase in {"gimbal_activity", "motion"}:
+                percent = float(event.get("percent", 0))
+                event = {**event, "phase_percent": percent, "percent": percent*.35 if phase == "gimbal_activity" else 35+percent*.65}
             key = (kind, path.name)
             previous = extraction.get(key, {})
             extraction[key] = {**previous, **event, "kind": kind, "name": path.name, "phase": phase}
             fraction = sum(min(1, v.get("fraction", v.get("percent", 0) / 100)) for v in extraction.values()) / max(1, total)
             active = [v for v in extraction.values() if not v.get("finished")]
             eta = event.get("eta_seconds")
-            label = "Boundary audio" if phase == "audio" else ("Preparing recording" if not use_motion else "Stick detection" if kind == "radio" else "FPV motion")
+            label = "Reading recording" if phase == "metadata" else "Gimbal activity" if phase == "gimbal_activity" else "Boundary audio" if phase == "audio" else ("Preparing recording" if not use_motion else "Stick detection" if kind == "radio" else "FPV motion")
             text = f"{label}: {path.name} · {event.get('percent', 0):.1f}%"
-            if eta is not None and phase == "motion" and use_motion:
+            if eta is not None and phase in {"motion", "gimbal_activity"} and use_motion:
                 text += f" · about {int(eta // 60)}m {int(eta % 60)}s remaining for motion extraction"
             report("extract", text, extraction_base + fraction * extraction_span, active_clips=active, completed=completed, total=total)
 
@@ -214,27 +254,27 @@ def run_batch(
 
     def process(kind, path):
         """Read cheap evidence first; vision failures must not discard audio."""
-        extraction_progress(kind, path, {"percent": 0, "eta_seconds": None}, phase="audio" if audio_enabled else "metadata")
+        extraction_progress(kind, path, {"percent": 0, "eta_seconds": None}, phase="metadata")
         signature = [path.stat().st_size, path.stat().st_mtime_ns]
         info = probe_video(path)
         info["mtime_ns"] = signature[1]
+        modified = config.get("modified_times", {}).get(kind, {}).get(path.name, {})
+        info["modified_time"] = modified.get("timestamp")
+        info["modified_time_source"] = modified.get("source", "filesystem")
+        info["modified_start_clock"] = (modified["timestamp"] - (info["duration"] if config.get("clock_settings", {}).get("modified_kind", "end") == "end" else 0)
+                                         if isinstance(modified.get("timestamp"), (int, float)) else None)
         identity = identities.get(kind, {}).get(path.name)
         info["motion_used"] = False
+        info["gimbal_activity_used"] = False
         info["source_usable"] = True
         info["motion_source"] = "deferred" if use_motion else "disabled"
         info["motion_label"] = "Motion awaiting evidence screening" if use_motion else "Motion matching disabled"
         audio = _empty()
-        if audio_enabled:
-            try:
-                audio = get_or_extract(str(path), cache, "audio", AUDIO_VERSION,
-                    {"boundary_seconds": 30}, lambda: extract_audio(str(path)), identity, validate=validate_audio)
-            except (ValueError, RuntimeError, OSError, ImportError) as exc:
-                info["audio_error"] = str(exc)
-        info["audio_used"] = audio_enabled and bool(len(audio["time"]))
+        info["audio_used"] = False
         if signature != [path.stat().st_size, path.stat().st_mtime_ns]:
             raise ValueError("Recording changed while reading it; wait until copying finishes, then rerun")
         return {"path": path, "name": path.name, "info": info, "signature": signature,
-            "motion": empty_motion(info["duration"]), "audio": audio, "tracking_quality": 0.,
+            "motion": empty_motion(info["duration"]), "audio": audio, "audio_by_boundary": {audio_boundary: audio}, "tracking_quality": 0.,
             "clock": filename_timestamp(path.name) if evidence_sources["filename_timestamps"] else None}
 
     def load_motion(kind, clip):
@@ -297,15 +337,32 @@ def run_batch(
                 info["needs_calibration"] = True
             else:
                 calibration = calibration_for(config, path.name)
-                from fpv_matcher.radio.derivation import cached_sticks, cache_status as stick_cache_status, observation_status
-                radio_fps = tracking_fps(sample_fps, stick_sampling_ratio, info.get("fps"))
-                info["stick_sample_fps"] = radio_fps
-                info["motion_reused"] = stick_cache_status(path, cache, calibration, radio_fps, identity)["status"] == "cached"
-                motion = cached_sticks(path, cache, calibration, radio_fps, identity,
-                                       lambda event: extraction_progress(kind, path, event))
-                info["motion_used"] = True
-                info["motion_source"] = "stick_inputs"
-                info["stick_observations"] = observation_status(motion)
+                motion = empty_motion(info["duration"])
+                if use_activity:
+                    try:
+                        before = activity_cache_status(path, cache, calibration, identity)
+                        clip["activity"] = cached_activity(path, cache, calibration, identity,
+                            lambda event: extraction_progress(kind, path, event, "gimbal_activity"))
+                        info["gimbal_activity_used"] = True
+                        info["gimbal_activity_reused"] = before["status"] == "cached"
+                        info["gimbal_activity"] = activity_cache_status(path, cache, calibration, identity)
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        info["gimbal_activity_error"] = str(exc)
+                if use_precise_motion and all("tip_x" in calibration[side] for side in ("left_gimbal", "right_gimbal")):
+                    from fpv_matcher.radio.derivation import cached_sticks, cache_status as stick_cache_status, observation_status
+                    radio_fps = tracking_fps(sample_fps, stick_sampling_ratio, info.get("fps"))
+                    info["stick_sample_fps"] = radio_fps
+                    info["motion_reused"] = stick_cache_status(path, cache, calibration, radio_fps, identity)["status"] == "cached"
+                    motion = cached_sticks(path, cache, calibration, radio_fps, identity,
+                                           lambda event: extraction_progress(kind, path, event))
+                    info["motion_used"] = True
+                    info["motion_source"] = "stick_inputs"
+                    info["stick_observations"] = observation_status(motion)
+                else:
+                    info["motion_source"] = "gimbal_activity" if info["gimbal_activity_used"] else "unavailable"
+                    info["motion_label"] = "Tip-free gimbal movement loaded" if info["gimbal_activity_used"] else info.get("gimbal_activity_error", "Gimbal activity unavailable")
+                    if use_precise_motion:
+                        info["motion_skipped_reason"] = "Mark both tips to enable precise stick-input derivation; gimbal activity is separate"
         if clip["signature"] != [path.stat().st_size, path.stat().st_mtime_ns]:
             raise ValueError(
                 "Recording changed during extraction; wait until it finishes copying, then rerun"
@@ -359,30 +416,105 @@ def run_batch(
         raise ValueError(
             "No usable recordings of both types remain. " + "; ".join(e["error"] for e in errors[:3])
         )
+    audio_pair_possible = audio_enabled and any(c["info"].get("has_audio") for c in fpv) and any(c["info"].get("has_audio") for c in radio)
+    if audio_pair_possible:
+        tasks = [(kind, c) for kind, items in clips.items() for c in items if c["info"].get("has_audio") and c["info"]["source_usable"]]
+        extraction.clear()
+        extraction_base, extraction_span, total, completed = 10., 15., len(tasks), 0
+        def load_audio(kind, clip):
+            path = clip["path"]
+            extraction_progress(kind, path, {"percent": 0}, "audio")
+            identity = identities.get(kind, {}).get(clip["name"])
+            data = get_or_extract(str(path), cache, "audio", AUDIO_VERSION,
+                {"boundary_seconds": audio_boundary}, lambda: extract_audio(str(path), audio_boundary), identity, validate=validate_audio)
+            clip["audio"], clip["audio_by_boundary"][audio_boundary] = data, data
+            clip["info"]["audio_used"] = bool(len(data["time"]))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(load_audio, kind, clip): (kind, clip) for kind, clip in tasks}
+            for future in as_completed(futures):
+                kind, clip = futures[future]
+                try:
+                    future.result()
+                except (ValueError, RuntimeError, OSError, ImportError) as exc:
+                    clip["info"]["audio_error"] = str(exc)
+                completed += 1
+                extraction[(kind, clip["name"])] = {"finished": True, "percent": 100}
+                report("extract", f"Boundary audio loaded: {clip['name']}", 10+completed/max(1,total)*15,
+                       completed=completed, total=total, active_clips=[v for v in extraction.values() if not v.get("finished")])
+    elif audio_enabled:
+        report("audio_screening", "No audio stream on both feeds; skipping audio extraction and retries", 25)
     for kind, items in clips.items():
         errors.extend({"kind": kind, "name": c["name"], "phase": "audio", "error": c["info"]["audio_error"]}
                       for c in items if c["info"].get("audio_error"))
 
     audio_checks, audio_auto_pairs = {}, set()
-    audio_screening = {"enabled": matching_strategy == "automatic" and audio_enabled,
+    audio_screening = {"enabled": bool(audio_pair_possible),
                        "policy": AUDIO_POLICY_VERSION, "eligible_pairs": 0, "distinctive_pairs": 0}
     if audio_screening["enabled"]:
         count = len(radio) * len(fpv)
         report("audio_screening", "Checking independent audio fingerprints and trends before deriving motion", 25, completed=0, total=count)
         eligible, owners = np.zeros((len(radio), len(fpv))), np.zeros((len(radio), len(fpv)))
-        for ri, rc in enumerate(radio):
-            for fi, fc in enumerate(fpv):
-                check = assess_audio_pair(rc["audio"], fc["audio"], min_overlap)
-                audio_checks[ri, fi] = check
-                owners[ri, fi] = .6 * check["landmark_strength"] + .4 * check["trend_score"]
-                common = min(rc["info"]["duration"] - max(0., check["offset"]),
-                             fc["info"]["duration"] - max(0., -check["offset"]))
-                if check["eligible"] and common >= min_overlap:
-                    eligible[ri, fi] = check["score"]
-                done = ri * len(fpv) + fi + 1
-                if done % max(1, count // 50) == 0 or done == count:
-                    report("audio_screening", f"Checked audio for {done}/{count} candidates", 25 + 10 * done / count,
-                           completed=done, total=count)
+        levels = [audio_boundary] + ([v for v in (60, 120, 300) if audio_boundary < v <= audio_retry_limit] if audio_adaptive else [])
+        pending = {fi for fi, c in enumerate(fpv) if c["info"]["audio_used"] and c["info"]["source_usable"]}
+        reused = 0
+        rounds = 0
+        for boundary in levels:
+            if not pending:
+                break
+            rounds += 1
+            prepared = {"radio": {}, "fpv": {}}
+            for kind, items in (("radio", radio), ("fpv", fpv)):
+                for index, clip in enumerate(items):
+                    if kind == "fpv" and index not in pending:
+                        continue
+                    if boundary == audio_boundary:
+                        prepared[kind][index] = clip["audio"]
+                        continue
+                    if not clip["info"].get("has_audio") or not clip["info"]["source_usable"]:
+                        prepared[kind][index] = _empty()
+                        continue
+                    report("audio_screening", f"Audio retry {boundary}s per end · {clip['name']}", 26)
+                    try:
+                        identity = identities.get(kind, {}).get(clip["name"])
+                        prepared[kind][index] = get_or_extract(str(clip["path"]), cache, "audio", AUDIO_VERSION,
+                            {"boundary_seconds": boundary}, lambda c=clip: extract_audio(str(c["path"]), boundary), identity, validate=validate_audio)
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        prepared[kind][index] = _empty()
+                        errors.append({"kind": kind, "name": clip["name"], "phase": "audio retry", "error": str(exc)})
+            for kind, prepared_clips in prepared.items():
+                for index, data in prepared_clips.items():
+                    clip = radio[index] if kind == "radio" else fpv[index]
+                    clip.setdefault("audio_by_boundary", {})[boundary] = data
+                    clip["info"]["audio_used"] |= bool(len(data["time"]))
+            for fi in sorted(pending):
+                for ri, rc in enumerate(radio):
+                    fc = fpv[fi]
+                    key = hashlib.sha256(json.dumps([AUDIO_POLICY_VERSION, AUDIO_VERSION, str(rc["path"].resolve()), rc["signature"],
+                        str(fc["path"].resolve()), fc["signature"], boundary, min_overlap]).encode()).hexdigest()
+                    saved = cache / "audio-comparisons" / (key + ".json")
+                    try:
+                        check = json.loads(saved.read_text())
+                        if check.get("comparison_key") != key or not isinstance(check.get("sections"), dict):
+                            raise ValueError("Invalid comparison checkpoint")
+                        reused += 1
+                    except (OSError, ValueError):
+                        check = assess_audio_pair(prepared["radio"][ri], prepared["fpv"][fi], min_overlap)
+                        check.update(comparison_key=key, boundary_seconds=boundary)
+                        atomic_json(saved, check)
+                    old = audio_checks.get((ri, fi))
+                    rank = lambda c: (c["eligible"], c["score"] if c["eligible"] else c["best_score"])
+                    if old is None or rank(check) > rank(old):
+                        audio_checks[ri, fi] = check
+                    best = audio_checks[ri, fi]
+                    owners[ri, fi] = .6 * best["landmark_strength"] + .4 * best["trend_score"]
+                    common = min(rc["info"]["duration"] - max(0., best["offset"]), fc["info"]["duration"] - max(0., -best["offset"]))
+                    if best["eligible"] and common >= min_overlap:
+                        eligible[ri, fi] = best["score"]
+                report("audio_screening", f"Checked {boundary}s boundary audio · {fc['name']} · {reused} saved comparisons reused", 30)
+            pending = {fi for fi in pending if not any(eligible[ri, fi] > 0 and
+                       candidate_margin(owners, ri, fi, multiple_fpv=True) >= .1 for ri in range(len(radio)))}
+        audio_screening.update(boundary_seconds=audio_boundary, retry_limit=audio_retry_limit,
+                               adaptive=audio_adaptive, reused_comparisons=reused, rounds=rounds)
         audio_screening["eligible_pairs"] = int(np.count_nonzero(eligible))
         for ri, fi in np.argwhere(eligible > 0):
             check = audio_checks[int(ri), int(fi)]
@@ -409,13 +541,23 @@ def run_batch(
             try:
                 if clip_config.get("skip_motion"):
                     raise ValueError("StickCam motion is disabled for this recording")
-                calibration_for(config, clip["name"])
+                calibration = calibration_for(config, clip["name"])
+                precise_ready = use_precise_motion and all("tip_x" in calibration[side] for side in ("left_gimbal", "right_gimbal"))
+                activity_ready = False
+                if use_activity:
+                    try:
+                        activity_specification(calibration)
+                        activity_ready = True
+                    except ValueError:
+                        pass
+                if not precise_ready and not activity_ready:
+                    raise ValueError("Save radio outline/gimbal regions or complete stick-tip calibration")
                 calibrated_radio.add(ri)
             except (ValueError, KeyError, TypeError, AttributeError):
                 clip["info"]["needs_calibration"] = True
                 clip["info"]["motion_source"] = "disabled"
                 clip["info"]["motion_label"] = "StickCam calibration needed for motion fallback"
-                clip["info"]["motion_skipped_reason"] = "StickCam needs a confirmed calibration before deriving inputs"
+                clip["info"]["motion_skipped_reason"] = "Save a radio outline and both gimbal regions for movement matching, or mark stick tips for precise inputs"
     motion_tasks = []
     if use_motion:
         for kind, items in clips.items():
@@ -502,6 +644,8 @@ def run_batch(
                 reason = "Source changed or disappeared during analysis; restore it and rerun"
                 clip["info"].update(source_usable=False, source_error=reason, audio_used=False, motion_used=False,
                                     motion_source="unavailable", motion_skipped_reason=reason)
+                clip["info"]["gimbal_activity_used"] = False
+                clip.pop("activity", None)
                 clip["audio"], clip["motion"] = _empty(), empty_motion(0)
                 clip["clock"] = None
                 errors.append({"kind": kind, "name": clip["name"], "phase": "source", "error": reason})
@@ -510,8 +654,26 @@ def run_batch(
     audio_auto_pairs &= valid_pairs
     audio_checks = {key: value for key, value in audio_checks.items() if key in valid_pairs}
     audio_screening["distinctive_pairs"] = len(audio_auto_pairs)
-    rdata = [prepare(apply_rate_profile(c["motion"], rate_profile), match_fps, True) if c["info"]["motion_used"] else None for c in radio]
-    fdata = [prepare(c["motion"], match_fps, False) if c["info"]["motion_used"] else None for c in fpv]
+    rdata = [prepare(apply_rate_profile(c["motion"], rate_profile), match_fps, True) if use_precise_motion and c["info"]["motion_used"] else None for c in radio]
+    fdata = [prepare(c["motion"], match_fps, False) if use_precise_motion and c["info"]["motion_used"] else None for c in fpv]
+    rhythm_results = {}
+    rhythm_enabled = evidence_sources.get("movement_rhythm", False) and use_precise_motion
+    if rhythm_enabled:
+        from fpv_matcher.matching import rhythm
+        rhythm_fps = min(10., match_fps)
+        rhythm_radio = [rhythm.prepare(c["motion"], rhythm_fps, True) if c["info"]["motion_used"] else None for c in radio]
+        rhythm_fpv = [rhythm.prepare(c["motion"], rhythm_fps, False) if c["info"]["motion_used"] else None for c in fpv]
+
+    activity_results = {}
+    if use_activity:
+        activity_radio = [activity_matching.prepare_signal(c["activity"], "activity") if c.get("activity") is not None else None for c in radio]
+        activity_fpv = [activity_matching.prepare_fpv(c["motion"]) if c["info"]["motion_used"] else None for c in fpv]
+
+
+    def pair_audio(ri, fi):
+        boundary = audio_checks.get((ri, fi), {}).get("boundary_seconds", audio_boundary)
+        return (radio[ri].get("audio_by_boundary", {}).get(boundary, radio[ri]["audio"]),
+                fpv[fi].get("audio_by_boundary", {}).get(boundary, fpv[fi]["audio"]))
 
     def pair_motion(ri, fi):
         return rdata[ri] is not None and fdata[fi] is not None
@@ -528,15 +690,21 @@ def run_batch(
     done = 0
     for ri, rc in enumerate(radio):
         for fi, fc in enumerate(fpv):
+            ra, fa = pair_audio(ri, fi)
             result = correlate_pair(ri, fi)
-            aud_score, aud_overlap = score_at_offset(rc["audio"], fc["audio"], result.offset_seconds)
+            if rhythm_enabled and pair_motion(ri, fi):
+                rhythm_results[ri, fi] = rhythm.compare(rhythm_radio[ri], rhythm_fpv[fi], min_overlap)
+            if use_activity and activity_radio[ri] is not None and activity_fpv[fi] is not None and (ri, fi) in valid_pairs:
+                activity_results[ri, fi] = activity_matching.compare(activity_radio[ri], activity_fpv[fi], min_overlap)
+
+            aud_score, aud_overlap = score_at_offset(*pair_audio(ri, fi), result.offset_seconds)
             audio_check = audio_checks.get((ri, fi))
             if audio_check:
                 best_score, aud_offset, best_overlap, aud_margin = (audio_check["best_score"], audio_check["best_offset"],
                     audio_check["best_overlap"], audio_check["peak_margin"])
             else:
-                best_score, aud_offset, best_overlap, aud_margin = best_offset(rc["audio"], fc["audio"], min_overlap)
-            aud_quality = min(float(rc["audio"]["quality"]), float(fc["audio"]["quality"]))
+                best_score, aud_offset, best_overlap, aud_margin = best_offset(*pair_audio(ri, fi), min_overlap)
+            aud_quality = min(float(ra["quality"]), float(fa["quality"]))
             # Audio can reinforce motion, or supply a explicitly reviewable proposal
             # when two microphones have a strong, distinctive shared edge segment.
             combined, source = result.score, "motion" if pair_motion(ri, fi) else "no matching evidence"
@@ -547,7 +715,7 @@ def run_batch(
                 if candidate.score > result.score - 0.06 and candidate.score >= 0.35:
                     result = candidate
                     result.offset_seconds = aud_offset
-                    aud_score, aud_overlap = score_at_offset(rc["audio"], fc["audio"], aud_offset)
+                    aud_score, aud_overlap = score_at_offset(*pair_audio(ri, fi), aud_offset)
                     combined = max(combined, 0.85 * result.score + 0.15 * best_score, 0.7 * best_score)
                     source = "motion + boundary audio"
                 elif result.score < 0.35:
@@ -566,7 +734,7 @@ def run_batch(
                 result = MatchResult(0., audio_check["offset"], 0., {}, peak_margin=audio_check["landmark_peak_margin"])
                 result.overlap_seconds = max(0., min(rc["info"]["duration"] - max(0., result.offset_seconds),
                     fc["info"]["duration"] - max(0., -result.offset_seconds)))
-                aud_score, aud_overlap = score_at_offset(rc["audio"], fc["audio"], result.offset_seconds, min_overlap)
+                aud_score, aud_overlap = score_at_offset(*pair_audio(ri, fi), result.offset_seconds, min_overlap)
                 combined, source = audio_check["score"], "spectral fingerprints + audio trends · review"
             matrix[ri, fi] = combined
             results[ri, fi], basis[ri, fi] = result, source
@@ -588,17 +756,63 @@ def run_batch(
                     completed=done,
                     total=pairs,
                 )
+    if rhythm_results:
+        rhythm_scores = np.zeros_like(matrix)
+        for key, check in rhythm_results.items():
+            rhythm_scores[key] = check["score"]
+        for (ri, fi), check in rhythm_results.items():
+            separation = candidate_margin(rhythm_scores, ri, fi, multiple_fpv=True)
+            check.update(candidate_margin=float(separation), suggested=bool(check["eligible"] and separation >= .06))
+            if check["eligible"] and not check["suggested"]:
+                check["reason"] = "Similar rhythms occur in competing StickCam candidates; no distinct shortlist proposal."
+    if activity_results:
+        activity_scores = np.zeros_like(matrix)
+        for key, check in activity_results.items():
+            activity_scores[key] = check["score"]
+        for (ri, fi), check in activity_results.items():
+            separation = candidate_margin(activity_scores, ri, fi, multiple_fpv=True)
+            check.update(candidate_margin=float(separation), suggested=bool(check["eligible"] and separation >= .04))
+            if check["eligible"] and not check["suggested"]:
+                check["reason"] = "Other StickCam clips have similar gimbal activity; compare the competing candidates."
+            elif check["suggested"] and (separation < .08 or check["sections"]["matched"] < 3):
+                check["reason"] = "Tentative movement suggestion: limited sections or a close competitor. Review visible events."
+    # Rhythm/activity shortlists never enter assignment or automatic clock matrices.
     clock_delta, clock_confidence, clock_support = infer_clock_difference(
         [c["clock"] for c in radio], [c["clock"] for c in fpv], results, matrix, audio_results,
-        allow_single_anchor=match_target_kind != "all",
+        allow_single_anchor=match_target_kind != "all" or (match_sample_percent < 100 and min(len(radio), len(fpv)) == 1),
     )
+    clock_source = "filename" if clock_delta is not None else None
+    if clock_delta is None:
+        clock_delta, clock_confidence, clock_support = infer_clock_difference(
+            [c["info"].get("modified_start_clock") for c in radio],
+            [c["info"].get("modified_start_clock") for c in fpv], results, matrix, audio_results,
+            allow_single_anchor=match_target_kind != "all" or (match_sample_percent < 100 and min(len(radio), len(fpv)) == 1),
+        )
+        if clock_delta is not None:
+            clock_source = "file modified time, adjusted by duration"
     agreements = {}
+    confirmed = config.get("confirmed_clocks", [])
+    if confirmed:
+        model = next((m for m in confirmed if m["method"] == "modified" and m["consistent"]), None) or next((m for m in confirmed if m["consistent"]), None)
+        clock_delta = -model["delta_seconds"] if model else None
+        clock_support = model["independent_flights"] if model else 0
+        clock_confidence = min(1., clock_support / 2) if model else 0.
+        clock_source = ("filename" if model["method"] == "filename" else "file modified time, adjusted by duration") if model else None
+    # The old search shortcut assumes one FPV recorder clock. Mixed recorder
+    # sessions use independent content searches and the per-recorder reviewed
+    # clock expansion in the web layer; never apply one drone's prior to another.
+    recorder_labels = set(config.get("fpv_recorders", {}).values())
+    several_clocks = any(sum(m["method"] == method for m in confirmed) > 1 for method in ("modified", "filename"))
+    if len(recorder_labels) > 1 or several_clocks:
+        clock_delta, clock_confidence, clock_support, clock_source = None, 0., 0, None
     if clock_delta is not None:
         for ri, rc in enumerate(radio):
             for fi, fc in enumerate(fpv):
-                if rc["clock"] is None or fc["clock"] is None:
+                radio_time = rc["clock"] if clock_source == "filename" else rc["info"].get("modified_start_clock")
+                fpv_time = fc["clock"] if clock_source == "filename" else fc["info"].get("modified_start_clock")
+                if radio_time is None or fpv_time is None:
                     continue
-                expected = fc["clock"] - rc["clock"] - clock_delta
+                expected = fpv_time - radio_time - clock_delta
                 if (
                     pair_motion(ri, fi)
                     and clock_confidence >= 0.6
@@ -609,7 +823,7 @@ def run_batch(
                     candidate = compare(
                         rdata[ri], fdata[fi], match_fps, min_overlap, (expected - 2, expected + 2)
                     )
-                    audio_score, overlap = score_at_offset(rc["audio"], fc["audio"], candidate.offset_seconds)
+                    audio_score, overlap = score_at_offset(*pair_audio(ri, fi), candidate.offset_seconds)
                     shared = min(
                         rc["info"]["duration"] - max(0.0, expected),
                         fc["info"]["duration"] - max(0.0, -expected),
@@ -678,14 +892,15 @@ def run_batch(
     rows = []
     for ri, rc in enumerate(radio):
         for fi, fc in enumerate(fpv):
+            ra, fa = pair_audio(ri, fi)
             result, aud = results[ri, fi], audio_results[ri, fi]
             offset = result.offset_seconds
             sections = (section_support(rdata[ri], fdata[fi], match_fps, offset, result.details)
                         if pair_motion(ri, fi) else {"correlated_sections": 0, "usable_sections": 0,
                         "section_seconds": 3.0, "section_agreement": 0.0, "section_spread": 0.0})
-            aud["score_at_offset"], aud["overlap"] = score_at_offset(rc["audio"], fc["audio"], offset)
+            aud["score_at_offset"], aud["overlap"] = score_at_offset(*pair_audio(ri, fi), offset)
             fingerprint_strength, fingerprint_offset, _, fingerprint_hashes, fingerprint_span = (
-                landmark_match(rc["audio"], fc["audio"])
+                landmark_match(*pair_audio(ri, fi))
             )
             # Use actual probed durations, not a correlation's valid sample count.
             overlap = max(
@@ -723,7 +938,7 @@ def run_batch(
                     reasons.extend(audio_check["reasons"])
                 if pair_motion(ri, fi) and result.correlated_sections < 5:
                     reasons.append("Motion lacks sustained agreement across independent active sections")
-                if not pair_motion(ri, fi) and not audio_enabled:
+                if not pair_motion(ri, fi) and not audio_enabled and (ri, fi) not in activity_results:
                     reasons.append("No selected motion evidence is available for this pair")
             row = {
                 "radio_video": rc["name"],
@@ -731,7 +946,7 @@ def run_batch(
                 "score": result.score,
                 "combined_score": float(matrix[ri, fi]),
                 "confidence": "strong" if strong_motion or strong_audio else "review",
-                "evidence": basis[ri, fi] + (f" · {fc['info']['motion_source']} rotation" if fc["info"].get("motion_source") != "visual" and "motion" in basis[ri, fi] else ""),
+                "evidence": ("Tip-free gimbal movement · review suggestion" if not pair_motion(ri, fi) and not rc["info"]["audio_used"] and (ri, fi) in activity_results else basis[ri, fi]) + (f" · {fc['info']['motion_source']} rotation" if fc["info"].get("motion_source") != "visual" and "motion" in basis[ri, fi] else ""),
                 "fpv_motion_source": fc["info"].get("motion_source", "visual"),
                 "motion_included": pair_motion(ri, fi),
                 "audio_included": rc["info"]["audio_used"] and fc["info"]["audio_used"],
@@ -744,6 +959,8 @@ def run_batch(
                 "valid_motion_seconds": result.valid_seconds,
                 "reliable_axes": result.reliable_axes,
                 "event_score": result.event_score,
+                "rhythm": rhythm_results.get((ri, fi)),
+                "gimbal_activity": activity_results.get((ri, fi)),
                 **sections,
                 "offset_seconds": offset,
                 "radio_common_start_seconds": max(0.0, offset),
@@ -752,6 +969,10 @@ def run_batch(
                 "global_assignment": (ri, fi) in selected and overlap >= min_overlap,
                 "radio_filename_time": format_timestamp(rc["clock"]),
                 "fpv_filename_time": format_timestamp(fc["clock"]),
+                "radio_modified_time": rc["info"].get("modified_time"),
+                "fpv_modified_time": fc["info"].get("modified_time"),
+                "modified_time_start_delta_seconds": (fc["info"].get("modified_start_clock") - rc["info"].get("modified_start_clock")
+                    if rc["info"].get("modified_start_clock") is not None and fc["info"].get("modified_start_clock") is not None else None),
                 "filename_start_delta_seconds": None
                 if rc["clock"] is None or fc["clock"] is None
                 else fc["clock"] - rc["clock"],
@@ -768,6 +989,7 @@ def run_batch(
                 "audio_fingerprint_span_seconds": fingerprint_span,
                 "matching_strategy": matching_strategy,
                 "audio_first_proposal": bool(strong_audio),
+                "audio_boundary_seconds": audio_check.get("boundary_seconds", audio_boundary) if audio_check else audio_boundary,
                 "motion_deferred": fc["info"]["motion_source"] == "deferred",
                 "audio_trend_score": audio_check["trend_score"] if audio_check else None,
                 "audio_trend_peak_margin": audio_check["trend_peak_margin"] if audio_check else None,
@@ -780,10 +1002,92 @@ def run_batch(
                 "axis_details": result.details,
             }
             rows.append(row)
+    deferred_clip_infos = {"fpv": [], "radio": []}
+    timing_suggestions = []
+    timing_suggestions_truncated = 0
+    if deferred_fpv_paths or deferred_radio_paths:
+        sampled = {"fpv": {clip["name"]: clip for clip in fpv},
+                   "radio": {clip["name"]: clip for clip in radio}}
+        deferred_names = {"fpv": {path.name for path in deferred_fpv_paths},
+                          "radio": {path.name for path in deferred_radio_paths}}
+        full_paths = {"fpv": full_fpv_paths, "radio": full_radio_paths}
+        clock_records = {"fpv": {}, "radio": {}}
+        for kind in ("fpv", "radio"):
+            for path in full_paths[kind]:
+                clip = sampled[kind].get(path.name)
+                if clip:
+                    info = clip["info"]
+                else:
+                    try:
+                        signature = [path.stat().st_size, path.stat().st_mtime_ns]
+                        metadata = probe_video(path)
+                        modified = config.get("modified_times", {}).get(kind, {}).get(path.name, {})
+                        modified_timestamp = modified.get("timestamp")
+                        if not isinstance(modified_timestamp, (int, float)):
+                            modified_timestamp = path.stat().st_mtime
+                        info = {**metadata, "mtime_ns": signature[1], "modified_time": modified_timestamp,
+                                "modified_time_source": modified.get("source", "server file date"),
+                                "modified_start_clock": modified_timestamp - (metadata["duration"] if config.get("clock_settings", {}).get("modified_kind", "end") == "end" else 0)}
+                        deferred_clip_infos[kind].append({"name": path.name, **info, "source_usable": True,
+                            "motion_used": False, "audio_used": False, "motion_source": "not_scanned",
+                            "motion_label": "Not scanned in this sample", "tracking_quality": 0.})
+                    except Exception as exc:
+                        errors.append({"kind": kind, "name": path.name, "phase": "scope metadata", "error": str(exc)})
+                        continue
+                timestamp = (filename_timestamp(path.name) if clock_source == "filename"
+                             else info.get("modified_start_clock"))
+                clock_records[kind][path.name] = {"timestamp": timestamp, "duration": info.get("duration", 0.),
+                    "modified_time": info.get("modified_time"), "modified_start_clock": info.get("modified_start_clock")}
+        if clock_delta is not None and clock_source:
+            existing = {(row["radio_video"], row["fpv_video"]) for row in rows}
+            for radio_name, radio_clock in clock_records["radio"].items():
+                for fpv_name, fpv_clock in clock_records["fpv"].items():
+                    if radio_name not in deferred_names["radio"] and fpv_name not in deferred_names["fpv"]:
+                        continue
+                    if (radio_name, fpv_name) in existing or radio_clock["timestamp"] is None or fpv_clock["timestamp"] is None:
+                        continue
+                    offset = fpv_clock["timestamp"] - radio_clock["timestamp"] - clock_delta
+                    overlap = max(0., min(radio_clock["duration"] - max(0., offset),
+                                          fpv_clock["duration"] - max(0., -offset)))
+                    if overlap >= min_overlap:
+                        timing_suggestions.append({"radio_video": radio_name, "fpv_video": fpv_name,
+                            "offset_seconds": offset, "overlap_seconds": overlap, "clock_source": clock_source,
+                            "radio_filename_time": format_timestamp(filename_timestamp(radio_name)),
+                            "fpv_filename_time": format_timestamp(filename_timestamp(fpv_name)),
+                            "radio_modified_time": radio_clock["modified_time"], "fpv_modified_time": fpv_clock["modified_time"],
+                            "modified_time_start_delta_seconds": (fpv_clock["modified_start_clock"] - radio_clock["modified_start_clock"]
+                                if fpv_clock["modified_start_clock"] is not None and radio_clock["modified_start_clock"] is not None else None),
+                            "clock_support": clock_support, "clock_confidence": clock_confidence,
+                            "tentative": clock_support < 2})
+            timing_suggestions.sort(key=lambda suggestion: (-suggestion["overlap_seconds"],
+                suggestion["radio_video"].casefold(), suggestion["fpv_video"].casefold()))
+            timing_suggestions_truncated = max(0, len(timing_suggestions) - 250)
+            timing_suggestions = timing_suggestions[:250]
+            if rows:
+                template = rows[0]
+                for candidate in timing_suggestions:
+                    offset = candidate["offset_seconds"]
+                    row = {**template, **candidate, "score": 0., "combined_score": 0.,
+                        "confidence": "review", "evidence": f"{clock_source} + duration · content not scanned",
+                        "fpv_motion_source": "not_scanned", "motion_included": False, "audio_included": False,
+                        "candidate_margin": 0., "peak_margin": 0., "tracking_coverage": 0.,
+                        "valid_motion_seconds": 0., "reliable_axes": 0, "event_score": 0.,
+                        "correlated_sections": 0, "usable_sections": 0, "section_agreement": 0.,
+                        "section_spread": 0., "offset_seconds": offset,
+                        "radio_common_start_seconds": max(0., offset), "fpv_common_start_seconds": max(0., -offset),
+                        "overlap_seconds": candidate["overlap_seconds"], "global_assignment": False,
+                        "audio_score_at_motion_offset": 0., "audio_best_score": 0., "audio_best_offset_seconds": None,
+                        "audio_overlap_seconds": 0., "audio_fingerprint_strength": 0.,
+                        "audio_fingerprint_offset_seconds": None, "audio_fingerprint_shared_hashes": 0,
+                        "audio_fingerprint_span_seconds": 0., "audio_first_proposal": False,
+                        "motion_deferred": True, "timing_only": True, "reviewed": False, "rhythm": None,
+                        "review_reasons": ["This pair was not content-scanned; preview it or run Quick Match on all files."],
+                        "alternatives": [], "axis_details": {}}
+                    rows.append(row)
     assigned_radio = {row["radio_video"] for row in rows if row["global_assignment"]}
     assigned_fpv = {row["fpv_video"] for row in rows if row["global_assignment"]}
     summary = {
-        "version": 4,
+        "version": 5,
         "pairing_model": "multiple_fpv_segments_per_stickcam",
         "rate_profile": rate_profile,
         "rows": rows,
@@ -794,14 +1098,31 @@ def run_batch(
         "considered_radio": considered_radio,
         "considered_fpv": considered_fpv,
         "match_scope": {"kind": match_target_kind, "target": match_target_name if match_target_kind != "all" else None,
-                        "targets": [p.name for p in (fpv_paths if match_target_kind == "fpv" else radio_paths)] if match_target_kind != "all" else []},
+                        "targets": [p.name for p in (full_fpv_paths if match_target_kind == "fpv" else full_radio_paths)] if match_target_kind != "all" else [],
+                        "sample_percent": match_sample_percent,
+                        "total_fpv": len(full_fpv_paths), "total_radio": len(full_radio_paths),
+                        "sampled_fpv": considered_fpv, "sampled_radio": considered_radio,
+                        "deferred_fpv": [p.name for p in deferred_fpv_paths],
+                        "deferred_radio": [p.name for p in deferred_radio_paths],
+                        "timing_suggestions": timing_suggestions,
+                        "timing_suggestions_truncated": timing_suggestions_truncated},
         "clips": {
-            kind: [{"name": c["name"], **c["info"], "tracking_quality": c["tracking_quality"]} for c in data]
+            kind: ([{"name": c["name"], **c["info"], "tracking_quality": c["tracking_quality"]} for c in data]
+                   + deferred_clip_infos[kind])
             for kind, data in clips.items()
         },
-        "clock": {"delta_seconds": clock_delta, "confidence": clock_confidence, "support": clock_support},
+        "clock": {"delta_seconds": clock_delta, "confidence": clock_confidence, "support": clock_support,
+                  "source": clock_source},
         "workflow": {
             "strategy": matching_strategy, "audio_screening": audio_screening,
+            "movement_rhythm": {"enabled": bool(rhythm_enabled), "proposals": sum(c["suggested"] for c in rhythm_results.values()), "automatic_confirmation": False},
+            "gimbal_activity": {"enabled": bool(use_activity), "proposals": sum(c["suggested"] for c in activity_results.values()),
+                                "sample_fps": 10, "automatic_confirmation": False},
+            "sample_percent": match_sample_percent,
+            "unscanned_fpv": [p.name for p in deferred_fpv_paths],
+            "unscanned_radio": [p.name for p in deferred_radio_paths],
+            "timing_suggestion_count": len(timing_suggestions),
+            "timing_suggestions_tentative": clock_support < 2 if timing_suggestions else False,
             "unresolved_fpv": [p.name for p in fpv_paths if p.name not in assigned_fpv],
             "unresolved_radio": [p.name for p in radio_paths if p.name not in assigned_radio],
             "needs_calibration": [c["name"] for c in radio if c["info"].get("needs_calibration")],
@@ -810,10 +1131,13 @@ def run_batch(
             "unavailable_sources": [{"kind": kind, "name": c["name"], "reason": c["info"]["source_error"]}
                 for kind, items in clips.items() for c in items if c["info"].get("source_error")],
             "motion_loaded": {kind: sum(c["info"]["motion_used"] for c in items) for kind, items in clips.items()},
+            "gimbal_activity_errors": [{"name": c["name"], "reason": c["info"]["gimbal_activity_error"]}
+                                      for c in radio if c["info"].get("gimbal_activity_error")],
             "automatic_confirmation": False,
         },
         "settings": {
             "sample_fps": sample_fps,
+            "match_sample_percent": match_sample_percent,
             "fpv_sampling_mode": fpv_sampling_mode,
             "fpv_visual_fps": fpv_visual_fps,
             "stick_sampling_ratio": stick_sampling_ratio,
@@ -834,7 +1158,7 @@ def run_batch(
     }
     atomic_json(output / "results.json", summary)
     temporary = output / "matches.csv.tmp"
-    scalar_keys = [key for key in rows[0] if key not in {"alternatives", "axis_details"}]
+    scalar_keys = list(dict.fromkeys(key for row in rows for key in row if key not in {"alternatives", "axis_details"}))
     with temporary.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=scalar_keys)
         writer.writeheader()

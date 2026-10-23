@@ -2,7 +2,8 @@
 /* Grid tracks and long camera filenames must shrink inside narrow panels. */
 .grid,.video-pair{grid-template-columns:repeat(2,minmax(0,1fr))}.field,.grid>*,.video-pair>*{min-width:0}.field select{width:100%}a{overflow-wrap:anywhere}.export-row .actions{align-items:flex-start}.video-pair.stacked{grid-template-columns:minmax(0,1fr)}.motion-synced-preview{border-top:1px solid var(--line);padding-top:10px;margin-top:18px}
 @media(max-width:720px){.grid,.video-pair{grid-template-columns:minmax(0,1fr)}}
-.video-file-list{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:9px}.video-file-row{display:flex;align-items:center;gap:9px;padding:9px 10px;border-bottom:1px solid var(--line);font-size:12px}.video-file-row span{flex:1;overflow-wrap:anywhere}.video-file-row small{font-size:10px;white-space:nowrap}.video-file-row input{flex-shrink:0}
+.video-file-list{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:9px}.video-file-row{display:flex;align-items:center;gap:9px;padding:9px 10px;border-bottom:1px solid var(--line);font-size:12px}.video-file-row span{flex:1;overflow-wrap:anywhere}.video-file-row small{font-size:10px;white-space:normal;max-width:44%;color:var(--muted)}.video-file-row small.video-identifiers{max-width:100%;flex-basis:100%;margin-left:27px}.video-file-row input{flex-shrink:0}
+.timing-suggestion-list{display:grid;gap:8px;margin-top:10px}.timing-suggestion-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(260px,1.5fr) auto;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:9px}.timing-suggestion-row span{overflow-wrap:anywhere}.timing-suggestion-row small{color:var(--muted)}@media(max-width:760px){.timing-suggestion-row{grid-template-columns:1fr}.video-file-row{flex-wrap:wrap}.video-file-row small{max-width:calc(100% - 35px)}}
 .actions>label,select{max-width:100%}.panel p,.history button{overflow-wrap:anywhere}
 .folder-input-row{display:flex;gap:8px}.folder-input-row input{flex:1}.folder-input-row button{flex:none}.browse-folder{padding:9px 12px}#folder-picker{width:min(720px,calc(100vw - 32px));max-height:min(80vh,760px);padding:24px;background:#11172d;color:var(--text);border:1px solid #494264;border-radius:16px;box-shadow:0 24px 90px #000b}#folder-picker::backdrop{background:#030611c9;backdrop-filter:blur(3px)}.folder-picker-heading,.folder-picker-footer,.folder-current{display:flex;align-items:center;justify-content:space-between;gap:12px}.folder-picker-heading h2{margin-top:5px}.folder-current{justify-content:flex-start;margin:18px 0 10px}.folder-current code{min-width:0;overflow-wrap:anywhere;color:#bcd8ff;font-size:12px}.folder-entries{max-height:42vh;overflow:auto;border:1px solid var(--line);border-radius:10px;background:#090f23}.folder-entry{display:flex;align-items:center;gap:10px;min-height:44px;padding:5px 10px;border-bottom:1px solid #ffffff0d}.folder-entry:last-child{border-bottom:0}.folder-entry-icon{color:var(--cyan);width:18px}.folder-entry-name{min-width:0;flex:1;overflow-wrap:anywhere;font-size:13px}.folder-entry small{white-space:nowrap}.folder-entry button{padding:6px 10px;font-size:11px}.folder-video{color:#aab5d2}.folder-video .folder-entry-icon{color:#9f73d2}.folder-picker-footer{margin-top:16px}.folder-picker-footer .muted{font-size:12px}
 .folder-network-shares{display:grid;gap:8px;padding:12px;border:1px solid #343451;border-radius:10px;background:#16172e}.folder-network-shares>span{font-size:12px}.folder-network-shares>div{display:flex;flex-wrap:wrap;gap:8px}.folder-network-shares button{padding:7px 11px}
@@ -80,3 +81,95 @@ body:not(.show-technical) .technical-panel:not(.guided-open){display:none!import
 #fpv-visual-review-canvas{display:block;width:100%;height:390px;background:#080e21;border:1px solid var(--line);border-radius:8px;cursor:crosshair}
 
 #stick-live-canvas { width:100%; height:300px; display:block; background:#0a0d19; border:1px solid #ffffff18; border-radius:8px; }
+
+/* Keep each file name readable and show data availability as a compact table below it. */
+.video-file-row{display:block;padding:8px 10px}
+.video-file-header{display:grid;grid-template-columns:20px minmax(0,1fr);column-gap:9px;align-items:start;min-width:0;cursor:pointer}
+.video-file-header input{grid-column:1;align-self:start;margin:2px 0 0}
+.video-file-header span{grid-column:2;min-width:0;width:100%;overflow-wrap:anywhere}
+.video-file-heading{display:flex;gap:10px;align-items:flex-start;min-width:0}
+.video-file-heading>.video-file-header,.video-file-heading>span{flex:1;min-width:0;overflow-wrap:anywhere}
+.video-file-heading>.recording-scope-button{flex:none;font-size:11px;padding:5px 9px;min-height:30px;line-height:1.3}
+.ignored-recording-row{background:#ffffff03}
+#fingerprint-plots .motion-chart{padding:10px;margin-top:10px}
+#fingerprint-plots .motion-chart h3{margin:0 0 6px;font-size:14px}
+#fingerprint-plots .motion-chart label{display:flex;align-items:center;gap:10px;margin:0 0 6px}
+#fingerprint-plots .motion-chart select{max-width:min(100%,400px);padding:4px 8px;min-height:30px}
+#fingerprint-plots .motion-chart canvas{height:180px}
+.video-file-row>.video-file-summary{display:block;width:auto;max-width:none;margin:3px 0 5px 29px;line-height:1.35}
+.identifier-table{width:calc(100% - 29px);margin:0 0 0 29px;border-collapse:collapse;table-layout:fixed;font-size:10px;line-height:1.25}
+.identifier-table tr{display:grid;grid-template-columns:18px minmax(82px,.8fr) minmax(0,1.2fr);align-items:start;border-bottom:1px solid #ffffff0b}
+.identifier-table tr:last-child{border-bottom:0}
+.identifier-table th,.identifier-table td{max-width:none;padding:3px 2px;border:0;text-align:left;vertical-align:top;overflow-wrap:anywhere;white-space:normal}
+.identifier-table th{font-weight:500;color:var(--muted)}
+.identifier-table td:first-child{padding-left:0}
+.identifier-mark{display:inline-block;width:14px;text-align:center;font-size:12px;font-weight:800}
+.identifier-mark.available{color:#65e6a0}
+.identifier-mark.missing{color:#ff6f78}
+.identifier-mark.warning{color:#ffd166}
+.identifier-mark.unknown{color:#8190ae}
+.identifier-key{margin:8px 2px 0;color:var(--muted);font-size:11px}
+
+.stick-review-actions>label{display:flex;align-items:center;gap:8px}
+.stick-review-actions select{max-width:min(50vw,480px)}
+.stick-review-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin-top:14px;align-items:start}
+.stick-review-player,.stick-review-editor{min-width:0;padding:14px;border:1px solid var(--line);border-radius:12px;background:#090f24}
+.stick-review-video-stage{position:relative;width:100%;aspect-ratio:16/9;min-height:200px;max-height:58vh;background:#020619;border-radius:8px;overflow:hidden}
+.stick-review-video-stage video,.stick-review-video-stage canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.stick-review-video-stage canvas{pointer-events:none;cursor:crosshair;touch-action:none}
+.stick-review-video-stage{cursor:crosshair}
+.stick-review-controls{gap:10px;margin-top:8px}
+.stick-review-controls label{display:flex;flex-direction:column;gap:5px;font-size:12px}
+.stick-review-editor textarea{width:100%;resize:vertical}
+.stick-review-chart canvas{height:340px;cursor:crosshair}
+.stick-review-chart .motion-legend{justify-content:space-between}
+.stick-review-table{max-height:300px;overflow:auto;margin-top:14px}
+.stick-review-table th:first-child,.stick-review-table td:first-child{white-space:nowrap}
+.stick-review-table td:last-child{white-space:nowrap}
+@media(max-width:800px){.stick-review-grid{grid-template-columns:minmax(0,1fr)}.stick-review-actions>label{flex:1 1 100%}.stick-review-actions select{max-width:none;min-width:0}}
+@media(max-width:430px){.identifier-table tr{grid-template-columns:17px minmax(68px,.85fr) minmax(0,1.15fr)}.identifier-table{font-size:9px}}
+.counterpart-selection{align-items:flex-end}.counterpart-selection .grow{min-width:min(100%,300px)}.counterpart-selection select{width:100%;max-width:100%}.counterpart-selection button{flex-shrink:0}.counterpart-visual{margin-top:16px;white-space:normal}.counterpart-table td{vertical-align:top}.counterpart-table td:first-child{min-width:180px;width:27%}.counterpart-table td:nth-child(2){min-width:240px;max-width:none;width:40%}.counterpart-table td:nth-child(3){min-width:135px}.counterpart-table small{display:block;margin-top:6px;line-height:1.45}.counterpart-table .badge{display:inline-block}.counterpart-table td:last-child button{white-space:nowrap}.counterpart-notes .actions{align-items:flex-start;margin-top:8px}.counterpart-notes .actions>span{flex:1;min-width:180px;overflow-wrap:anywhere}#counterpart-panel>.section-heading h3{margin:0}#counterpart-scope{overflow-wrap:anywhere}
+
+/* Split recordings on the full StickCam timeline. */
+.flight-timeline {position:relative;height:48px;margin:16px 0;background:#101510;border:1px solid var(--line);border-radius:4px;overflow:hidden;cursor:pointer}
+.flight-time-labels {display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
+.flight-part {position:absolute;top:4px;height:40px;padding:4px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;background:#285572;border:1px solid #4a86a9;border-radius:3px;font-size:.75rem}
+.flight-part.confirmed {background:#355e39;border-color:#6aa979}.flight-part.later {background:#796a2c}
+.flight-cursor {position:absolute;top:0;bottom:0;left:0;width:2px;background:var(--text);pointer-events:none;z-index:2}
+.flight-part-row {display:flex;align-items:center;gap:12px;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.flight-part-row span {min-width:0}.flight-part-row small {display:block}.flight-part-row button {flex-shrink:0}.flight-conflict {border-left:3px solid #b15d47;padding-left:12px}
+#flight-preview video {display:block;width:100%;max-height:50vh;background:#000} #flight-seek {width:100%}
+#flight-preview .buffer-overlay {position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:8px;background:#111b;pointer-events:none}#flight-preview .buffer-overlay[hidden] {display:none}
+@media(max-width:650px){.flight-part-row{flex-wrap:wrap}}
+
+.flight-candidate-list{max-height:360px;overflow:auto;margin-bottom:12px}
+
+.rhythm-match{color:#9fd8a9;border-left:3px solid #6aa979;padding-left:10px}#pair-rhythm-sections{max-height:260px;overflow:auto}
+
+/* One StickCam viewport serves starting calibration and timed tracking corrections. */
+.stick-workspace-heading{align-items:center;margin:0 0 10px!important}
+.stick-workspace-heading .hint{margin:0;min-width:0;overflow-wrap:anywhere}
+#cal-stage #stick-review-overlay{pointer-events:none;cursor:default}
+#cal-stage.watching #roi-canvas{display:none}
+.stick-playhead-label{display:flex;align-items:center;gap:12px;margin-top:14px;font-size:12px;color:var(--muted)}
+#stick-playhead{flex:1;min-width:0;accent-color:var(--cyan);padding:0}
+.stick-review-landmarks{margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:12px}
+#stick-review-unsaved{white-space:normal;line-height:1.4}
+.calibration-preview .stick-review-chart{margin-top:14px}
+.calibration-preview .stick-review-chart canvas{height:280px}
+.calibration-preview .stick-review-table{max-height:300px}
+.calibration-preview .stick-review-editor{margin-top:12px}
+@media(max-width:600px){.stick-workspace-heading{align-items:flex-start}.stick-playhead-label{align-items:stretch;flex-direction:column}.calibration-preview .stick-review-chart canvas{height:240px}}
+
+.manual-video-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:16px}
+.manual-video-grid.stacked{grid-template-columns:minmax(0,1fr)}
+.manual-source{min-width:0;border:1px solid var(--line);border-radius:10px;padding:14px}
+.manual-source h3{margin:0 0 10px}
+.manual-source video{width:100%;aspect-ratio:16/9;object-fit:contain;background:#020402;border-radius:6px;display:block}
+.manual-source select{width:100%;min-width:0}
+.manual-source input[type=number]{width:110px}
+.manual-source .actions{gap:8px}
+.manual-source .actions button{padding:8px 10px}
+.manual-source .hint{overflow-wrap:anywhere}
+.manual-recorder{margin-top:18px}
+@media(max-width:800px){.manual-video-grid{grid-template-columns:minmax(0,1fr)}}

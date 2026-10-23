@@ -14,6 +14,7 @@ from fpv_matcher.cache.fingerprints import _key, get_or_extract
 from fpv_matcher.config import validate_calibration
 from fpv_matcher.radio.stabilization import VERSION as OUTLINE_VERSION, extract_review_sticks
 from fpv_matcher.radio.stick_tracker import ALGORITHM_VERSION, MAX_DIMENSION, extract_sticks
+from fpv_matcher.radio.landmarks import VERSION as LANDMARK_VERSION
 
 FULL_SPAN_VERSION = "reference-backward-tracking-v1"
 
@@ -27,7 +28,7 @@ def specification(calibration, fps):
         calibration.pop("radio_rotation_deg")  # Preserve existing upright caches.
     outline = "radio_outline" in calibration
     return ("radio-review" if outline else "radio",
-            (ALGORITHM_VERSION + OUTLINE_VERSION if outline else ALGORITHM_VERSION) + (FULL_SPAN_VERSION if calibration["reference_time"] > 0 else ""),
+            (ALGORITHM_VERSION + OUTLINE_VERSION if outline else ALGORITHM_VERSION) + (FULL_SPAN_VERSION if calibration["reference_time"] > 0 else "") + (LANDMARK_VERSION if calibration.get("tracking_landmarks") else ""),
             {"sample_fps": float(fps), "config": calibration, "max_dimension": MAX_DIMENSION})
 
 
@@ -74,6 +75,20 @@ def _validate(data):
             quality = np.asarray(data[key])
             if quality.shape != times.shape or not np.isfinite(quality).all() or ((quality < 0) | (quality > 1)).any():
                 raise ValueError("Invalid saved StickCam observation quality")
+    for key in ("left_tip_landmark", "right_tip_landmark"):
+        if key in data:
+            flags = np.asarray(data[key])
+            if flags.shape != times.shape or not np.isin(flags, [-1, 0, 1]).all():
+                raise ValueError("Invalid saved tracking landmark events")
+    if "frame_calibration_landmark" in data:
+        flags = np.asarray(data["frame_calibration_landmark"])
+        if flags.shape != times.shape or not np.isin(flags, [0, 1]).all():
+            raise ValueError("Invalid saved frame calibration events")
+    from fpv_matcher.radio.tracking_review import GEOMETRY_KEYS
+    if any(key in data for key in GEOMETRY_KEYS):
+        for key in GEOMETRY_KEYS:
+            if key not in data or np.asarray(data[key]).shape != times.shape or not np.isfinite(data[key]).all():
+                raise ValueError("Incomplete saved tracking geometry")
 
 
 def observation_status(data):
@@ -95,6 +110,12 @@ def observation_status(data):
               "observation_state": "no_observations" if not observed.any() else "partial" if percent < 99 else "observed"}
     if "radio_orientation_quality" in data:
         result["outline_usable_percent"] = round(float((np.asarray(data["radio_orientation_quality"]) >= .35).mean() * 100), 1)
+    events = [np.asarray(data[key]) for key in ("left_tip_landmark", "right_tip_landmark") if key in data]
+    if events:
+        result["landmarks_applied"] = int(sum((flags > 0).sum() for flags in events))
+        result["landmarks_rejected"] = int(sum((flags < 0).sum() for flags in events))
+    if "frame_calibration_landmark" in data:
+        result["calibration_landmarks_applied"] = int((np.asarray(data["frame_calibration_landmark"]) > 0).sum())
     if percent < 10:
         result["quality_warning"] = "Saved inputs contain very little jointly observed stick data. Review tracking or use audio; repeated extraction with the same calibration will not fix covered tips."
     return result

@@ -1,7 +1,13 @@
 // Keep HTMLVideoElement timestamps in the original recording's time domain.
 // Each fragment is independently seekable; no whole-file transcode is queued.
 const players = new Map();
+const LOOK_AHEAD = 6;
 const clamp = (value, maximum) => Math.max(0, Math.min(Number(value) || 0, Math.max(0, maximum - 1 / 30)));
+
+export function setPreviewPlaybackIntent(video, playing) {
+  const player=players.get(video);
+  if (player) { player.playing=playing; player.wake(); }
+}
 
 export function releasePreview(video) {
   players.get(video)?.dispose();
@@ -39,9 +45,10 @@ function decodedFrame(video, at) {
   });
 }
 
-export async function loadFastPreview(video, base, current, notify, initialTime = 0) {
+export async function loadFastPreview(video, base, current, notify, initialTime = 0, acceleration = 'auto') {
   releasePreview(video);
-  const descriptorResponse = await fetch(base);
+  const option=encodeURIComponent(acceleration);
+  const descriptorResponse = await fetch(`${base}?acceleration=${option}`);
   if (!descriptorResponse.ok) throw new Error('Could not read preview metadata.');
   const manifest = await descriptorResponse.json();
   if (!current()) return;
@@ -49,10 +56,10 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
     throw new Error('Fast preview needs a browser supporting H.264 Media Source playback. Try current Chrome or Edge, or play a supported original.');
   }
   const media = new MediaSource(), url = URL.createObjectURL(media);
-  let buffer, disposed = false, busy = false, controller, activeIndex = -1, timer;
+  let buffer, disposed = false, busy = false, controller, activeIndex = -1, anchorIndex = -1, timer;
   const loaded = new Set();
   const atIndex = () => Math.min(manifest.chunks - 1, Math.floor(clamp(video.currentTime, manifest.duration) / manifest.chunk_seconds));
-  const player = {dispose() {
+  const player = {playing:false, wake:()=>void pump(), dispose() {
     if (disposed) return;
     disposed = true; clearInterval(timer); controller?.abort();
     for (const event of ['seeking', 'play', 'timeupdate']) video.removeEventListener(event, wake);
@@ -63,16 +70,19 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
   }};
   players.set(video, player);
   function fail() { if (!disposed && current()) notify('Fast preview playback failed. Reload the pair to retry.', true); player.dispose(); }
-  function wake() {
-    if (activeIndex >= 0 && Math.abs(activeIndex - atIndex()) > 1) controller?.abort();
+  function wake(event) {
+    // Cancel only a real seek away from the current buffer window. Upcoming
+    // fragments are deliberately ahead of the playhead, not obsolete requests.
+    if (event?.type==='seeking' && activeIndex >= 0 && anchorIndex !== atIndex()) controller?.abort();
     void pump();
   }
   async function remove(start, end) {
-    if (end > start && buffer.buffered.length) await eventUntil(buffer, 'updateend', () => buffer.remove(start, end), 10000);
+    const intersects=Array.from({length:buffer.buffered.length},(_,i)=>i).some(i=>buffer.buffered.start(i)<end && buffer.buffered.end(i)>start);
+    if (end > start && intersects) await eventUntil(buffer, 'updateend', () => buffer.remove(start, end), 10000);
   }
   async function trim() {
     const at = video.currentTime, size = manifest.chunk_seconds;
-    const before = Math.max(0, Math.floor(at / size) * size - 2 * size), after = Math.min(manifest.duration, Math.ceil(at / size) * size + 4 * size);
+    const before = Math.max(0, Math.floor(at / size) * size - 2 * size), after = Math.min(manifest.duration, Math.ceil(at / size) * size + (LOOK_AHEAD+2) * size);
     if (before > 0) await remove(0, before);
     if (after < manifest.duration) await remove(after, manifest.duration + 1);
     for (const index of loaded) if ((index + 1) * size <= before || index * size >= after) loaded.delete(index);
@@ -81,7 +91,7 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
     if (!current()) { player.dispose(); return; }
     if (loaded.has(index) || index < 0 || index >= manifest.chunks || disposed) return;
     activeIndex = index; controller = new AbortController();
-    const response = await fetch(`${base}/${index}?source=${encodeURIComponent(manifest.source_key)}`, {signal: controller.signal});
+    const response = await fetch(`${base}/${index}?source=${encodeURIComponent(manifest.source_key)}&acceleration=${option}`, {signal: controller.signal});
     if (!response.ok) {
       let text = 'Preview chunk could not be prepared.';
       try { text = (await response.json()).detail || text; } catch {}
@@ -89,14 +99,17 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
     }
     const bytes = await response.arrayBuffer();
     if (disposed || !current()) return;
+    video.dataset.previewDecoder=response.headers.get('X-Preview-Decoder') || 'cpu';
     const start = Number(response.headers.get('X-Preview-Start'));
     const duration = Number(response.headers.get('X-Preview-Duration'));
     const videoStart = Number(response.headers.get('X-Preview-Video-Start'));
     if (![start, duration, videoStart].every(Number.isFinite) || duration <= 0) throw new Error('Invalid preview timing.');
     buffer.timestampOffset = start - videoStart;
     buffer.appendWindowStart = 0;
-    buffer.appendWindowEnd = start + duration;
-    buffer.appendWindowStart = start;
+    // Leave room for AAC priming and timestamp rounding at chunk boundaries.
+    // The video timestampOffset still places the first frame on the source clock.
+    buffer.appendWindowEnd = start + duration + .05;
+    buffer.appendWindowStart = Math.max(0,start-.05);
     try {
       await eventUntil(buffer, 'updateend', () => buffer.appendBuffer(bytes), 15000);
     } catch (error) {
@@ -113,11 +126,12 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
     try {
       await trim();
       let index = atIndex();
+      anchorIndex = index;
       await ensure(index);
       if (index !== atIndex()) return;
-      // Paused views buffer one following fragment. While playing, two give
-      // both feeds time to decode over LAN without converting the whole clip.
-      const count = video.paused ? 1 : 2;
+      // Keep reading ahead even when synchronization temporarily pauses both
+      // elements to buffer. Explicitly paused views retain two following chunks.
+      const count = player.playing ? LOOK_AHEAD : 2;
       for (let n = 1; n <= count && index === atIndex(); n++) await ensure(index + n);
       if (index === manifest.chunks - 1 && media.readyState === 'open' && !buffer.updating) media.endOfStream();
     } catch (error) {
@@ -130,10 +144,11 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
     if (!current()) { player.dispose(); return; }
     buffer = media.addSourceBuffer(manifest.mime); buffer.mode = 'segments';
     const at = clamp(initialTime, manifest.duration);
+    anchorIndex = Math.floor(at / manifest.chunk_seconds);
     busy = true;
     const metadata = video.readyState >= 1 ? Promise.resolve() : eventUntil(video, 'loadedmetadata');
     metadata.catch(() => {});
-    await ensure(Math.floor(at / manifest.chunk_seconds)); await metadata;
+    await ensure(anchorIndex); await metadata;
     media.duration = manifest.duration;
     await decodedFrame(video, at);
     if (!current()) { player.dispose(); return; }
@@ -142,7 +157,7 @@ export async function loadFastPreview(video, base, current, notify, initialTime 
     video.addEventListener('error', fail);
     timer = setInterval(() => void pump(), 500);
     void pump();
-    notify('Fast preview ready · 480p chunks on demand; exports use the originals.');
+    notify('Fast preview ready · upcoming chunks are buffered; exports use the originals.');
   } catch (error) { player.dispose(); if (current()) throw error; }
 }
 window.addEventListener('pagehide', releaseAllPreviews);

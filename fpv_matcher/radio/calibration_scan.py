@@ -31,7 +31,7 @@ def _scale_region(region, sx, sy):
             else value * min(sx, sy) if key == "tip_radius" else value for key, value in region.items()}
 
 
-def _proposal(image, references, radio_model="auto"):
+def _proposal(image, references, radio_model="auto", *, include_tips=True):
     proposals = []
     for reference in references:
         candidate = suggest_from_reference(reference["image"], image, reference["outline"], reference["regions"])
@@ -45,10 +45,13 @@ def _proposal(image, references, radio_model="auto"):
     else:
         proposal = suggest_radio_orientation(image, radio_model=radio_model)
     for region in proposal["regions"].values():
-        if "tip_x" not in region:
+        if include_tips and "tip_x" not in region:
             tip = suggest_visible_tip(image, region)
             if tip is not None:
                 region.update(tip)
+        if not include_tips:
+            region.pop("tip_x", None)
+            region.pop("tip_y", None)
     proposal["missing_tips"] = [side for side, region in proposal["regions"].items() if "tip_x" not in region]
     return {"frame_width": int(image.shape[1]), "frame_height": int(image.shape[0]), **proposal}
 

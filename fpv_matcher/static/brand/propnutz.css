@@ -1,0 +1,201 @@
+/* PropNutz companion workspace. Brand reference: https://www.propnutz.co.uk/.
+   Presentation only: calibration controls and workflow layout stay in style.css. */
+:root {
+  --ink: #111311;
+  --paper: #e8e3d8;
+  --red: #e63c2e;
+  --blue: #49a7f2;
+  --bg: var(--ink);
+  --panel: #1b1e1c;
+  --line: #373b35;
+  --border: var(--line);
+  --muted: #aaa99f;
+  --text: var(--paper);
+  --accent: var(--red);
+  --purple: var(--red);
+  --cyan: var(--blue);
+  --pink: #f06f62;
+  --surface: #171a17;
+  --surface-sunken: #0e100e;
+  --button-red: #ca3428;
+  --display: 'Barlow Condensed', 'Arial Narrow', Impact, sans-serif;
+  --body: 'Barlow', Arial, sans-serif;
+}
+
+body {
+  background: radial-gradient(ellipse at 0 55%, #24251e55, transparent 45%), var(--ink);
+  color: var(--paper);
+  font-family: var(--body);
+}
+::selection { background: var(--red); color: #fff; }
+main { padding-top: 28px; }
+.app-header { padding: 0 0 4px; }
+.brand-bar {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  padding: 0 0 22px;
+  border-bottom: 1px solid var(--line);
+}
+.brand-wordmark {
+  display: inline-block;
+  flex-shrink: 0;
+  padding: 3px 5px 0 0;
+  color: var(--paper);
+  font: italic 900 38px/1 var(--display);
+  letter-spacing: -.03em;
+}
+.brand-wordmark > span { color: var(--red); }
+.brand-wordmark small {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+  font: 700 9px/1.8 var(--body);
+  letter-spacing: .4em;
+}
+.brand-wordmark:hover { text-decoration: none; }
+.brand-product { padding-left: 24px; border-left: 1px solid var(--line); }
+.brand-product > span {
+  display: block;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .17em;
+}
+.brand-product > strong {
+  display: block;
+  margin-top: 3px;
+  font: 700 25px/1.15 var(--display);
+  text-transform: uppercase;
+  letter-spacing: .025em;
+}
+.brand-site-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 22px;
+  margin-left: auto;
+  padding: 10px 15px;
+  border: 1px solid #696c60;
+  color: var(--paper);
+  font-size: 12px;
+  font-weight: 600;
+}
+.brand-site-link:hover { color: var(--blue); border-color: var(--blue); text-decoration: none; }
+.brand-intro {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(250px, .85fr);
+  align-items: end;
+  gap: 30px;
+  padding: 28px 0 24px;
+}
+.app-header .eyebrow { color: var(--muted); font-size: 10px; letter-spacing: .16em; margin-bottom: 12px; }
+.app-header h1 {
+  margin: 0;
+  padding-bottom: .06em;
+  overflow: visible;
+  background: none;
+  color: var(--paper);
+  -webkit-text-fill-color: currentColor;
+  font-family: var(--display);
+  font-weight: 900;
+  font-size: clamp(44px, 6vw, 72px);
+  line-height: 1.04;
+  letter-spacing: -.015em;
+  text-transform: uppercase;
+}
+.app-header h1 > span { display: block; color: var(--red); }
+.brand-description { padding-bottom: 6px; }
+.brand-description .lede { max-width: 39ch; margin: 0; color: var(--paper); font-size: 16px; line-height: 1.6; }
+.brand-signoff { margin: 16px 0 0; font-size: 10px; font-weight: 700; letter-spacing: .16em; color: var(--muted); }
+.brand-toolbar { justify-content: flex-start; gap: 8px; border-top: 1px solid var(--line); padding-top: 16px; }
+.brand-toolbar #system { flex: 1 1 280px; font-size: 12px; }
+
+h2 { font: 700 27px/1.2 var(--display); text-transform: uppercase; letter-spacing: .01em; }
+.compact h2 { font-size: 23px; }
+h3 { color: var(--paper); }
+.panel { background: var(--panel); border-color: var(--line); border-radius: 3px; box-shadow: none; }
+.workflow-panel { border-top: 3px solid var(--red); background: var(--panel); }
+.step { background: #e63c2e12; border-color: #e63c2e66; color: #ff7667; border-radius: 2px; }
+button {
+  background: var(--button-red);
+  border-radius: 3px;
+  box-shadow: none;
+  color: #fff;
+  font-weight: 600;
+}
+button:hover:enabled { background: #bf2d21; }
+button.secondary { background: var(--surface); color: var(--paper); border-color: #4b5047; border-radius: 3px; }
+button.secondary:hover:enabled, button.secondary.active { background: #242923; border-color: var(--blue); }
+.brand-toolbar #new-session, .calibration-preview .calibration-save-controls #save-calibration {
+  background: var(--button-red); border-color: var(--button-red); color: #fff;
+}
+.brand-toolbar #new-session:hover:enabled, .calibration-preview .calibration-save-controls #save-calibration:hover:enabled { background: #bf2d21; }
+input[type=text], input[type=number], select, textarea { background: var(--surface-sunken); border-color: #53594e; border-radius: 3px; }
+input[type=file] { background: var(--surface); border-color: #676e60; border-radius: 3px; }
+input[type=checkbox], input[type=range] { accent-color: var(--red); }
+a { color: var(--blue); }
+summary { color: var(--paper); }
+th { color: var(--muted); }
+.error { color: #ff9389; }
+.badge { color: var(--paper); background: #252a24; border-color: #53594e; border-radius: 3px; }
+.badge.strong { color: #96dfb2; border-color: #497354; }
+.badge.review { color: #ffd38b; border-color: #826230; }
+.badge.saved { color: #8dcbfa; border-color: #456c85; }
+progress, progress::-webkit-progress-bar { background: #30352f; }
+progress::-webkit-progress-value { background: var(--red); }
+progress::-moz-progress-bar { background: var(--red); }
+.pair-card { background: var(--surface); border-color: var(--line); }
+.pair-card:hover, .pair-card.active { background: #242923; border-color: var(--blue); }
+.pair-card .names span + span { color: #a2c3dd; }
+.interval-track { background: #30352f; }
+.interval-shared { background: #49a7f2aa; }
+.workflow-stat { background: var(--surface); border-radius: 3px; }
+.workflow-stat strong { font-family: var(--display); font-size: 32px; line-height: 1.25; color: var(--blue); }
+.matching-evidence, .evidence-option, .extraction-progress-row, .stick-progress-card { border-radius: 3px; }
+.calibration-controls, .calibration-preview .marker-group, .calibration-playback-controls,
+.stick-progress-card, .motion-chart, .stick-review-player, .stick-review-editor {
+  background: var(--surface); border-color: var(--line); border-radius: 3px;
+}
+.cal-stage, .video-pair video, #radio-stabilize-media video, #radio-stabilize-media canvas,
+.stick-review-video-stage, #fpv-visual-review-video {
+  background: var(--surface-sunken); border-radius: 3px;
+}
+.session-thumbnail, .session-thumbnail-placeholder, #radio-shape-preview,
+#fpv-visual-review-canvas, #stick-live-canvas {
+  background: var(--surface-sunken); border-color: var(--line); border-radius: 2px;
+}
+.video-file-list, .video-file-row { background: var(--surface); border-color: var(--line); }
+#folder-picker { background: var(--panel); color: var(--paper); border-color: #53594e; border-radius: 4px; }
+#folder-picker::backdrop { background: #080b09cc; }
+.folder-entries, .folder-current, #folder-network-shares { background: var(--surface); border-color: var(--line); border-radius: 3px; }
+.folder-entry button { background: var(--surface); }
+.folder-entry button:hover:enabled { background: #242923; border-color: var(--blue); }
+.folder-entry span { color: var(--muted); }
+.folder-current code, .folder-video .folder-entry-icon { color: var(--blue); }
+.folder-video { color: var(--muted); }
+.brand-footer { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); text-align: left; }
+.brand-footer > a { font-family: var(--display); font-size: 21px; font-style: italic; font-weight: 800; text-transform: uppercase; color: var(--paper); }
+.brand-footer > span { margin-left: 8px; font-size: 12px; }
+.brand-footer > small { display: block; margin-top: 7px; font-size: 11px; }
+
+@media (max-width: 720px) {
+  main { padding-top: 20px; }
+  .brand-bar { gap: 18px; padding-bottom: 18px; }
+  .brand-wordmark { font-size: 32px; }
+  .brand-product { padding-left: 18px; }
+  .brand-product > strong { font-size: 22px; }
+  .brand-site-link { font-size: 11px; gap: 8px; padding: 8px 10px; }
+  .brand-intro { grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 22px 0; }
+  .app-header h1 { font-size: clamp(44px, 10vw, 62px); }
+  .brand-description .lede { max-width: 48ch; font-size: 15px; }
+  .brand-signoff { margin-top: 10px; }
+  .brand-toolbar #system { flex-basis: 100%; }
+}
+@media (max-width: 480px) {
+  .brand-bar { flex-wrap: wrap; column-gap: 18px; row-gap: 10px; }
+  .brand-wordmark { font-size: 30px; }
+  .brand-product > span { font-size: 8px; }
+  .brand-product > strong { font-size: 21px; }
+  .brand-site-link { padding: 0; border: 0; margin: 2px 0 0; flex-basis: 100%; width: fit-content; }
+  .brand-toolbar button { flex: 1 1 auto; padding: 9px 11px; }
+}

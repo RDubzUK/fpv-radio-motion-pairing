@@ -79,6 +79,27 @@ def run_selected(fpv_paths, radio_paths, config, output, cache, settings, progre
         row["global_assignment"] = (ri, fi) in selected
         if row["candidate_margin"] < .08:
             row["confidence"] = "review"
+    rhythm_scores = np.zeros_like(matrix)
+    for row in rows:
+        if row.get("rhythm"):
+            rhythm_scores[rn.index(row["radio_video"]), fn.index(row["fpv_video"])] = row["rhythm"]["score"]
+    for row in rows:
+        if row.get("rhythm"):
+            separation = candidate_margin(rhythm_scores, rn.index(row["radio_video"]), fn.index(row["fpv_video"]), multiple_fpv=True)
+            row["rhythm"].update(candidate_margin=float(separation), suggested=bool(row["rhythm"]["eligible"] and separation >= .06))
+            if row["rhythm"]["eligible"] and not row["rhythm"]["suggested"]:
+                row["rhythm"]["reason"] = "Competing StickCam candidates have similar rhythms; no distinct suggestion."
+    activity_scores = np.zeros_like(matrix)
+    for row in rows:
+        if row.get("gimbal_activity"):
+            activity_scores[rn.index(row["radio_video"]), fn.index(row["fpv_video"])] = row["gimbal_activity"]["score"]
+    for row in rows:
+        if row.get("gimbal_activity"):
+            check = row["gimbal_activity"]
+            separation = candidate_margin(activity_scores, rn.index(row["radio_video"]), fn.index(row["fpv_video"]), multiple_fpv=True)
+            check.update(candidate_margin=float(separation), suggested=bool(check["eligible"] and separation >= .04))
+            if check["eligible"] and not check["suggested"]:
+                check["reason"] = "Other StickCam candidates have similar activity; compare the competing recordings."
     result = {"version": 4, "pairing_model": "multiple_fpv_segments_per_stickcam", "rows": rows, "errors": errors, "clips": {k: list(v.values()) for k, v in clips.items()},
         "rate_profile": settings.get("rate_profile"), "settings": settings,
         "clock": {"delta_seconds": None, "confidence": 0, "support": 0},

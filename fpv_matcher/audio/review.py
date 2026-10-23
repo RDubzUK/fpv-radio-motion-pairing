@@ -86,7 +86,8 @@ def run(request_path):
         progress(0)
         identity = request.get(kind + "_identity")
         waveform = get_or_extract(path, cache, "waveform", VERSION, {}, lambda: extract_waveform(path, progress), identity)
-        audio = get_or_extract(path, cache, "audio", ALGORITHM_VERSION, {"boundary_seconds": 30}, lambda: extract_audio(path), identity, validate=validate_audio)
+        boundary = request.get("boundary_seconds", 30)
+        audio = get_or_extract(path, cache, "audio", ALGORITHM_VERSION, {"boundary_seconds": boundary}, lambda: extract_audio(path, boundary), identity, validate=validate_audio)
         stat = Path(path).stat()
         if [stat.st_size, stat.st_mtime_ns] != request["signatures"][kind]:
             raise ValueError("Audio source changed while reading it; reload the waveforms")

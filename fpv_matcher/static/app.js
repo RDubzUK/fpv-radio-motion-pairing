@@ -1,4 +1,7 @@
-import {loadFastPreview, releasePreview, releaseAllPreviews} from '/static/preview-player.js?v=1';
+import {installManualPairing} from './manual-pairing.js?v=2';
+import {installFingerprintReview} from './fingerprint-review.js?v=1';
+import {installFlightView, renderFlightView, clearFlightPreview, pauseFlight} from './flight-view.js?v=1';
+import {loadFastPreview, releasePreview, releaseAllPreviews, setPreviewPlaybackIntent} from '/static/preview-player.js?v=4';
 const $ = id => document.getElementById(id);
 const state = { job: null, results: null, source: 'upload', busy: false, uploadController: null,
   jobToken: 0, calToken: 0, viewerToken: 0, pollTimer: null, exportTimers: new Map(),
@@ -7,12 +10,16 @@ const state = { job: null, results: null, source: 'upload', busy: false, uploadC
   frameController: null, frameURL: null, frameToken: 0, offsetToken: 0, targets: {fpv: new Set(), radio: new Set()},
   calibrationRotationOverride: null, calibrationName: null, calibrationProposalId: null, calibrationDrafts: {}, calibrationFrameReady: false, suggesting: false, suggestionToken: 0, suggestionController: null };
 let calibrationLoad = null;
+const storage = {getItem(key){try{return window.localStorage.getItem(key);}catch{return null;}},setItem(key,value){try{window.localStorage.setItem(key,value);}catch{}},removeItem(key){try{window.localStorage.removeItem(key);}catch{}}};
 const clone = value => JSON.parse(JSON.stringify(value));
 const calibrationScan = { id: null, jobId: null, token: 0, timer: null, running: false, rows: [] };
 const segmentScan = {token:0, timer:null, task:null, running:false};
 const fpvPreparation = {key:'', refreshed:0, token:0, task:null, jobId:null, timer:null, running:false, selected:new Set()};
 const fpvVisualReview = {token:0, windowToken:0, name:null, fps:null, data:null, duration:0, frame:null, pending:false, controller:null};
 const radioOrientation = { token: 0, timer: null, task: null, running: false, result: null };
+const stickReview = { token: 0, name: null, jobId: null, data: null, dirty: false, frame: null, reloadAfterDerivation: null,
+  trackingWindow:null, windowPending:false, windowToken:0, windowRetry:0, framePurpose:'initial', frameEdits:false, loading:false, saving:null };
+const counterpartSearch = {starting:false, candidatesKey:null};
 const part = value => encodeURIComponent(value);
 const path = suffix => `/api/jobs/${state.job.id}${suffix}`;
 const show = (id, visible = true) => $(id).classList.toggle('hidden', !visible);
@@ -32,6 +39,23 @@ const el = (tag, text, className) => { const node = document.createElement(tag);
 let radioModels = [];
 const action = (text, callback, className = 'secondary') => { const button = el('button', text, className); button.addEventListener('click', callback); return button; };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function waitForServer() {
+  let lastError;
+  for (let attempt = 1; attempt <= 45; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try { return await api('/api/system', { signal: controller.signal }); }
+      finally { clearTimeout(timeout); }
+    }
+    catch (error) {
+      lastError = error;
+      message('system', `Connecting to the local server… (${attempt}/45)`);
+      if (attempt < 45) await sleep(1000);
+    }
+  }
+  throw new Error(`Could not connect to the local server: ${lastError?.message || 'no response'}`);
+}
 async function api(url, options = {}) {
   const { json, ...request } = options;
   if (json !== undefined) { request.body = JSON.stringify(json); request.headers = { ...request.headers, 'Content-Type': 'application/json' }; }
@@ -45,6 +69,32 @@ async function api(url, options = {}) {
 function guarded(callback, target) {
   return async (...args) => { try { await callback(...args); } catch (error) { if (error.name !== 'AbortError') message(target, error.message, true); } };
 }
+const fingerprintReview=installFingerprintReview({$,getJob:()=>state.job,getToken:()=>state.jobToken,getPair:()=>state.pair,api,notice:message,fmt:time,onTaskChange:()=>{renderVideoLists();refreshStickData(true).catch(error=>message('stick-data-message',error.message,true));},
+  onPreview:async(radio,fpv,offset,signatures)=>{
+    const info=await api(path('/pair-info'),{method:'POST',json:{radio_video:radio,fpv_video:fpv,offset_seconds:offset,manual_pair:true}});
+    if(signatures && ['radio','fpv'].some(k=>JSON.stringify(signatures[k])!==JSON.stringify(info.source_signatures[k])))throw new Error('Source changed since these rhythms were loaded. Reload the rhythm comparison.');
+    await openPair(radio,fpv,offset,false,false,{source_revisions:info.source_revisions});
+  },
+  onSeek:(radio,fpv,at)=>{if(state.pair?.radio_video===radio&&state.pair.fpv_video===fpv){pausePair();seekPair(at-state.pair.radio_start);}},
+  getPlayhead:(radio,fpv)=>state.pair?.radio_video===radio&&state.pair.fpv_video===fpv?$('radio-preview').currentTime:null});
+const manualBrowser = installManualPairing({$,getJob:()=>state.job,getToken:()=>state.jobToken,api,loadVideo,fmt:time,
+  onPreview:(radio,fpv,offset,options)=>openPair(radio,fpv,offset,false,false,options),
+  onLabel:assignFPVRecorder,pauseOther:()=>{pausePair();pauseFlight();$('cal-video').pause();pauseMotionPreview();}});
+async function assignFPVRecorder(names,label) {
+  if(!state.job)return;
+  const id=state.job.id,token=state.jobToken;
+  const job=await api(`/api/jobs/${id}/fpv-recorders`,{method:'PUT',json:{names,label}});
+  if(token!==state.jobToken)return;
+  state.job=job;manualBrowser.render();renderVideoLists();
+  if(job.has_results)await loadResults();
+}
+$('fpv-recorder-apply').onclick=guarded(async()=>{
+  if($('match-target-kind').value!=='fpv'||!state.targets.fpv.size)throw new Error('Choose Selected FPV scope and select the files from this recorder.');
+  await assignFPVRecorder([...state.targets.fpv],$('fpv-recorder-label').value.trim());
+  message('fpv-recorder-message',`Recorder label saved for ${state.targets.fpv.size} FPV file(s). Date suggestions updated using separate recorder clocks.`);
+},'fpv-recorder-message');
+$('workflow-manual').onclick=()=>{openPanel('manual-pair-panel');manualBrowser.render();$('manual-pair-panel').scrollIntoView({behavior:'smooth',block:'start'});};
+
 function setBusy(value) {
   state.busy = value;
   $('prepare').disabled = value;
@@ -52,35 +102,97 @@ function setBusy(value) {
   document.querySelectorAll('#history button').forEach(button => button.disabled = value);
 }
 function activeAnalysis() { return state.job && ['queued', 'running', 'cancelling'].includes(state.job.status); }
-const evidenceFields = {fpv_gyro: 'use-fpv-gyro', fpv_visual: 'use-fpv-visual', stick_inputs: 'use-stick-inputs', fpv_audio: 'use-fpv-audio', stickcam_audio: 'use-stickcam-audio', filename_timestamps: 'use-filename-timestamps'};
+const evidenceFields = {fpv_gyro: 'use-fpv-gyro', fpv_visual: 'use-fpv-visual', stick_inputs: 'use-stick-inputs', fpv_audio: 'use-fpv-audio', stickcam_audio: 'use-stickcam-audio', filename_timestamps: 'use-filename-timestamps', movement_rhythm:'use-movement-rhythm', gimbal_activity:'use-gimbal-activity'};
 function readEvidenceSources() {
   return Object.fromEntries(Object.entries(evidenceFields).map(([key, id]) => [key, $(id).checked]));
 }
 function evidenceMode(sources = readEvidenceSources()) {
-  return {motion: sources.stick_inputs && (sources.fpv_gyro || sources.fpv_visual), audio: sources.fpv_audio && sources.stickcam_audio};
+  return {motion: (sources.stick_inputs || sources.gimbal_activity) && (sources.fpv_gyro || sources.fpv_visual), audio: sources.fpv_audio && sources.stickcam_audio};
 }
 function loadEvidenceSources(settings = {}) {
   const source = settings.motion_source || 'auto', audio = settings.audio_enabled !== false;
-  const defaults = {fpv_gyro: source !== 'visual', fpv_visual: settings.matching_strategy === 'selected' && source !== 'gyro', stick_inputs: true, fpv_audio: audio, stickcam_audio: audio, filename_timestamps: true};
+  const defaults = {fpv_gyro: source !== 'visual', fpv_visual: source !== 'gyro', stick_inputs: true, fpv_audio: audio, stickcam_audio: audio, filename_timestamps: true, movement_rhythm:false, gimbal_activity:true};
   for (const [key, id] of Object.entries(evidenceFields)) $(id).checked = settings.evidence_sources?.[key] ?? defaults[key];
+  $('workflow-rhythm').checked=$('use-movement-rhythm').checked;
   updateEvidenceSummary();
 }
 function updateEvidenceSummary() {
+  if(!$('use-stick-inputs').checked)$('use-movement-rhythm').checked=false;
+  $('use-movement-rhythm').disabled=!$('use-stick-inputs').checked;
+  $('workflow-rhythm').checked=$('use-movement-rhythm').checked;
+  $('workflow-gimbal-activity').checked=$('use-gimbal-activity').checked;
   const sources = readEvidenceSources(), mode = evidenceMode(sources), notes = [];
   if (mode.motion) notes.push(sources.fpv_gyro ? (sources.fpv_visual ? 'Embedded FPV motion first; visual fallback if needed.' : 'Embedded FPV motion only; no visual extraction.') : 'Visual FPV motion only; embedded data is skipped.');
   else notes.push('All motion extraction and StickCam derivation are skipped; no calibration is required.');
   notes.push(mode.audio ? 'Boundary audio matching is enabled.' : 'Audio extraction and matching are skipped.');
+  if(sources.gimbal_activity) notes.push(mode.motion ? 'Tip-free gimbal activity is cached independently; tips and rates are unnecessary. Suggestions need visible-event review.' : 'Gimbal movement needs an FPV motion source.');
+  if(sources.gimbal_activity && sources.stick_inputs) notes.push('Both methods are selected: precise stick derivation will also run. Choose Movement · no tip tracking for the lighter pass.');
+  if(sources.movement_rhythm) notes.push(sources.stick_inputs && mode.motion ? 'Derived-input rhythm uses the saved stick data.' : 'Derived-input rhythm needs StickCam inputs and an FPV motion source.');
   if (sources.fpv_audio !== sources.stickcam_audio) notes.push('Select both audio sources to use audio.');
-  if (!mode.motion && (sources.stick_inputs || sources.fpv_gyro || sources.fpv_visual)) notes.push('Select StickCam inputs and an FPV motion source to use motion.');
+  if (!mode.motion && (sources.stick_inputs || sources.gimbal_activity || sources.fpv_gyro || sources.fpv_visual)) notes.push('Select StickCam inputs or gimbal movement and an FPV motion source.');
   if (sources.filename_timestamps) notes.push('Filename clocks need an independent match; timestamps alone cannot sync footage.');
   const valid = mode.motion || mode.audio;
   if (!valid) notes.push('Choose a complete audio or motion comparison before analyzing.');
-  if ($('matching-strategy').value !== 'automatic' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio) notes.push('Unconfigured StickCam fallback requires both audio sources.');
-  message('evidence-summary', notes.join(' '), !valid || ($('matching-strategy').value !== 'automatic' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio));
+  if ($('matching-strategy').value === 'selected' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio) notes.push('Unconfigured StickCam fallback requires both audio sources.');
+  message('evidence-summary', notes.join(' '), !valid || ($('matching-strategy').value === 'selected' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio));
   $('audio-only-unconfigured').disabled = !mode.motion;
-  if (state.job) $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size) || !valid || ($('matching-strategy').value !== 'automatic' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio);
+  if (state.job) $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !Object.values(state.job.inputs).flat().every(item => item.uploaded === item.size) || !valid || ($('matching-strategy').value === 'selected' && mode.motion && $('audio-only-unconfigured').checked && !mode.audio);
+  if (state.job) { renderCounterpart();renderWorkflow(); }
 }
 function calibrated(config) { return config && !config.source_changed && (config.exclude || config.skip_motion || ['left_gimbal', 'right_gimbal'].every(side => config[side]?.tip_x !== undefined)); }
+function activityConfigured(config) { return config && !config.source_changed && !config.exclude && !config.skip_motion && config.radio_outline?.length === 4 && ['left_gimbal','right_gimbal'].every(side=>config[side]?.width >= 8 && config[side]?.height >= 8); }
+function matchingCalibrationReady(config,sources) { return config && !config.source_changed && (config.exclude || config.skip_motion || ((!sources.stick_inputs || calibrated(config)) && (!sources.gimbal_activity || activityConfigured(config)))); }
+function matchingReadiness(sources,radioInputs=state.job?.inputs.radio || [],fpvInputs=state.job?.inputs.fpv || [],strategy=$('matching-strategy').value) {
+  if (!radioInputs.length || !fpvInputs.length) return {blocked:true,autoSeed:false,regionReady:0,preciseReady:0,message:'Include at least one FPV and one StickCam recording. Restore ignored videos in Video lists & match scope.'};
+  const mode=evidenceMode(sources), active=radioInputs.filter(r=>!state.job.calibrations[r.name]?.exclude);
+  const regionReady=active.filter(r=>activityConfigured(state.job.calibrations[r.name])).length;
+  const preciseReady=active.filter(r=>{const c=state.job.calibrations[r.name];return c && !c.exclude && !c.skip_motion && calibrated(c);}).length;
+  const motionReady=mode.motion && ((sources.gimbal_activity && regionReady>0)||(sources.stick_inputs && preciseReady>0));
+  const audioPossible=mode.audio && [active,fpvInputs].every(records=>records.some(r=>r.metadata?.has_audio!==false));
+  const parts=[];
+  if(sources.gimbal_activity)parts.push(`Tip-free movement: ${regionReady}/${active.length} StickCam clips have saved radio regions.`);
+  if(sources.stick_inputs)parts.push(`Derived inputs: ${preciseReady}/${active.length} clips have calibrated tips.`);
+  if(mode.audio && !audioPossible)parts.push('Audio cannot be compared: one feed has no audio.');
+  const autoSeed=strategy==='telemetry_seed' || (strategy==='automatic' && $('embedded-seed-enabled').checked && sources.fpv_gyro && sources.gimbal_activity && !sources.stick_inputs && fpvInputs.length>0 && fpvInputs.every(r=>r.metadata?.has_audio===false));
+  const blocked=!audioPossible && !motionReady && !autoSeed;
+  if(autoSeed)parts.push(`Radio regions will be found automatically, one StickCam at a time. Embedded motion seed → modified-date suggestions → ${$('seed-spot-checks').value} optional spot checks → review. No full-session StickCam derivation is required.`);
+  if(blocked)parts.push('Save radio regions in Resolve calibration before running movement matching. No match or offset is available yet.');
+  return {blocked,autoSeed,regionReady,preciseReady,message:parts.join(' ')};
+}
+function identifierTable(items) {
+  const table = el('table', undefined, 'identifier-table'), body = document.createElement('tbody');
+  for (const item of items) {
+    const row = document.createElement('tr'), indicatorCell = document.createElement('td'), label = document.createElement('th'), value = document.createElement('td');
+    const glyph = item.state === 'available' ? '✓' : item.state === 'missing' ? '✕' : item.state === 'warning' ? '!' : '·';
+    const mark = el('span', glyph, `identifier-mark ${item.state}`); mark.setAttribute('aria-hidden', 'true');
+    indicatorCell.append(mark);
+    label.scope = 'row'; label.textContent = item.label;
+    value.textContent = item.value;
+    if (item.title) { row.title = item.title; value.title = item.title; }
+    row.append(indicatorCell, label, value); body.append(row);
+  }
+  table.append(body);
+  return table;
+}
+function audioIdentifiers(audio) {
+  const stream = audio?.stream === 'present'
+    ? {state: 'available', value: 'Present'}
+    : audio?.stream === 'absent'
+      ? {state: 'missing', value: 'No audio stream'}
+      : {state: 'unknown', value: 'Not scanned'};
+  let fingerprint;
+  if (audio?.stream === 'absent') fingerprint = {state: 'missing', value: 'No audio stream'};
+  else if (audio?.fingerprint === 'cached_useful') fingerprint = {state: 'available', value: 'Ready'};
+  else if (audio?.fingerprint === 'cached_empty') fingerprint = {state: 'missing', value: 'No useful fingerprint'};
+  else if (audio?.fingerprint === 'corrupt') fingerprint = {state: 'missing', value: 'Cache needs refresh'};
+  else if (audio?.fingerprint === 'not_prepared') fingerprint = {state: 'unknown', value: 'Not prepared'};
+  else fingerprint = {state: 'unknown', value: 'Not checked'};
+  return [{label: 'Audio', ...stream}, {label: 'Audio fingerprint', ...fingerprint}];
+}
+function clockIdentifier(label, clock) {
+  if (!clock?.display) return {label, state: clock ? 'missing' : 'unknown', value: clock ? 'Unavailable' : 'Not scanned'};
+  return {label, state: clock.suspect ? 'warning' : 'available', value: `${clock.suspect ? 'Suspect · ' : ''}${clock.display}`, title: clock.suspect ? 'Timestamp is present but may be unreliable.' : clock.display};
+}
 function updateMatchTargetOptions() {
   if (!state.job) return;
   const kind = $('match-target-kind').value, select = $('match-target-name'), previous = select.value;
@@ -92,35 +204,104 @@ function updateMatchTargetOptions() {
   show('match-target-wrap', kind !== 'all');
   renderVideoLists();
 }
+let recordingScopeSaving = false;
+async function setRecordingIgnored(kind, name, ignored) {
+  if (!state.job || recordingScopeSaving) return;
+  const jobId = state.job.id, token = state.jobToken;
+  const panels = [...document.querySelectorAll('[data-major-panel]')].filter(p => p.open).map(p => p.id);
+  const targets = {fpv:new Set(state.targets.fpv), radio:new Set(state.targets.radio)};
+  recordingScopeSaving = true; renderVideoLists();
+  try {
+    await api(`/api/jobs/${jobId}/recordings/${kind}/${part(name)}/ignored`, {method:'PUT',json:{ignored}});
+    if (token !== state.jobToken) return;
+    await selectJob(jobId);
+    if (state.job?.id !== jobId) return;
+    for (const side of ['fpv','radio']) state.targets[side] = new Set([...targets[side]].filter(n => state.job.inputs[side].some(r => r.name === n)));
+    for (const id of panels) if ($(id) && !$(id).classList.contains('hidden')) $(id).open = true;
+    openPanel('video-list-panel');
+    if (ignored) $('ignored-recordings').open = true;
+    message('recording-scope-message', `${name} ${ignored ? 'ignored for this session. Its saved data and pairings are kept.' : 'restored to this session.'}`);
+  } finally {
+    recordingScopeSaving = false;
+    renderVideoLists();
+  }
+}
 function renderVideoLists() {
   if (!state.job) return;
   const mode = $('match-target-kind').value;
   for (const kind of ['fpv', 'radio']) {
     const records = state.job.inputs[kind], list = $(`${kind}-video-list`);
-    const hash = JSON.stringify([mode, [...state.targets[kind]], records.map(r => [r.name, r.metadata?.duration, calibrated(state.job.calibrations[r.name]), !!state.job.calibrations[r.name]?.exclude, state.stickData?.clips.find(c => c.name === r.name), state.job.calibrations[r.name]?.radio_rotation_deg, state.job.radio_orientation_checks?.[r.name]?.status, state.job.radio_orientation_checks?.[r.name]?.midpoint_rotation_deg]), activeAnalysis()]);
+    const hash = JSON.stringify([mode, [...state.targets[kind]], records.map(r => [r.name, r.metadata?.duration, r.fpv_recorder, calibrated(state.job.calibrations[r.name]), !!state.job.calibrations[r.name]?.exclude, state.stickData?.clips.find(c => c.name === r.name), state.fpvData?.clips.find(c => c.name === r.name), state.job.calibrations[r.name]?.radio_rotation_deg, state.job.radio_orientation_checks?.[r.name]?.status, state.job.radio_orientation_checks?.[r.name]?.midpoint_rotation_deg]), state.results?.match_scope, state.results?.recorder_groups, activeAnalysis(), state.job.scope_editable, recordingScopeSaving]);
     if (list.dataset.hash === hash) continue;
-    list.dataset.hash = hash; list.replaceChildren(); $(`${kind}-list-title`).textContent = `${kind === 'fpv' ? 'FPV' : 'StickCam'} videos (${records.length})`;
+    list.dataset.hash = hash; list.replaceChildren(); $(`${kind}-list-title`).textContent = `${kind === 'fpv' ? 'FPV' : 'StickCam'} videos (${records.length} included)`;
     for (const record of records) {
-      const label = el('label', undefined, 'video-file-row'), check = el('input'); check.type = 'checkbox'; check.checked = mode === 'all' || state.targets[kind].has(record.name);
+      const row = el('div', undefined, 'video-file-row'), header = el('label', undefined, 'video-file-header'), check = el('input'); check.type = 'checkbox'; check.checked = mode === 'all' || state.targets[kind].has(record.name); check.setAttribute('aria-label', `Select ${record.name}`);
       check.disabled = mode !== kind || activeAnalysis() || (kind === 'radio' && state.job.calibrations[record.name]?.exclude);
       check.onchange = () => { if (check.checked) state.targets[kind].add(record.name); else state.targets[kind].delete(record.name); updateSelectionSummary(); };
       const cached = state.stickData?.clips.find(c => c.name === record.name);
+      const fpv = state.fpvData?.clips.find(c => c.name === record.name);
       const config = state.job.calibrations[record.name];
-      const status = kind === 'radio' ? (config?.exclude ? 'Excluded' : config?.skip_motion ? 'Audio only' : cached?.status === 'cached' ? 'Movement cached' : cached?.status === 'other_rate' ? `Saved at ${cached.sample_fps} Hz · needs ${cached.requested_fps} Hz` : calibrated(state.job.calibrations[record.name]) ? 'Calibrated · needs derivation' : 'Needs calibration') : bytes(record.size);
+      const status = kind === 'radio' ? (config?.exclude ? 'Excluded' : config?.skip_motion ? 'Audio only' : cached?.status === 'cached' ? `Stick inputs saved${Number.isFinite(cached.usable_percent)?` · ${cached.usable_percent}% observed`:''}` : cached?.status === 'other_rate' ? `Saved at ${cached.sample_fps} Hz · needs ${cached.requested_fps} Hz` : calibrated(state.job.calibrations[record.name]) ? 'Calibrated · needs derivation' : 'Needs calibration') : bytes(record.size);
       const orientation = kind === 'radio' ? state.job.radio_orientation_checks?.[record.name] : null;
       const savedRotation = state.job.calibrations[record.name]?.radio_rotation_deg;
       const orientationText = savedRotation === 180 ? ' · inverted reference confirmed' : orientation ? ` · midpoint ${orientation.midpoint_rotation_deg === 180 ? 'inverted' : orientation.midpoint_rotation_deg === 0 ? 'upright' : 'unknown'}` : '';
-      label.append(check, el('span', record.name), el('small', `${clipDuration(record)} · ${status}${orientationText}`));
-      list.append(label);
+      const group = kind==='fpv' ? state.results?.recorder_groups?.find(g=>g.confirmed_members.includes(record.name)) : null;
+      const deferred = kind === 'fpv' ? state.results?.match_scope?.deferred_fpv : state.results?.match_scope?.deferred_radio;
+      const outsideSample = (deferred || []).includes(record.name);
+      const audio = kind === 'fpv' ? fpv?.audio : cached?.audio;
+      const identifiers = kind === 'fpv' ? fpv : cached;
+      const items = [...audioIdentifiers(audio)];
+      if (kind === 'fpv') {
+        const gyro = fpv?.embedded?.status;
+        items.push({label: 'Embedded gyro', state: gyro === 'available' ? 'available' : gyro === 'unavailable' ? 'missing' : 'unknown', value: gyro === 'available' ? 'Found' : gyro === 'unavailable' ? 'Not found' : 'Not checked'});
+        const visual = fpv?.visual?.status;
+        items.push({label: 'Visual motion', state: visual === 'cached' ? 'available' : ['other_rate', 'older_algorithm'].includes(visual) ? 'warning' : ['unavailable', 'not_derived'].includes(visual) ? 'missing' : 'unknown', value: visual === 'cached' ? 'Saved' : visual === 'other_rate' ? 'Saved at another rate' : visual === 'older_algorithm' ? 'Older saved data' : visual === 'unavailable' ? 'Unavailable' : visual === 'not_derived' ? 'Not derived' : 'Not checked'});
+      } else {
+        items.push({label: 'Calibration', state: config?.exclude || config?.skip_motion || config?.auto_generated ? 'warning' : calibrated(config) || activityConfigured(config) ? 'available' : 'missing', value: config?.exclude ? 'Excluded' : config?.skip_motion ? 'Audio only' : config?.auto_generated ? 'Automatic regions · review' : calibrated(config) ? 'Ready' : activityConfigured(config) ? 'Radio regions ready' : 'Needs setup'});
+        const stickStatus = cached?.status;
+        items.push({label: 'Stick inputs', state: config?.exclude || config?.skip_motion || stickStatus === 'other_rate' ? 'warning' : stickStatus === 'cached' ? (cached.usable_percent < 10 ? 'warning' : 'available') : ['not_derived', 'needs_calibration', 'unavailable'].includes(stickStatus) ? 'missing' : 'unknown', value: config?.exclude ? 'Excluded' : config?.skip_motion ? 'Audio only' : stickStatus === 'cached' ? `Saved${Number.isFinite(cached.usable_percent)?` · ${cached.usable_percent}% observed`:''}` : stickStatus === 'other_rate' ? `Saved at ${cached.sample_fps} Hz` : stickStatus === 'unavailable' ? 'Unavailable' : stickStatus === 'needs_calibration' ? 'Needs setup' : stickStatus === 'not_derived' ? 'Not derived' : 'Not checked'});
+        const activity=cached?.gimbal_activity;
+        items.push({label:'Gimbal movement',state:activity?.status==='cached' ? (activity.usable_percent>0?'available':'warning') : ['not_derived','needs_calibration','unavailable'].includes(activity?.status)?'missing':'unknown',value:activity?.status==='cached'?`Saved · ${activity.usable_percent}% observed`:activity?.status==='not_derived'?'Not derived':activity?.status==='needs_calibration'?'Needs radio regions':activity?.status==='unavailable'?'Unavailable':'Not checked'});
+        const overall=cached?.overall_movement;
+        items.push({label:'Overall movement',title:'Generic foreground image change after camera-motion compensation; separate from detected controls.',state:overall?.status==='cached'?(overall.usable_percent>0?'available':'warning'):['not_derived','unavailable'].includes(overall?.status)?'missing':'unknown',value:overall?.status==='cached'?`Saved · ${overall.usable_percent}% observed · ${overall.sample_fps} Hz`:overall?.status==='not_derived'?'Not derived':overall?.status==='unavailable'?'Unavailable':'Not checked'});
+      }
+      items.push(clockIdentifier('Filename time', identifiers?.filename_time), clockIdentifier('Modified time', identifiers?.modified_time));
+      header.append(check, el('span', record.name));
+      const heading = el('div',undefined,'video-file-heading');
+      const ignore = action('Ignore',guarded(()=>setRecordingIgnored(kind,record.name,true),'recording-scope-message'),'secondary recording-scope-button');
+      ignore.setAttribute('aria-label',`Ignore ${kind==='fpv'?'FPV':'StickCam'} video ${record.name}`);
+      ignore.disabled = recordingScopeSaving || state.job.scope_editable === false;
+      ignore.title = 'Leave this video out of this session; keep its file and saved data';
+      heading.append(header,ignore);
+      const modified=identifiers?.modified_time?.timestamp ?? record.camera_modified_time ?? (record.metadata_signature?.[1]?record.metadata_signature[1]/1e9:null);
+      row.append(heading,...(modified==null?[]:[el('small',`Modified: ${new Date(modified*1000).toLocaleString()}`,'video-file-summary')]), el('small', `${clipDuration(record)} · ${status}${kind==='fpv' ? ` · recorder: ${record.fpv_recorder || 'Unassigned'}${group?` · ${group.label}`:''}` : ''}${outsideSample ? ' · Not analyzed in last sample' : ''}${orientationText}`, 'video-file-summary'), identifierTable(items));
+      list.append(row);
     }
+  }
+  const ignored = state.job.ignored_inputs || {fpv:[],radio:[]};
+  const ignoredCount = ignored.fpv.length + ignored.radio.length;
+  show('ignored-recordings', ignoredCount > 0);
+  $('ignored-recordings-title').textContent = `Ignored recordings (${ignoredCount}) · restore when needed`;
+  for (const kind of ['fpv','radio']) {
+    const list=$(`ignored-${kind}-list`); list.replaceChildren();
+    for (const record of ignored[kind]) {
+      const row=el('div',undefined,'video-file-row ignored-recording-row'), heading=el('div',undefined,'video-file-heading');
+      const restore=action('Restore',guarded(()=>setRecordingIgnored(kind,record.name,false),'recording-scope-message'),'secondary recording-scope-button');
+      restore.setAttribute('aria-label',`Restore ${kind==='fpv'?'FPV':'StickCam'} video ${record.name}`);
+      restore.disabled=recordingScopeSaving || state.job.scope_editable===false;
+      heading.append(el('span',record.name),restore); row.append(heading,el('small',`${clipDuration(record)} · ignored in this session`,'video-file-summary')); list.append(row);
+    }
+    if (!ignored[kind].length) list.append(el('p','None','hint'));
   }
   updateSelectionSummary();
 }
 function updateSelectionSummary() {
   const kind = $('match-target-kind').value;
-  message('target-selection-summary', kind === 'all' ? 'Compare all FPV and StickCam recordings.' : `${state.targets[kind].size} ${kind === 'fpv' ? 'FPV' : 'StickCam'} target(s) selected · compare with all available ${kind === 'fpv' ? 'StickCam' : 'FPV'} candidates. Select a single checkbox for one flight.`);
+  const scope = Number($('match-sample-percent')?.value || 100);
+  message('target-selection-summary', `${kind === 'all' ? 'Compare all FPV and StickCam recordings' : `${state.targets[kind].size} ${kind === 'fpv' ? 'FPV' : 'StickCam'} target(s) selected · compare with all available ${kind === 'fpv' ? 'StickCam' : 'FPV'} candidates`}. Initial pass: ${scope === 100 ? 'all files' : `${scope}% spread across each file list`}. Sampled runs finish that subset before presenting clock-and-duration suggestions; use 100% to enable stop-on-first-strong-match review.`);
+  $('fpv-recorder-apply').disabled = kind!=='fpv' || !state.targets.fpv.size;
   for (const id of ['targets-select-all', 'targets-clear']) $(id).disabled = kind === 'all' || activeAnalysis();
-  $('stop-on-confident-match').disabled = kind !== 'fpv' || activeAnalysis();
+  $('stop-on-confident-match').disabled = kind !== 'fpv' || activeAnalysis() || scope < 100;
 }
 function updateCalibrationCount() {
   if (!state.job) return;
@@ -145,9 +326,13 @@ function updateJobUI() {
   show('workflow-panel', true); renderWorkflow();
   if (completeInputs) refreshFPVData().catch(error => message('fpv-data-message', error.message, true));
   show('motion-panel', completeInputs);
+  show('fingerprint-panel',completeInputs);fingerprintReview.render();
   show('video-list-panel', completeInputs);
+  show('counterpart-panel', completeInputs); show('manual-pair-panel',completeInputs);manualBrowser.render();
+  renderCounterpart();
   updateMotionOptions();
   $('analyze').disabled = activeAnalysis() || stickPreparation.running || fpvPreparation.running || !completeInputs;
+  $('match-sample-percent').disabled = activeAnalysis();
   updateEvidenceSummary();
   $('analyze').textContent = ['failed', 'interrupted', 'cancelled', 'complete'].includes(state.job.status) ? 'Run analysis again (reuse cache)' : 'Analyze recordings';
   show('cancel-analysis', activeAnalysis());
@@ -190,7 +375,7 @@ async function history() {
       button.append(image);
     }
     button.append(el('span', job.label, 'session-title'));
-    button.append(el('small', `${job.radio_count} StickCam / ${job.fpv_count} FPV · ${job.status}`));
+    button.append(el('small', `${job.radio_count} StickCam / ${job.fpv_count} FPV${job.ignored_count ? ` · ${job.ignored_count} ignored` : ''} · ${job.status}`));
     button.disabled = state.busy; $('history').append(button);
   }
   const deleted = await api('/api/deleted-sessions');
@@ -201,6 +386,10 @@ async function history() {
   }, 'session-message')));
 }
 function clearSession() {
+  fingerprintReview.reset();
+  manualBrowser.reset();
+  clearFlightPreview();
+  for(const id of ['save-project','save-project-bundle'])show(id,false);$('session-backup-list').replaceChildren();show('installation-details',false);$('export-destination').value='';
   rememberCalibrationDraft();
   cancelGimbalSuggestion();
   segmentScan.token++; clearTimeout(segmentScan.timer); segmentScan.running = false; segmentScan.task = null;
@@ -227,14 +416,20 @@ function clearSession() {
   state.frameController?.abort(); state.frameToken++;
   clearTimeout(state.pollTimer); for (const timer of state.exportTimers.values()) clearTimeout(timer); state.exportTimers.clear();
   releaseAllPreviews(); pausePair(); $('cal-video').pause(); $('cal-video').removeAttribute('src'); $('cal-video').load();
+  resetStickReviewState();
   state.job = state.results = state.pair = state.calibration = state.metadata = null;
   state.calibrationFrameReady = false;
+  counterpartSearch.starting = false; counterpartSearch.candidatesKey = null;
+  $('counterpart-fpv').replaceChildren(); delete $('counterpart-fpv').dataset.optionsKey;
+  $('counterpart-method').value = 'automatic'; $('counterpart-visual').checked = true; $('counterpart-show-all').checked = false;
+  $('counterpart-rows').replaceChildren(); $('counterpart-notes').replaceChildren(); message('counterpart-message', '');
+  show('counterpart-panel', false); show('manual-pair-panel',false);$('manual-pair-panel').open=false;
   show('workflow-panel', false);
   for (const panel of document.querySelectorAll('.technical-panel')) { panel.classList.remove('guided-open'); panel.open = false; }
   state.targets = {fpv: new Set(), radio: new Set()};
-  localStorage.removeItem('fpv-session');
+  storage.removeItem('fpv-session');
   show('rename-session-controls', false); $('rename-session-label').value = ''; message('session-message', '');
-  for (const id of ['fpv-preparation-panel', 'video-list-panel', 'motion-panel', 'calibration-panel', 'analysis-panel', 'results-panel', 'viewer-panel', 'portrait-panel', 'exports-panel', 'diagnostics-panel', 'upload-progress']) show(id, false);
+  for (const id of ['fpv-preparation-panel', 'video-list-panel', 'fingerprint-panel', 'motion-panel', 'calibration-panel', 'analysis-panel', 'results-panel', 'viewer-panel', 'portrait-panel', 'exports-panel', 'diagnostics-panel', 'upload-progress']) show(id, false);
   message('input-error', ''); $('prepare').textContent = 'Prepare session';
 }
 function loadRateProfile(profile) {
@@ -301,10 +496,13 @@ async function selectJob(id) {
   clearSession(); const token = state.jobToken;
   const job = await api(`/api/jobs/${id}`); if (token !== state.jobToken) return;
   if (job.deleted_at) { await history(); message('session-message', 'This session was deleted from the frontend; use Deleted sessions to restore it.'); return; }
-  state.job = job; $('matching-strategy').value = job.settings.matching_strategy || 'automatic'; state.source = job.source; localStorage.setItem('fpv-session', id);
+  state.job = job; $('matching-strategy').value = job.settings.matching_strategy || 'automatic';$('embedded-seed-enabled').checked=job.settings.embedded_seed_enabled!==false;$('seed-spot-checks').value=String(job.settings.seed_spot_checks??2); $('match-sample-percent').value = String(job.settings.match_sample_percent || 25); $('audio-boundary').value=String(job.settings.audio_boundary || 30); $('audio-adaptive').checked=job.settings.audio_adaptive!==false; $('audio-retry-limit').value=String(job.settings.audio_retry_limit || 120); state.source = job.source; storage.setItem('fpv-session', id);
   $('session-radio-label').value = job.radio_profile?.model_id || (job.radio_profile ? 'other' : 'auto'); renderRadioShape();
   $('rename-session-label').value = job.label || ''; show('rename-session-controls');
   setSource(job.source); updateJobUI();
+  $('export-destination').value=job.export_destination || '';
+  for(const [id,suffix] of [['save-project',''],['save-project-bundle','?fingerprints=true']]){$(id).href=path('/project')+suffix;show(id);}
+  if(job.recovery_required){message('session-message',`Session JSON needs recovery. Available backup: ${job.recovery_required}. Open Session backups and restore before processing.`,true);return;}
   const oldDefaults = {sample_fps:15, match_fps:7.5, min_overlap:5}, newDefaults = {sample_fps:30, match_fps:30, min_overlap:2};
   for (const [key, saved] of Object.entries(job.settings)) {
     const value = !job.settings_defaults_version && saved === oldDefaults[key] ? newDefaults[key] : saved;
@@ -350,7 +548,7 @@ async function loadClipDurations(jobId, token) {
     }
   }
   await Promise.all([worker(),worker()]);
-  if (token === state.jobToken) { render(); await refreshFPVData(true); }
+  if (token === state.jobToken) { render(); manualBrowser.render();await refreshFPVData(true);if(state.job.has_results)await loadResults(); }
 }
 function setSource(source) {
   state.source = source; show('local-fields', source === 'local'); show('upload-fields', source === 'upload');
@@ -394,12 +592,12 @@ async function browseFolder(path) {
     }
     $('folder-entries').append(row);
   }
-  message('folder-picker-message', listing.truncated ? 'Showing the first 500 folders and videos. Narrow the path to see more.' : `Choose a folder containing ${folderTarget?.id === 'fpv-path' ? 'FPV' : 'StickCam'} recordings.`);
+  message('folder-picker-message', folderTarget?.id==='export-destination'?'Choose a destination for aligned exports.': listing.truncated ? 'Showing the first 500 folders and videos. Narrow the path to see more.' : `Choose a folder containing ${folderTarget?.id === 'fpv-path' ? 'FPV' : 'StickCam'} recordings.`);
 }
 for (const button of document.querySelectorAll('.browse-folder')) button.onclick = guarded(async () => {
   folderTarget = $(button.dataset.folderField);
-  const purpose = folderTarget.id === 'fpv-path' || (folderTarget.id === 'relink-path' && $('relink-kind').value === 'fpv') ? 'FPV video' : 'StickCam video';
-  $('folder-picker-title').textContent = `Choose ${purpose} source folder`;
+  const purpose = folderTarget.id === 'export-destination' ? 'export output' : folderTarget.id === 'fpv-path' || (folderTarget.id === 'relink-path' && $('relink-kind').value === 'fpv') ? 'FPV video' : 'StickCam video';
+  $('folder-picker-title').textContent = `Choose ${purpose}${folderTarget.id==='export-destination'?' folder':' source folder'}`;
   $('folder-purpose').textContent = `Selecting ${purpose} footage`;
   $('folder-picker').showModal();
   const currentPath = folderTarget.value.trim();
@@ -484,7 +682,7 @@ $('pause-upload').onclick = () => state.uploadController?.abort();
 // cannot play. Motion preview requests short compatible chunks when necessary.
 function emptyCalibration() { return { stickcam_mode: 'wonky', stick_mode: state.job?.settings?.stick_mode || 2, reference_time: 0, signs: { roll: 1, pitch: 1, yaw: 1, throttle: 1 } }; }
 function rememberCalibrationDraft() {
-  if (!state.calibrationName || !state.calibration) return;
+  if (!state.calibrationName || !state.calibration || stickReview.framePurpose === 'correction') return;
   const config = clone(state.calibration);
   if ($('exclude-clip').checked) config.exclude = true; else delete config.exclude;
   if ($('skip-motion').checked) config.skip_motion = true; else delete config.skip_motion;
@@ -492,11 +690,18 @@ function rememberCalibrationDraft() {
   state.calibrationDrafts[state.calibrationName] = { config, proposalId: state.calibrationProposalId };
   const dirty = JSON.stringify(config) !== JSON.stringify(state.job?.calibrations[state.calibrationName] || emptyCalibration());
   show('calibration-dirty', dirty); show('discard-calibration-draft', dirty);
-  try { const key = calibrationDraftKey(state.calibrationName); if (dirty && state.metadata?.source_signature) localStorage.setItem(key, JSON.stringify({config, proposalId:state.calibrationProposalId, signature:state.metadata.source_signature})); else if (!dirty) localStorage.removeItem(key); } catch {}
+  try { const key = calibrationDraftKey(state.calibrationName); if (dirty && state.metadata?.source_signature) storage.setItem(key, JSON.stringify({config, proposalId:state.calibrationProposalId, signature:state.metadata.source_signature})); else if (!dirty) storage.removeItem(key); } catch {}
 }
 async function loadCalibration(name) {
   if (!name || !state.job) return;
   if (calibrationLoad?.name === name && calibrationLoad.jobToken === state.jobToken) return calibrationLoad.promise;
+  if (stickReview.frameEdits) { $('calibration-clip').value = state.calibrationName; throw new Error('Add or discard the current frame correction before reloading or changing clips.'); }
+  if (stickReview.name && stickReview.name !== name) {
+    if (stickReview.frameEdits) { $('calibration-clip').value = stickReview.name; throw new Error('Add or discard the current frame correction before changing clips.'); }
+    if (stickReview.dirty) await saveStickReview();
+    rememberCalibrationDraft(); state.calibration = null;
+    resetStickReviewState();
+  }
   cancelGimbalSuggestion();
   const loading = {name, jobToken: state.jobToken};
   loading.promise = loadCalibrationFrame(name);
@@ -519,7 +724,9 @@ async function loadCalibrationFrame(name) {
   const token = ++state.calToken, jobToken = state.jobToken;
   state.frameController?.abort();
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas'); show('tracking-check', false);
+  $('cal-stage').classList.remove('watching');
   state.calibrationName = name; state.calibrationProposalId = state.calibrationDrafts[name]?.proposalId || null;
+  stickReview.framePurpose = 'initial'; stickReview.frameEdits = false;
   state.tool = state.drag = null; state.calibration = clone(state.calibrationDrafts[name]?.config || state.job.calibrations[name] || emptyCalibration());
   state.calibrationRotationOverride = null;
   $('radio-rotation-deg').value = String(state.calibration.radio_rotation_deg || 0);
@@ -544,7 +751,7 @@ async function loadCalibrationFrame(name) {
   }
   if (token !== state.calToken || jobToken !== state.jobToken) return;
   state.metadata = info;
-  try { const saved = JSON.parse(localStorage.getItem(calibrationDraftKey(name)) || 'null'); if (saved && JSON.stringify(saved.signature) === JSON.stringify(info.source_signature) && !state.calibrationDrafts[name]) { state.calibrationDrafts[name] = saved; state.calibration = clone(saved.config); state.calibrationProposalId = saved.proposalId; $('reference-time').value = saved.config.reference_time || 0; $('stickcam-mode').value = saved.config.stickcam_mode || 'wonky'; $('radio-rotation-deg').value = String(saved.config.radio_rotation_deg || 0); $('skip-motion').checked = !!saved.config.skip_motion; $('exclude-clip').checked = !!saved.config.exclude; } else if (saved && JSON.stringify(saved.signature) !== JSON.stringify(info.source_signature)) localStorage.removeItem(calibrationDraftKey(name)); } catch {}
+  try { const saved = JSON.parse(storage.getItem(calibrationDraftKey(name)) || 'null'); if (saved && JSON.stringify(saved.signature) === JSON.stringify(info.source_signature) && !state.calibrationDrafts[name]) { state.calibrationDrafts[name] = saved; state.calibration = clone(saved.config); state.calibrationProposalId = saved.proposalId; $('reference-time').value = saved.config.reference_time || 0; $('stickcam-mode').value = saved.config.stickcam_mode || 'wonky'; $('radio-rotation-deg').value = String(saved.config.radio_rotation_deg || 0); $('skip-motion').checked = !!saved.config.skip_motion; $('exclude-clip').checked = !!saved.config.exclude; } else if (saved && JSON.stringify(saved.signature) !== JSON.stringify(info.source_signature)) storage.removeItem(calibrationDraftKey(name)); } catch {}
   rememberCalibrationDraft(); message('cal-duration', `Duration ${time(info.duration)} · ${info.fps.toFixed(2)} fps`);
   const record = state.job.inputs.radio.find(r => r.name === name); if (record) record.metadata = info;
   updateStickSamplingPreview();
@@ -557,12 +764,17 @@ async function loadCalibrationFrame(name) {
   updateMarkTools();
   message('calibration-message', state.calibrationProposalId ? 'Automatic suggestion pending review. Check all markers and confirm when ready.' : state.calibration.exclude ? 'This recording is excluded from analysis.' : state.calibration.skip_motion ? 'This clip will use boundary audio and any established camera-clock evidence.' :
     calibrated(state.calibration) ? state.job.calibrations[name] ? 'Review the markers. Confirm to save any changes.' : 'Unsaved calibration draft. Check tracking, then confirm.' : 'Draw both regions, then click the tips. Purple = left; cyan = right.');
+  updateStickWorkspace();
+  if (stickReview.name !== name || !stickReview.data) openStickReview().catch(error => message('stick-review-message', error.message, true));
 }
 async function showFrame(reset = true, token = state.calToken) {
   if (!state.metadata) return;
   const at = Number($('reference-time').value);
   if (!Number.isFinite(at) || at < 0 || at >= state.metadata.duration) throw new Error('Choose a reference frame inside the clip.');
+  if (stickReview.frameEdits && Math.abs(at - state.calibration.reference_time) > .01) throw new Error('Add or discard the current frame correction before moving to another frame.');
+  if (!$('cal-video').classList.contains('hidden') && calibrated(state.job.calibrations[state.calibrationName])) { rememberCalibrationDraft(); stickReview.framePurpose = 'correction'; }
   $('cal-video').pause(); show('cal-video', false); show('cal-image'); show('cal-pause', false); show('roi-canvas');
+  $('cal-stage').classList.remove('watching');
   const nextCalibration = clone(state.calibration);
   if (reset && Math.abs(at - nextCalibration.reference_time) > .01) {
     nextCalibration.radio_orientation_confirmed = false;
@@ -599,14 +811,15 @@ async function showFrame(reset = true, token = state.calToken) {
   state.frameURL = objectURL;
   if (token !== state.calToken || frameToken !== state.frameToken) return;
   state.calibration = nextCalibration;
+  if (stickReview.framePurpose === 'correction') seedStickCorrection(at);
   state.calibrationFrameReady = true; updateMarkTools();
   $('cal-stage').setAttribute('aria-busy', 'false');
   if (reset) message('calibration-message', `Showing frame at ${time(at, true)}. Review the markers before confirming.`);
   $('radio-rotation-deg').value = String(nextCalibration.radio_rotation_deg || 0);
   renderStickMode();
-  drawRegions();
+  drawRegions(); updateStickWorkspace(); stickReviewPositionChanged();
   updateRadioOrientationUI();
-  if (state.job.radio_profile && !activeAnalysis()) checkRadioOrientation(false, true).catch(error => message('radio-orientation-message', error.message, true));
+  if (stickReview.framePurpose !== 'correction' && state.job.radio_profile && !activeAnalysis()) checkRadioOrientation(false, true).catch(error => message('radio-orientation-message', error.message, true));
 }
 $('calibration-clip').onchange = guarded(() => loadCalibration($('calibration-clip').value), 'calibration-message');
 async function loadRadioModels() {
@@ -639,7 +852,7 @@ $('apply-stick-mode-all').onclick = guarded(async () => {
   state.job.settings.stick_mode = mode; state.job.calibrations = result.calibrations;
   for (const [name,draft] of Object.entries(state.calibrationDrafts)) {
     draft.config.stick_mode = mode;
-    try { const key = calibrationDraftKey(name), saved = JSON.parse(localStorage.getItem(key) || 'null'); if (saved) { saved.config.stick_mode = mode; localStorage.setItem(key,JSON.stringify(saved)); } } catch {}
+    try { const key = calibrationDraftKey(name), saved = JSON.parse(storage.getItem(key) || 'null'); if (saved) { saved.config.stick_mode = mode; storage.setItem(key,JSON.stringify(saved)); } } catch {}
   }
   if (state.calibration) state.calibration.stick_mode = mode;
   renderStickMode(); rememberCalibrationDraft(); await refreshStickData(true);
@@ -654,10 +867,10 @@ function renderRadioShape() {
   const context = canvas.getContext('2d'); context.clearRect(0, 0, canvas.width, canvas.height);
   const w = Math.min(250, 145 * model.body_aspect), h = w / model.body_aspect, x = (300 - w) / 2, y = (180 - h) / 2;
   context.beginPath(); model.shell.forEach(([px, py], i) => { if (i) context.lineTo(x + px*w, y + py*h); else context.moveTo(x + px*w, y + py*h); }); context.closePath();
-  context.fillStyle = '#22283e'; context.fill(); context.strokeStyle = '#c3a0f4'; context.lineWidth = 2; context.stroke();
-  context.strokeStyle = '#7fd9fa';
-  for (const [px, py] of model.gimbals) { context.beginPath(); context.arc(x + px*w, y + py*h, w*model.gimbal_radius, 0, Math.PI*2); context.stroke(); context.beginPath(); context.arc(x + px*w, y + py*h, 3, 0, Math.PI*2); context.fillStyle = '#7fd9fa'; context.fill(); }
-  if (model.screen) { const [a,b,c,d] = model.screen; context.strokeStyle = '#92a0ba'; context.strokeRect(x+a*w, y+b*h, (c-a)*w, (d-b)*h); }
+  context.fillStyle = '#1b1e1c'; context.fill(); context.strokeStyle = '#e8e3d8'; context.lineWidth = 2; context.stroke();
+  context.strokeStyle = '#49a7f2';
+  for (const [px, py] of model.gimbals) { context.beginPath(); context.arc(x + px*w, y + py*h, w*model.gimbal_radius, 0, Math.PI*2); context.stroke(); context.beginPath(); context.arc(x + px*w, y + py*h, 3, 0, Math.PI*2); context.fillStyle = '#49a7f2'; context.fill(); }
+  if (model.screen) { const [a,b,c,d] = model.screen; context.strokeStyle = '#aaa99f'; context.strokeRect(x+a*w, y+b*h, (c-a)*w, (d-b)*h); }
   hint.append(document.createTextNode(`Approximate ${model.family} shell and gimbal layout. Shape supports detection; your confirmed session image takes priority. `));
   const link = el('a', 'Manufacturer reference'); link.href = model.source; link.target = '_blank'; link.rel = 'noopener'; hint.append(link);
 }
@@ -895,7 +1108,8 @@ $('auto-regions').onclick = guarded(async () => {
   $('tip-radius').value = Number(state.calibration.left_gimbal.tip_radius.toFixed(1));
   state.tool = null; document.querySelectorAll('[data-tool]').forEach(button => button.classList.remove('active'));
   drawRegions();
-  rememberCalibrationDraft();
+  if (stickReview.framePurpose === 'correction') stickReview.frameEdits = true;
+  rememberCalibrationDraft(); updateStickWorkspace();
   const missingTips = ['left_gimbal', 'right_gimbal'].filter(side => state.calibration[side].tip_x === undefined);
   const tipMessage = missingTips.length ? `Could not reliably locate the ${missingTips.map(side => side.startsWith('left') ? 'left' : 'right').join(' and ')} tip${missingTips.length > 1 ? 's' : ''}; click the corresponding tip tool to mark ${missingTips.length > 1 ? 'them' : 'it'}.` : 'Both current stick tips are suggested. Review all markers, adjust any point, then save or check tracking.';
   message('calibration-message', `${proposal.needs_review ? 'Uncertain suggestion — review before confirming. ' : ''}${proposal.reference_clip ? `Located a saved radio reference from ${proposal.reference_clip}.` : `Suggested gimbal housings${outlined ? ' inside the marked outline' : ''}.`} ${(proposal.review_reasons || []).join(' ')} ${proposal.shape_matches?.length ? `Shape candidates: ${proposal.shape_matches.map(row => row.label).join(', ')}. ` : ''}${proposal.shape_message || ''} ${tipMessage} Circles mark tips; crosses mark estimated neutral centres.`);
@@ -918,27 +1132,38 @@ $('stickcam-mode').onchange = () => {
   message('calibration-message', $('stickcam-mode').value === 'fixed' ? 'Fixed mode tracks tips inside these regions.' : 'Wonky mode also tracks the housing. Include detailed housing edges around each gimbal.');
 };
 function updateMarkTools() {
-  const unavailable = $('skip-motion').checked || $('exclude-clip').checked || !state.metadata || !state.calibrationFrameReady;
+  const unavailable = $('skip-motion').checked || $('exclude-clip').checked || !state.metadata || !state.calibrationFrameReady || (stickReview.framePurpose === 'correction' && !stickReview.data);
   $('cal-stage').classList.toggle('disabled', unavailable);
-  document.querySelectorAll('[data-tool]').forEach(button => button.disabled = unavailable || activeAnalysis() || state.suggesting);
+  document.querySelectorAll('[data-tool]').forEach(button => button.disabled = unavailable || activeAnalysis() || stickPreparation.running || state.suggesting || !!stickReview.saving);
   $('check-tracking').disabled = unavailable || activeAnalysis();
-  $('auto-regions').disabled = unavailable || activeAnalysis() || state.suggesting;
+  $('auto-regions').disabled = unavailable || activeAnalysis() || stickPreparation.running || state.suggesting || !!stickReview.saving;
   $('auto-regions').textContent = state.suggesting ? 'Finding gimbal regions…' : 'Suggest gimbal regions';
   $('auto-regions').setAttribute('aria-busy', String(state.suggesting));
-  $('save-calibration').disabled = !state.calibration || activeAnalysis() || stickPreparation.running || state.suggesting || !!calibrationLoad || (!state.calibrationFrameReady && !$('exclude-clip').checked && !$('skip-motion').checked);
+  $('save-calibration').disabled = stickReview.framePurpose === 'correction' || !state.calibration || activeAnalysis() || stickPreparation.running || state.suggesting || !!calibrationLoad || (!state.calibrationFrameReady && !$('exclude-clip').checked && !$('skip-motion').checked);
+  $('save-activity-regions').disabled = $('save-calibration').disabled || !activityConfigured(state.calibration);
+  $('stick-review-load').disabled = !state.job || !state.calibrationName || activeAnalysis() || stickReview.loading || !!stickReview.saving;
+  $('stick-review-load').textContent = stickReview.loading ? 'Reading saved tracking…' : 'Reload saved tracking';
+  $('stick-review-rederive').disabled = !!stickReview.saving || stickReview.loading || !state.calibration || !calibrated(stickReview.framePurpose === 'correction' ? state.job?.calibrations[state.calibrationName] : state.calibration) || $('skip-motion').checked || $('exclude-clip').checked || activeAnalysis() || stickPreparation.running || state.suggesting || !!calibrationLoad;
   for (const id of ['load-frame', 'cal-preview', 'cal-frame-back', 'cal-frame-forward', 'reference-time']) $(id).disabled = !state.metadata || $('exclude-clip').checked || activeAnalysis() || state.suggesting;
-  $('cal-preview').disabled ||= !state.calibrationFrameReady;
-  for (const id of ['skip-motion', 'exclude-clip', 'stickcam-mode', 'session-radio-label']) $(id).disabled = activeAnalysis() || state.suggesting;
+  $('cal-preview').disabled ||= !state.calibrationFrameReady || stickReview.frameEdits;
+  $('cal-pause').disabled = !state.metadata || !state.calibrationFrameReady || activeAnalysis() || state.suggesting;
+  $('stick-review-save').disabled = !stickReview.data || (!stickReview.dirty && !stickReview.frameEdits) || activeAnalysis() || stickPreparation.running || !!stickReview.saving;
+  $('stick-review-calibration-landmark').disabled = !stickReview.data || !state.calibrationFrameReady || activeAnalysis() || stickPreparation.running || !!stickReview.saving;
+  $('stick-edit-initial').disabled = activeAnalysis() || stickPreparation.running || !!stickReview.saving;
+  for (const id of ['stick-review-add','stick-review-remove','stick-review-throttle','stick-review-yaw','stick-review-pitch','stick-review-roll','stick-review-note']) $(id).disabled = activeAnalysis() || stickPreparation.running || !!stickReview.saving;
+  for (const id of ['radio-stick-mode','skip-motion','exclude-clip']) { $(id).disabled = activeAnalysis() || state.suggesting || stickReview.framePurpose === 'correction'; $(id).title = stickReview.framePurpose === 'correction' ? 'Choose Edit initial calibration to change this clip setting.' : ''; }
+  for (const id of ['stickcam-mode', 'session-radio-label']) $(id).disabled = activeAnalysis() || state.suggesting;
   updateRadioOrientationUI();
 }
 $('skip-motion').onchange = updateMarkTools;
 $('exclude-clip').onchange = updateMarkTools;
-for (const button of document.querySelectorAll('[data-tool]')) button.onclick = () => {
+for (const button of document.querySelectorAll('[data-tool]')) button.onclick = guarded(async () => {
+  if (!$('cal-video').classList.contains('hidden') && !await editStickPlaybackFrame()) return;
   state.tool = button.dataset.tool;
-  if (state.tool === 'radio-outline') { state.calibration.radio_outline = []; drawRegions(); }
+  if (state.tool === 'radio-outline') { state.calibration.radio_outline = []; if (stickReview.framePurpose === 'correction') stickReview.frameEdits = true; drawRegions(); updateStickWorkspace(); }
   document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item === button));
   message('calibration-message', state.tool === 'radio-outline' ? 'Click the radio body corners in order: top left, top right, bottom right, bottom left. Stay on the shell and avoid including your hands.' : state.tool.startsWith('box') ? 'Drag a rectangle around the complete gimbal and its housing.' : state.tool.startsWith('tip') ? 'Click the centre of the visible stick tip.' : 'Click the neutral gimbal centre (where the tip would be at rest).');
-};
+}, 'calibration-message');
 function calibrationViewRotated() { return state.calibrationRotationOverride ?? state.calibration?.radio_rotation_deg === 180; }
 $('cal-rotate-180').onchange = () => { $('suggest-radio-orientation').checked = false; applyRadioRotation($('cal-rotate-180').checked ? 180 : 0); rememberCalibrationDraft(); };
 function coordinates(event) {
@@ -950,9 +1175,9 @@ function coordinates(event) {
     y: Math.max(0, Math.min(state.metadata.height - 1, rotated ? state.metadata.height - y : y)) };
 }
 $('roi-canvas').onpointerdown = event => {
-  if (!state.metadata || !state.tool || $('skip-motion').checked || $('exclude-clip').checked || activeAnalysis() || state.suggesting) return;
+  if (!state.metadata || !state.tool || $('skip-motion').checked || $('exclude-clip').checked || activeAnalysis() || stickPreparation.running || state.suggesting || stickReview.saving) return;
   const [kind, side] = state.tool.split(':');
-  if (kind !== 'radio-outline' && !state.calibration[side] && kind !== 'box') { message('calibration-message', 'Draw that gimbal region first.', true); return; }
+  if (kind !== 'radio-outline' && !state.calibration[side] && kind !== 'box' && !(kind === 'tip' && stickReview.framePurpose === 'correction')) { message('calibration-message', 'Draw that gimbal region first.', true); return; }
   $('roi-canvas').setPointerCapture(event.pointerId); state.drag = { start: coordinates(event), current: coordinates(event), kind, side }; event.preventDefault();
 };
 $('roi-canvas').onpointermove = event => { if (state.drag) { state.drag.current = coordinates(event); drawRegions(); } };
@@ -974,13 +1199,19 @@ $('roi-canvas').onpointerup = event => {
     const width = Math.ceil(Math.abs(end.x - start.x)), height = Math.ceil(Math.abs(end.y - start.y));
     if (Math.min(width, height) < 8) { message('calibration-message', 'Draw a larger region.', true); return; }
     state.calibration[side] = { x, y, width, height, center_x: width / 2, center_y: height / 2, travel_x: width * .4, travel_y: height * .4 };
+  } else if (kind === 'tip' && stickReview.framePurpose === 'correction') {
+    addStickTipCorrection(side, end);
   } else {
     const spec = state.calibration[side], x = end.x - spec.x, y = end.y - spec.y;
     if (x < 0 || y < 0 || x >= spec.width || y >= spec.height) { message('calibration-message', 'Choose a point inside that gimbal region.', true); return; }
     spec[kind === 'tip' ? 'tip_x' : 'center_x'] = x; spec[kind === 'tip' ? 'tip_y' : 'center_y'] = y;
     if (kind === 'tip') delete spec.tip_suggested;
   }
-  drawRegions(); message('calibration-message', calibrated(state.calibration) ? 'Both tips marked. Save or check the tracking.' : 'Continue marking the remaining region or tip.');
+  if (stickReview.framePurpose === 'correction' && kind !== 'tip') stickReview.frameEdits = true;
+  drawRegions(); updateMarkTools(); updateStickWorkspace();
+  if (stickReview.framePurpose === 'correction') { message('calibration-message', kind === 'tip' ? 'Tip correction added at this time. Save corrections or re-derive to apply it.' : 'Frame correction draft. Check both regions, centres, tips and outline, then add the correction.'); return; }
+  rememberCalibrationDraft();
+  message('calibration-message', calibrated(state.calibration) ? 'Both tips marked. Save or check the tracking.' : 'Continue marking the remaining region or tip.');
 };
 $('roi-canvas').onpointercancel = () => { state.drag = null; drawRegions(); };
 function drawRegions() {
@@ -998,7 +1229,7 @@ function drawRegions() {
   const line = Math.max(2, canvas.width / 500); context.lineWidth = line; context.font = `${Math.max(14, canvas.width / 70)}px system-ui`;
   for (const [index, side] of ['left_gimbal', 'right_gimbal'].entries()) {
     const spec = state.calibration?.[side]; if (!spec) continue;
-    context.strokeStyle = context.fillStyle = index ? '#4dccff' : '#d787ff'; context.strokeRect(spec.x, spec.y, spec.width, spec.height);
+    context.strokeStyle = context.fillStyle = index ? '#f06f62' : '#49a7f2'; context.strokeRect(spec.x, spec.y, spec.width, spec.height);
     label(index ? 'RIGHT' : 'LEFT', spec.x + line * 2, Math.max(20, spec.y - line * 2));
     const cx = spec.x + spec.center_x, cy = spec.y + spec.center_y;
     context.beginPath(); context.moveTo(cx - line * 4, cy); context.lineTo(cx + line * 4, cy); context.moveTo(cx, cy - line * 4); context.lineTo(cx, cy + line * 4); context.stroke();
@@ -1022,13 +1253,13 @@ function drawRegions() {
     outline.forEach(([x, y], index) => { context.beginPath(); context.arc(x, y, line * 3, 0, Math.PI * 2); context.fill(); label(String(rotated && outline.length === 4 ? [2,3,0,1].indexOf(index) + 1 : index + 1), x + line * 3, y - line * 3); });
   }
   if (state.drag?.kind === 'box') { const { start, current } = state.drag; context.strokeStyle = '#fff'; context.strokeRect(start.x, start.y, current.x - start.x, current.y - start.y); }
-  context.restore();
+  context.restore(); drawStickReviewOverlay();
 }
 $('tip-radius').oninput = () => {
   for (const side of ['left_gimbal', 'right_gimbal']) if (state.calibration?.[side]) state.calibration[side].tip_radius = Number($('tip-radius').value);
   drawRegions();
 };
-function currentCalibrationConfig() {
+function currentCalibrationConfig(activityOnly = false) {
   let config = clone(state.calibration);
   delete config.exclude; delete config.skip_motion;
   if (config.radio_outline?.length === 0) delete config.radio_outline;
@@ -1038,23 +1269,26 @@ function currentCalibrationConfig() {
     config.stickcam_mode = $('stickcam-mode').value;
     config.stick_mode = Number($('radio-stick-mode').value);
     config.radio_rotation_deg = Number($('radio-rotation-deg').value); config.radio_orientation_confirmed = true;
-    if (!calibrated(config)) throw new Error('Draw both regions and click both tips, or choose audio-only matching.');
+    if (activityOnly ? !activityConfigured(config) : !calibrated(config)) throw new Error(activityOnly ? 'Mark the radio outline and both gimbal regions. Stick tips are optional for movement.' : 'Draw both regions and click both tips, or save radio regions for tip-free movement.');
     if (config.radio_outline && config.radio_outline.length !== 4) throw new Error('Mark all four radio outline corners, or click the outline tool again to start over.');
     for (const side of ['left_gimbal', 'right_gimbal']) {
       Object.assign(config[side], { tip_radius: config[side].tip_radius ?? Number($('tip-radius').value), threshold: Number($('tip-threshold').value), polarity: $('tip-polarity').value });
+      if(activityOnly && config[side].tip_suggested){delete config[side].tip_x;delete config[side].tip_y;}
       delete config[side].tip_suggested;
     }
   }
   return config;
 }
-async function saveCalibration(next = false) {
+async function saveCalibration(next = false, activityOnly = false) {
   if (!state.job || !state.calibration) return;
+  if (stickReview.framePurpose === 'correction') throw new Error('Save this as a timed correction, or choose Edit initial calibration to change the starting frame.');
   const name = $('calibration-clip').value, token = state.calToken, jobToken = state.jobToken;
-  const config = currentCalibrationConfig(), proposalId = state.calibrationProposalId;
+  const config = currentCalibrationConfig(activityOnly), proposalId = state.calibrationProposalId;
   const saved = await api(path(`/calibration/${part(name)}${proposalId ? `?proposal_id=${proposalId}` : ''}`), { method: 'PUT', json: config });
   if (jobToken !== state.jobToken) return;
+  if (stickReview.name === name && stickReview.data?.movement && JSON.stringify(state.job.calibrations[name]) !== JSON.stringify(saved.config)) stickReview.data.movement.stale = true;
   state.job.calibrations[name] = saved.config;
-  delete state.calibrationDrafts[name]; try { localStorage.removeItem(calibrationDraftKey(name)); } catch {}
+  delete state.calibrationDrafts[name]; try { storage.removeItem(calibrationDraftKey(name)); } catch {}
   show('calibration-dirty', false); show('discard-calibration-draft', false); renderWorkflow();
   if (proposalId) { state.job.calibration_reviews ??= {}; state.job.calibration_reviews[name] = {proposal_id: proposalId, status:'confirmed'}; }
   renderCalibrationProposals();
@@ -1070,7 +1304,8 @@ async function saveCalibration(next = false) {
     else message('calibration-message', 'Saved calibrations are ready. Run automatic matching to reuse audio and derive only the unresolved inputs needed.');
   }
 }
-$('save-calibration').onclick = guarded(() => saveCalibration(true), 'calibration-message');
+$('save-calibration').onclick = guarded(async () => { await saveCalibration(false); if (stickReview.data) stickReview.data.calibration = clone(state.calibration); updateStickWorkspace(); }, 'calibration-message');
+$('save-activity-regions').onclick = guarded(async () => { await saveCalibration(false,true); message('calibration-message','Radio regions saved for tip-free movement matching. Exact inputs still need marked tips.'); await refreshStickData(true); updateStickWorkspace(); }, 'calibration-message');
 $('check-tracking').onclick = guarded(async () => {
   const token = state.calToken, jobToken = state.jobToken;
   const config = currentCalibrationConfig();
@@ -1104,6 +1339,8 @@ $('copy-regions').onclick = guarded(async () => {
       if (Math.abs(metadata.width / metadata.height - info.width / info.height) > .02) continue;
       const target = clone(config), sx = metadata.width / info.width, sy = metadata.height / info.height;
       delete target.radio_outline;
+      delete target.tracking_landmarks;
+      delete target.capture_tracking_geometry;
       target.reference_time = 0;
       for (const side of ['left_gimbal', 'right_gimbal']) {
         delete target[side].tip_x; delete target[side].tip_y;
@@ -1143,43 +1380,194 @@ async function loadVideo(video, kind, name, isCurrent, target, preferFast = fals
     } catch (error) { if (!isCurrent()) return; }
   }
   await loadFastPreview(video, `/api/jobs/${id}/preview/${kind}/${part(name)}`, isCurrent,
-    (text, error = false) => { if (isCurrent()) message(target, `${name}: ${text}`, error); }, initialTime);
+    (text, error = false) => { if (isCurrent()) message(target, `${name}: ${text}`, error); }, initialTime, $('preview-acceleration').value);
 }
 $('cal-preview').onclick = guarded(async () => {
-  const token = state.calToken, at = state.calibration.reference_time, name = $('calibration-clip').value;
-  await loadVideo($('cal-video'), 'radio', name, () => token === state.calToken, 'calibration-message', true, at);
-  if (token !== state.calToken) return;
-  $('cal-video').currentTime = at; show('cal-image', false); show('cal-video'); show('cal-pause'); show('roi-canvas', false);
-  await $('cal-video').play(); $('cal-pause').textContent = 'Use current frame';
-  message('calibration-message', 'Choose “Use current frame” to stop playback and mark that reference.');
+  const token = state.calToken, jobToken = state.jobToken, at = stickWorkspaceTime(), name = $('calibration-clip').value;
+  const video = $('cal-video'), key = `${state.job.id}/${name}`;
+  if (video.dataset.stickSource !== key || !video.readyState) {
+    await loadVideo(video, 'radio', name, () => token === state.calToken && jobToken === state.jobToken, 'calibration-message', true, at);
+    if (token !== state.calToken || jobToken !== state.jobToken) return;
+    video.dataset.stickSource = key;
+  }
+  video.currentTime = at; show('cal-image', false); show('cal-video'); show('cal-pause'); show('roi-canvas', false);
+  $('cal-stage').classList.add('watching'); updateStickWorkspace();
+  video.muted = !$('stick-review-audio').checked; video.playbackRate = Number($('stick-review-speed').value);
+  await video.play();
+  message('calibration-message', 'Watch the saved tracking and controls below. Pause & correct this frame, or choose a marking tool to stop and correct it.');
 }, 'calibration-message');
-$('cal-pause').onclick = guarded(async () => { $('cal-video').pause(); $('reference-time').value = $('cal-video').currentTime.toFixed(3); await showFrame(); }, 'calibration-message');
+$('cal-pause').onclick = guarded(editStickPlaybackFrame, 'calibration-message');
+$('stick-edit-initial').onclick = guarded(async () => {
+  if (stickReview.frameEdits) throw new Error('Add or discard the current frame correction first.');
+  if (stickReview.dirty) await saveStickReview();
+  await loadCalibrationFrame($('calibration-clip').value);
+}, 'calibration-message');
 
 // Analysis, recovery and result review.
-async function startMatching() {
-  const automatic = $('matching-strategy').value === 'automatic';
-  const targetKind = $('match-target-kind').value, targetNames = targetKind === 'all' ? [] : [...state.targets[targetKind]], targetName = targetNames.length === 1 ? targetNames[0] : '';
+async function startMatching(overrides = {}) {
+  const jobId = state.job.id, jobToken = state.jobToken;
+  if (activeAnalysis() || stickPreparation.running || fpvPreparation.running) throw new Error('Wait for the current processing task to finish.');
+  const strategy=overrides.matching_strategy || $('matching-strategy').value,automatic=strategy!=='selected';
+  const targetKind = overrides.match_target_kind || $('match-target-kind').value, targetNames = overrides.match_target_names || (targetKind === 'all' ? [] : [...state.targets[targetKind]]), targetName = targetNames.length === 1 ? targetNames[0] : '';
   if (targetKind !== 'all' && !targetNames.length) throw new Error('Select one or more targets in the video lists.');
   const radioInputs = targetKind === 'radio' ? state.job.inputs.radio.filter(record => targetNames.includes(record.name)) : state.job.inputs.radio;
-  const evidenceSources = readEvidenceSources(), mode = evidenceMode(evidenceSources);
-  if (!mode.motion && !mode.audio) throw new Error('Select both audio sources, or StickCam inputs and an FPV motion source.');
+  const evidenceSources = overrides.evidence_sources || readEvidenceSources(), mode = evidenceMode(evidenceSources);
+  if (!mode.motion && !mode.audio) throw new Error('Select both audio sources, or StickCam inputs/gimbal movement and an FPV motion source.');
+  if(evidenceSources.movement_rhythm && !evidenceSources.stick_inputs)throw new Error('Derived-input rhythm needs StickCam derived inputs. Use tip-free gimbal movement to skip exact tip tracking.');
+  const fpvInputs=targetKind==='fpv'?state.job.inputs.fpv.filter(record=>targetNames.includes(record.name)):state.job.inputs.fpv;
+  const readiness=matchingReadiness(evidenceSources,radioInputs,fpvInputs,strategy);
+  if(readiness.blocked){openPanel('calibration-panel');message('matching-readiness',readiness.message,true);throw new Error(readiness.message);}
   const allowUnconfigured = automatic || (mode.motion && $('audio-only-unconfigured').checked);
   if (!automatic && allowUnconfigured && !mode.audio) throw new Error('Unconfigured StickCam fallback requires both audio sources.');
   const pending = !automatic && mode.motion && radioInputs.find(record => {
     const config = state.job.calibrations[record.name];
-    return !config ? !allowUnconfigured : !calibrated(config);
+    return !config ? !allowUnconfigured : !matchingCalibrationReady(config,evidenceSources);
   });
-  if (pending) { $('calibration-clip').value = pending.name; await loadCalibration(pending.name); throw new Error(`Finish the calibration for ${pending.name}, or enable audio + filename-clock matching for unconfigured StickCam.`); }
-  const settings = { matching_strategy: automatic ? 'automatic' : 'selected', sample_fps: Number($('sample-fps').value), match_fps: Number($('match-fps').value), min_overlap: Number($('min-overlap').value),
+  if (pending) { openPanel('calibration-panel'); $('calibration-clip').value = pending.name; await loadCalibration(pending.name); $('calibration-panel').scrollIntoView({behavior:'smooth',block:'start'}); throw new Error(`Finish the calibration for ${pending.name}, or enable audio + filename-clock matching for unconfigured StickCam.`); }
+  const settings = { matching_strategy: strategy,embedded_seed_enabled:$('embedded-seed-enabled').checked,seed_spot_checks:Number($('seed-spot-checks').value), match_sample_percent: Number($('match-sample-percent').value), sample_fps: Number($('sample-fps').value), match_fps: Number($('match-fps').value), min_overlap: Number($('min-overlap').value),
+    audio_boundary:Number($('audio-boundary').value), audio_adaptive:$('audio-adaptive').checked, audio_retry_limit:Number($('audio-retry-limit').value),
     workers: Number($('workers').value), minimum_score: Number($('minimum-score').value), audio_enabled: mode.audio, evidence_sources: evidenceSources,
-    match_target_kind: targetKind, match_target_name: targetName, match_target_names: targetNames, stop_on_confident_match: $('stop-on-confident-match').checked, allow_unconfigured_radio: allowUnconfigured, rate_profile: mode.motion ? readRateProfile() : null, ...readMotionSettings() };
-  await api(path('/run'), { method: 'POST', json: settings });
+    match_target_kind: targetKind, match_target_name: targetName, match_target_names: targetNames, stop_on_confident_match: $('stop-on-confident-match').checked, allow_unconfigured_radio: allowUnconfigured, rate_profile: evidenceSources.stick_inputs && mode.motion ? readRateProfile() : null, ...readMotionSettings(), ...overrides };
+  await api(`/api/jobs/${jobId}/run`, { method: 'POST', json: settings });
+  if (jobId !== state.job?.id || jobToken !== state.jobToken) return;
+  state.job.settings = {...state.job.settings, ...settings};
   state.job.status = 'queued'; state.job.message = 'Queued for analysis'; state.job.progress = null;
   pausePair(); show('viewer-panel', false); show('diagnostics-panel', false);
   updateJobUI(); await history(); pollJob(state.job.id, state.jobToken);
 }
-$('analyze').onclick = guarded(startMatching, 'analysis-message');
-$('workflow-find').onclick = guarded(startMatching, 'workflow-message');
+$('analyze').onclick = guarded(() => startMatching(), 'analysis-message');
+$('workflow-find').onclick = guarded(() => startMatching(), 'workflow-message');
+$('workflow-movement').onclick=()=>{ $('matching-strategy').value='automatic';$('audio-only-unconfigured').checked=false;loadEvidenceSources({evidence_sources:{fpv_gyro:true,fpv_visual:true,stick_inputs:false,gimbal_activity:true,movement_rhythm:false,fpv_audio:true,stickcam_audio:true,filename_timestamps:true}});renderWorkflow();message('workflow-message','Audio + tip-free movement selected. Run Quick Match to reuse saved activity and skip exact stick-input derivation.'); };
+function selectEmbeddedSeed() {
+  $('matching-strategy').value='telemetry_seed';$('embedded-seed-enabled').checked=true;$('audio-only-unconfigured').checked=false;
+  loadEvidenceSources({evidence_sources:{fpv_gyro:true,fpv_visual:false,stick_inputs:false,gimbal_activity:true,movement_rhythm:false,fpv_audio:false,stickcam_audio:false,filename_timestamps:false}});
+  renderWorkflow();message('workflow-message','O4 Quick Match selected. Run to find radio regions automatically, derive one StickCam at a time, then suggest and spot-check other pairs using modified dates.');
+}
+$('workflow-embedded-seed').onclick=selectEmbeddedSeed;
+
+// One FPV recording against the full available StickCam list, regardless of the
+// general match-scope/sample controls. Confirmation stays in the shared viewer.
+function counterpartOptions() {
+  const method = $('counterpart-method').value;
+  if (method === 'selected') return {strategy:'selected', sources:readEvidenceSources()};
+  return {strategy:'automatic', sources:{fpv_audio:true, stickcam_audio:true, filename_timestamps:true,
+    fpv_gyro:method !== 'audio', stick_inputs:method !== 'audio' && (!$('workflow-gimbal-activity').checked || $('workflow-rhythm').checked),
+    gimbal_activity:method !== 'audio' && $('workflow-gimbal-activity').checked,
+    fpv_visual:method !== 'audio' && $('counterpart-visual').checked, movement_rhythm:method !== 'audio' && $('workflow-rhythm').checked}};
+}
+function renderCounterpart() {
+  if (!state.job) return;
+  const job = state.job, select = $('counterpart-fpv'), records = job.inputs.fpv;
+  const optionsKey = JSON.stringify(records.map(r => [r.name, r.metadata?.duration]));
+  if (select.dataset.optionsKey !== optionsKey) {
+    const previous = select.value;
+    const saved = storage.getItem(`fpv-counterpart:${job.id}`);
+    const target = job.settings.match_target_kind === 'fpv' && job.settings.match_target_names?.length === 1 ? job.settings.match_target_names[0] : '';
+    select.replaceChildren(...records.map(record => {const option=el('option',clipLabel(record));option.value=record.name;return option;}));
+    const choice = [previous,saved,target].find(name=>records.some(r=>r.name===name));
+    if (choice) select.value = choice;
+    select.dataset.optionsKey = optionsKey;
+  }
+  const name = select.value, available = job.inputs.radio.filter(r=>!job.calibrations[r.name]?.exclude);
+  const excluded = job.inputs.radio.length - available.length;
+  const busy = activeAnalysis() || stickPreparation.running || fpvPreparation.running || counterpartSearch.starting;
+  const ready = Object.values(job.inputs).flat().every(r=>r.uploaded === r.size);
+  const {strategy,sources} = counterpartOptions(), mode = evidenceMode(sources);
+  select.disabled = busy; $('counterpart-method').disabled = busy; $('counterpart-visual').disabled = busy;
+  $('counterpart-find').disabled = busy || !ready || !name || !available.length || (!mode.audio && !mode.motion);
+  $('workflow-counterpart').disabled = !ready || !records.length;
+  show('counterpart-visual-option', $('counterpart-method').value === 'automatic');
+  show('counterpart-evidence-settings', $('counterpart-method').value === 'selected');
+  const evidence = [mode.audio ? 'boundary audio' : '', mode.motion && sources.fpv_gyro ? 'embedded FPV motion' : '', mode.motion && sources.fpv_visual ? 'experimental FPV visual fallback' : '', mode.motion && sources.gimbal_activity ? 'tip-free gimbal activity' : '', mode.motion && sources.stick_inputs ? 'precise StickCam inputs' : ''].filter(Boolean).join(' · ');
+  const seedReady=matchingReadiness(sources,available,records.filter(r=>r.name===name),strategy).autoSeed;
+  message('counterpart-scope', `${name || 'Choose an FPV recording'} · ${available.length} StickCam candidate(s)${excluded ? ` · ${excluded} excluded` : ''}. ${seedReady?'Checks one StickCam at a time and stops on a supported embedded-motion seed.':'This search uses one FPV clip and 100% of the available StickCam list.'} Evidence: ${evidence || 'choose a complete audio or motion comparison in Find matching flights'}.${seedReady?' Radio regions are found automatically.':strategy === 'automatic' && mode.motion ? ' Motion fallback needs a saved StickCam calibration; missing setups are reported below.' : ''}`);
+  const targets = job.settings.match_target_names || (job.settings.match_target_name ? [job.settings.match_target_name] : []);
+  const searching = activeAnalysis() && job.settings.match_target_kind === 'fpv' && targets.length === 1 && targets[0] === name;
+  show('counterpart-progress', searching); $('counterpart-progress').value = job.progress?.percent || 0;
+  show('counterpart-cancel', searching); $('counterpart-cancel').disabled = job.status === 'cancelling';
+  const rows = (state.results?.rows || []).filter(row=>row.fpv_video === name).sort((a,b)=>
+    Number(!!a.rejected)-Number(!!b.rejected) || Number(!!b.reviewed)-Number(!!a.reviewed) ||
+    Number(!!b.global_assignment)-Number(!!a.global_assignment) || Number(!!a.timing_only)-Number(!!b.timing_only) || candidateStrength(b)-candidateStrength(a));
+  const supported = rows.filter(r=>r.alignment_available && !r.rejected && !r.timing_only && (r.reviewed || r.alignment_suggested));
+  const visible = $('counterpart-show-all').checked ? rows : rows.slice(0,5);
+  const considered = (state.results?.considered_fpv || state.results?.match_scope?.sampled_fpv || []).includes(name);
+  let status = !ready ? 'Finish uploading your recordings first.' : !available.length ? 'No StickCam recordings are available. Include at least one in this session.' : !rows.length ? considered ? 'The saved search found no comparable candidates for this FPV recording. See any preparation or source problems below.' : 'Choose a recording and find its counterpart.' : supported.some(r=>r.reviewed) ? 'A saved, reviewed counterpart is available below.' : supported.length ? 'Matching proposals are ready. Preview the shared events before confirming.' : 'No confident counterpart found in the saved results. The strongest alternatives are below for inspection.';
+  if (counterpartSearch.starting) status = 'Starting the counterpart search…';
+  else if (searching) status = `${job.message}${job.progress?.percent == null ? '' : ` · ${Number(job.progress.percent).toFixed(1)}%`}${rows.length ? ' Previous saved candidates remain visible while the new search runs.' : ''}`;
+  else if (busy) status = 'Another processing task is running. You can search after it finishes.';
+  else if (['failed','cancelled','interrupted'].includes(job.status) && job.settings.match_target_kind === 'fpv' && targets.includes(name)) status = `${job.message}${rows.length ? ' Previous saved candidates are shown below.' : ''}`;
+  else if (rows.length) status += ` Showing ${visible.length}/${rows.length} saved candidates for this FPV clip.`;
+  if(!busy && !counterpartSearch.starting && rows.length && !rows.some(r=>r.alignment_available))status='No matching alignment was found. The saved rows contain no usable matching evidence; no offset has been estimated. Save radio regions for movement matching, or find a pair manually.';
+  if (!searching && !counterpartSearch.starting && rows.length && (state.results.match_scope?.deferred_radio || []).length) status += ` The last completed run left ${state.results.match_scope.deferred_radio.length} StickCam recordings unscanned; find the counterpart to check the full list.`;
+  message('counterpart-message',status,job.status === 'failed' && targets.includes(name));
+  show('counterpart-candidates',rows.length > 0);
+  const resultKey = JSON.stringify([name,$('counterpart-show-all').checked,rows,state.results?.workflow,state.results?.errors,available.map(r=>[r.name,calibrated(job.calibrations[r.name])])]);
+  if (counterpartSearch.candidatesKey === resultKey) return;
+  counterpartSearch.candidatesKey = resultKey;
+  $('counterpart-rows').replaceChildren(...visible.map(row=>{
+    const tr=el('tr'), recording=el('td'), matching=el('td'), alignment=el('td'), review=el('td');
+    const activityCandidate=row.alignment_method==='gimbal_activity';
+    const candidateOffset=row.alignment_offset_seconds;
+    const record=job.inputs.radio.find(r=>r.name===row.radio_video);
+    recording.append(el('span',row.radio_video),el('small',clipDuration(record)));
+    const label=!row.alignment_available?'No matching evidence':row.rejected ? 'Rejected' : row.reviewed ? 'Reviewed alignment' : row.timing_only ? 'Clock suggestion · unscanned' : row.confidence === 'strong' && row.global_assignment ? 'Strong proposal' : row.global_assignment ? 'Proposal · needs review' : activityCandidate ? 'Movement candidate · needs review' : 'Weak / ambiguous candidate';
+    matching.append(el('span',label,`badge ${row.reviewed ? 'saved' : row.confidence === 'strong' && row.global_assignment ? 'strong' : 'review'}`));
+    matching.append(el('small',row.timing_only ? 'Dates and durations only; content has not been checked.' : `Evidence score ${Number(row.combined_score).toFixed(3)} · ${row.evidence}`));
+    if (!row.timing_only) {
+      const counts=[];
+      if(row.audio_usable_sections != null)counts.push(`Audio: ${row.audio_correlated_sections}/${row.audio_usable_sections} sections`);
+      if(row.motion_included !== false && row.usable_sections != null)counts.push(`Motion: ${row.correlated_sections}/${row.usable_sections} sections`);
+      if(counts.length)matching.append(el('small',counts.join(' · ')));
+      const details=el('details');details.append(el('summary','Evidence details'),el('small',sectionsText(row)),el('small',`Candidate separation ${Number(row.candidate_margin || 0).toFixed(3)} · timing peak margin ${Number(row.peak_margin || 0).toFixed(3)}`));matching.append(details);
+    }
+    if(row.clock_support?.length) {
+      const detail=el('details');detail.append(el('summary','Modified-date evidence'));
+      clockDetails(detail,row.clock_support,[],row.timing_only);matching.append(detail);
+    }
+    if(row.gimbal_activity) {
+      const p=row.gimbal_activity;matching.append(el('small',`Tip-free movement: ${p.score.toFixed(3)} · ${p.sections.matched}/${p.sections.usable} sections · ${p.reason}`));
+      if(p.suggested)review.append(action('Preview movement match',guarded(()=>openPair(p.radio_video || row.radio_video,p.fpv_video || row.fpv_video,p.offset_seconds,false,'gimbal_activity'),'counterpart-message')));
+    }
+    if(row.rhythm) {
+      matching.append(el('small',`Movement rhythm: ${row.rhythm.score.toFixed(3)} · ${row.rhythm.sections.matched}/${row.rhythm.sections.usable} sections · ${row.rhythm.reason}`));
+      if(row.rhythm.suggested)review.append(action('Preview rhythm offset',guarded(()=>openPair(row.radio_video,row.fpv_video,row.rhythm.offset_seconds,false,true),'counterpart-message')));
+    }
+    alignment.append(el('span',row.alignment_available?`Offset ${offsetText(candidateOffset)}`:'Offset not estimated'));
+    if(row.alignment_available)alignment.append(el('small',`${time(row.alignment_overlap_seconds ?? row.overlap_seconds)} shared footage`));
+    const sourceError = (state.results.clips?.radio || []).find(c=>c.name===row.radio_video)?.source_usable === false || (state.results.clips?.fpv || []).find(c=>c.name===name)?.source_usable === false;
+    const button=action(row.reviewed ? 'Review saved pair' : 'Preview candidate',guarded(()=>openCandidate(row),'counterpart-message'));
+    button.disabled=sourceError || !row.alignment_available; review.append(button); if(sourceError)review.append(el('small','Source unavailable'));else if(!row.alignment_available)review.append(el('small',row.alignment_reason));
+    tr.append(recording,matching,alignment,review);return tr;
+  }));
+  $('counterpart-notes').replaceChildren();
+  if (!rows.length && !considered) return;
+  const needs=(state.results?.workflow?.needs_calibration || []).filter(n=>available.some(r=>r.name===n) && !matchingCalibrationReady(job.calibrations[n],sources));
+  if(needs.length){
+    const details=el('details'), summary=el('summary',`${needs.length} StickCam recording(s) need calibration for motion fallback`);details.append(summary);
+    for(const clip of needs){const row=el('div',undefined,'actions');row.append(el('span',clip,'hint'),action('Calibrate this clip',guarded(async()=>{openPanel('calibration-panel');await loadCalibration(clip);$('calibration-panel').scrollIntoView({behavior:'smooth'});},'counterpart-message')));details.append(row);}
+    $('counterpart-notes').append(details);
+  }
+  const skipped = (state.results?.workflow?.skipped_motion || []).filter(item=>item.kind === 'fpv' && item.name === name);
+  for(const item of skipped)$('counterpart-notes').append(el('p',`FPV motion: ${item.reason}`,'hint'));
+  for(const item of state.results?.errors || [])if(item.name===name || available.some(r=>r.name===item.name))$('counterpart-notes').append(el('p',`${item.name}: ${item.error}`,'error'));
+}
+$('workflow-counterpart').onclick=()=>{openPanel('counterpart-panel');$('counterpart-panel').scrollIntoView({behavior:'smooth',block:'start'});};
+$('counterpart-evidence-settings').onclick=()=>{setTechnicalTools(true);openPanel('analysis-panel');$('analysis-panel').scrollIntoView({behavior:'smooth',block:'start'});};
+$('counterpart-fpv').onchange=()=>{if(state.job)storage.setItem(`fpv-counterpart:${state.job.id}`,$('counterpart-fpv').value);renderCounterpart();};
+for(const id of ['counterpart-method','counterpart-visual','counterpart-show-all'])$(id).onchange=renderCounterpart;
+$('counterpart-find').onclick=guarded(async()=>{
+  if(!state.job || counterpartSearch.starting)return;
+  const name=$('counterpart-fpv').value;
+  if(!name || !state.job.inputs.fpv.some(r=>r.name===name))throw new Error('Choose an FPV recording from this session.');
+  const {strategy,sources}=counterpartOptions(), token=state.jobToken;
+  counterpartSearch.starting=true;renderCounterpart();
+  try{
+    await startMatching({matching_strategy:strategy,evidence_sources:sources,match_target_kind:'fpv',match_target_name:name,match_target_names:[name],match_sample_percent:100,stop_on_confident_match:false});
+  }finally{if(token===state.jobToken){counterpartSearch.starting=false;renderCounterpart();}}
+},'counterpart-message');
+$('counterpart-cancel').onclick=guarded(async()=>{
+  await api(path('/cancel'),{method:'POST'});state.job.status='cancelled';state.job.message='Counterpart search cancelled. Completed fingerprints remain cached.';updateJobUI();await history();
+},'counterpart-message');
 $('match-target-kind').onchange = updateMatchTargetOptions;
 $('match-target-name').onchange = () => { const kind = $('match-target-kind').value; if (kind !== 'all') { state.targets[kind] = new Set([$('match-target-name').value]); renderVideoLists(); } };
 $('targets-select-all').onclick = () => { const kind = $('match-target-kind').value; if (kind !== 'all') { state.targets[kind] = new Set(state.job.inputs[kind].filter(r => !state.job.calibrations[r.name]?.exclude).map(r => r.name)); renderVideoLists(); } };
@@ -1197,9 +1585,10 @@ $('early-preview').onclick = guarded(async () => {
 $('audio-only-unconfigured').onchange = updateEvidenceSummary;
 for (const id of Object.values(evidenceFields)) $(id).onchange = updateEvidenceSummary;
 for (const [id, sources] of Object.entries({
-  'evidence-all': {fpv_gyro: true, fpv_visual: true, stick_inputs: true, fpv_audio: true, stickcam_audio: true, filename_timestamps: true},
-  'evidence-audio': {fpv_gyro: false, fpv_visual: false, stick_inputs: false, fpv_audio: true, stickcam_audio: true, filename_timestamps: true},
-  'evidence-gyro': {fpv_gyro: true, fpv_visual: false, stick_inputs: true, fpv_audio: false, stickcam_audio: false, filename_timestamps: true}
+  'evidence-all': {fpv_gyro: true, fpv_visual: true, stick_inputs: true, fpv_audio: true, stickcam_audio: true, filename_timestamps: true, gimbal_activity:true},
+  'evidence-audio': {fpv_gyro: false, fpv_visual: false, stick_inputs: false, fpv_audio: true, stickcam_audio: true, filename_timestamps: true, gimbal_activity:false},
+  'evidence-gyro': {fpv_gyro: true, fpv_visual: false, stick_inputs: true, fpv_audio: false, stickcam_audio: false, filename_timestamps: true, gimbal_activity:false},
+  'evidence-movement': {fpv_gyro:true,fpv_visual:true,stick_inputs:false,fpv_audio:false,stickcam_audio:false,filename_timestamps:true,movement_rhythm:false,gimbal_activity:true}
 })) $(id).onclick = () => {
   $('audio-only-unconfigured').checked = false;
   loadEvidenceSources({evidence_sources: sources});
@@ -1219,28 +1608,60 @@ async function pollJob(id, token) {
 }
 async function loadResults() {
   const token = state.jobToken, results = await api(path('/matches')); if (token !== state.jobToken) return;
-  state.results = results; renderResults(); renderExports(); renderWorkflow();
+  state.results = results; renderResults(); renderExports(); renderWorkflow(); renderVideoLists();
+  refreshStickData(true).catch(error=>message('stick-data-message',error.message,true));
+  refreshFPVData(true).catch(error=>message('fpv-data-message',error.message,true));
   if (state.job.status !== 'complete') return;
   const plots = await api(path('/plots')); if (token !== state.jobToken) return;
   $('plots').replaceChildren(...plots.files.map(filename => { const link = el('a'); link.href = path(`/file/${part(filename)}`); link.target = '_blank'; link.rel = 'noopener';
     const image = el('img'); image.src = link.href; image.alt = 'Aligned motion and tracking quality diagnostics'; image.loading = 'lazy'; link.append(image); return link; }));
   show('diagnostics-panel', plots.files.length > 0);
 }
+function candidateStrength(row) { return row.alignment_available ? Number(row.alignment_score)||0 : 0; }
+function openCandidate(row) {
+  if(!row.alignment_available)throw new Error(row.alignment_reason || 'No matching alignment was found. Save radio regions or find a pair manually.');
+  return openPair(row.radio_video,row.fpv_video,row.alignment_offset_seconds,!!row.timing_only,row.alignment_method==='gimbal_activity'?'gimbal_activity':row.alignment_method==='rhythm');
+}
 function renderResults() {
   show('results-panel'); show('exports-panel'); const data = state.results;
   const assigned = data.rows.filter(row => row.global_assignment).sort((a, b) => a.radio_video.localeCompare(b.radio_video) || a.radio_common_start_seconds - b.radio_common_start_seconds);
   const scope = data.match_scope?.kind !== 'all' ? ` · ${data.match_scope.kind === 'fpv' ? 'FPV' : 'StickCam'} targets: ${(data.match_scope.targets || [data.match_scope.target]).join(', ')}` : '';
-  message('result-summary', `${assigned.length} proposed FPV pairs across ${new Set(assigned.map(r => r.radio_video)).size} StickCam recordings${scope} · ${data.unmatched_radio.length} StickCam and ${data.unmatched_fpv.length} FPV unmatched · ${(data.elapsed_seconds / 60).toFixed(1)} min analysis`);
-  message('clock-summary', data.clock.delta_seconds === null ? 'No reliable camera-clock difference established.' : `FPV − StickCam clock difference: ${offsetText(data.clock.delta_seconds)} · ${data.clock.support} supporting pair(s)${data.clock.support < 2 ? ' · tentative' : ''}.`);
+  const scopeText = data.manual_only ? ' · manual review; automated matching has not run' : data.match_scope?.sample_percent < 100 ? ` · ${data.match_scope.sample_percent}% sample setting (${data.match_scope.sampled_fpv?.length || 0}/${data.match_scope.total_fpv} FPV, ${data.match_scope.sampled_radio?.length || 0}/${data.match_scope.total_radio} StickCam scanned)` : ' · all selected files scanned';
+  const unmatchedLabel = data.match_scope?.sample_percent < 100 ? 'unmatched in sample' : 'unmatched';
+  message('result-summary', `${assigned.length} proposed FPV pairs across ${new Set(assigned.map(r => r.radio_video)).size} StickCam recordings${scope}${data.workflow?.strategy==='telemetry_seed'?' · sequential embedded-motion seed; other clips may be date-only':scopeText} · ${data.unmatched_radio.length} StickCam and ${data.unmatched_fpv.length} FPV ${unmatchedLabel} · ${Number.isFinite(data.elapsed_seconds) ? `${(data.elapsed_seconds / 60).toFixed(1)} min analysis` : 'saved results'}`);
+  if(data.workflow?.strategy==='telemetry_seed')message('result-summary',`${(data.gimbal_activity_proposals || []).length} movement candidates · ${(data.match_scope?.timing_suggestions || []).length} date-based relationships · ${data.workflow.seed_search.attempts.length}/${state.job.inputs.radio.length} StickCam prepared · ${assigned.filter(r=>r.reviewed).length} confirmed alignments · ${(data.elapsed_seconds/60).toFixed(1)} min. Review content and sync before confirming.`);
+  renderClocks(data);
+  const counts=data.review_summary || {};
+  message('review-summary',Object.entries(counts).map(([key,value])=>`${value} ${key}`).join(' · '));
+  renderFlightView(flightDocument());
+  const activity=data.gimbal_activity_proposals || [];show('gimbal-activity-suggestions',activity.length>0);
+  $('gimbal-activity-rows').replaceChildren(...activity.map(p=>{
+    const row=el('div',undefined,'timing-suggestion-row');row.append(el('span',`${p.radio_video} ↔ ${p.fpv_video}`),
+      el('small',`Movement score ${p.score.toFixed(3)} · ${p.sections.matched}/${p.sections.usable} sections · ${p.valid_seconds.toFixed(1)}s observed · offset ${offsetText(p.offset_seconds)} · ${p.reason}`),
+      action('Preview movement match',guarded(()=>openPair(p.radio_video,p.fpv_video,p.offset_seconds,false,'gimbal_activity'),'viewer-message')));return row;
+  }));
+  const rhythms=data.rhythm_proposals || [];show('rhythm-suggestions',rhythms.length>0);
+  $('rhythm-suggestion-rows').replaceChildren(...rhythms.map(p=>{
+    const row=el('div',undefined,'timing-suggestion-row');row.append(el('span',`${p.radio_video} ↔ ${p.fpv_video}`),
+      el('small',`Rhythm ${p.score.toFixed(3)} · ${p.sections.matched}/${p.sections.usable} active sections · ${p.radio_events}/${p.fpv_events} bursts · offset ${offsetText(p.offset_seconds)} · review required`),
+      action('Preview rhythm suggestion',guarded(()=>openPair(p.radio_video,p.fpv_video,p.offset_seconds,false,true),'viewer-message')));return row;
+  }));
+  const suggestions = data.match_scope?.timing_suggestions || [];
+  show('timing-suggestions', suggestions.length > 0);
+  $('timing-suggestion-rows').replaceChildren(...suggestions.slice(0, 30).map(renderDateSuggestion));
+  if (suggestions.length > 30) $('timing-suggestion-rows').append(action(`Show all ${suggestions.length} date suggestions`, () => {
+    $('timing-suggestion-rows').replaceChildren(...suggestions.map(renderDateSuggestion));
+  }));
+  if (data.match_scope?.timing_suggestions_truncated) $('timing-suggestion-rows').append(el('p', `Showing the first 250 of at least ${250 + data.match_scope.timing_suggestions_truncated} time-based candidates. Run all files to check more clips with content evidence.`, 'hint'));
   const ratesName = data.rate_profile?.model === 'actual' ? 'ACTUAL' : data.rate_profile?.model === 'kiss' ? 'KISS' : 'Betaflight legacy';
   message('rate-summary', data.rate_profile ? `Stick positions compared through the ${ratesName} rate curves.` : 'No FPV rate curve was applied.');
-  $('csv-download').href = path('/file/matches.csv'); $('pair-cards').replaceChildren();
+  show('csv-download',!data.manual_only);$('csv-download').href = path('/file/matches.csv'); $('pair-cards').replaceChildren();
   for (const row of assigned) {
     const button = action('', guarded(() => openPair(row.radio_video, row.fpv_video), 'viewer-message'), `pair-card${state.pair?.radio_video === row.radio_video && state.pair?.fpv_video === row.fpv_video ? ' active' : ''}`);
     button.append(el('span', row.reviewed ? 'Reviewed' : row.confidence === 'strong' ? 'Strong proposal' : 'Needs review', `badge ${row.reviewed ? 'saved' : row.confidence}`));
     const names = el('div', undefined, 'names'); names.append(el('span', clipLabel(state.job.inputs.radio.find(r => r.name === row.radio_video) || {name:row.radio_video})), el('span', '↔ ' + clipLabel(state.job.inputs.fpv.find(r => r.name === row.fpv_video) || {name:row.fpv_video}))); button.append(names);
-    button.append(el('small', `Score ${row.combined_score.toFixed(3)} · offset ${offsetText(row.offset_seconds)} · ${time(row.overlap_seconds)} shared`));
-    button.append(el('small', row.evidence));
+    button.append(el('small', `${row.reviewed?'Saved alignment':row.manual_pair?'Manual alignment':`Score ${row.combined_score.toFixed(3)}`} · offset ${offsetText(row.offset_seconds)} · ${time(row.overlap_seconds)} shared`));
+    button.append(el('small', row.reviewed && !row.combined_score?'Reviewed alignment · no automated content score in this run':row.evidence));
     if (row.audio_usable_sections != null) button.append(el('small', `Audio: ${row.audio_correlated_sections}/${row.audio_usable_sections} sections agree · ${row.audio_joint_sections || 0} agree in landmarks + trends`));
     if (row.motion_included === false) button.append(el('small', 'Motion skipped'));
     else if (row.usable_sections !== undefined) button.append(el('small', `Motion: ${row.correlated_sections}/${row.usable_sections} usable sections agree · ${Math.round(row.section_agreement * 100)}% support`));
@@ -1248,13 +1669,20 @@ function renderResults() {
     if (siblings.length > 1) button.append(el('small', `FPV segment ${siblings.indexOf(row) + 1}/${siblings.length} for this StickCam`));
     $('pair-cards').append(button);
   }
-  if (!assigned.length) $('pair-cards').append(el('p', 'No candidate passed the proposal threshold. Review the strongest alternatives below, or improve the tracking calibration.', 'hint'));
+  if (!assigned.length) $('pair-cards').append(el('p',data.manual_only?'No confirmed manual pair yet. Browse the two feeds, mark a shared event and confirm its alignment.':data.rows.some(r=>r.alignment_available)?'No candidate passed the proposal threshold. Review available evidence below, or find a pair manually.':'No matching evidence was available. Save radio regions for movement matching, or find a pair manually. No offset has been estimated.','hint'));
   $('unmatched').replaceChildren();
-  if (data.unmatched_radio.length) $('unmatched').append(el('h3', 'Unmatched StickCam recordings'));
+  if ((data.match_scope?.deferred_fpv || []).length || (data.match_scope?.deferred_radio || []).length)
+    $('unmatched').append(el('p', `${(data.match_scope.deferred_fpv || []).length} FPV and ${(data.match_scope.deferred_radio || []).length} StickCam files were not content-scanned in this pass. Clock-and-duration candidates are shown separately and require preview or a full pass.`, 'hint'));
+  if (data.unmatched_radio.length) $('unmatched').append(el('h3', data.workflow?.strategy==='telemetry_seed'?'StickCam recordings awaiting confirmation':'Unmatched StickCam recordings'));
   for (const name of data.unmatched_radio) {
     const row = el('div', undefined, 'unmatched-row'); row.append(el('span', name));
-    const candidate = data.rows.filter(item => item.radio_video === name).sort((a, b) => b.combined_score - a.combined_score)[0];
-    if (candidate) row.append(action(`Review best candidate · ${candidate.combined_score.toFixed(3)}`, guarded(() => openPair(name, candidate.fpv_video), 'viewer-message')));
+    const candidate = data.rows.filter(item => item.radio_video === name && item.alignment_available && !item.rejected).sort((a, b) => candidateStrength(b)-candidateStrength(a))[0];
+    if (candidate) row.append(action(`Review best candidate · ${candidateStrength(candidate).toFixed(3)}`, guarded(() => openCandidate(candidate), 'viewer-message')));
+    else {
+      const needsRegions=readEvidenceSources().gimbal_activity && !activityConfigured(state.job.calibrations[name]);
+      row.append(el('small',needsRegions?'Radio regions needed · no matching alignment':'No matching alignment found'));
+      if(needsRegions)row.append(action('Save radio regions',guarded(async()=>{openPanel('calibration-panel');await loadCalibration(name);$('cal-stage').scrollIntoView({behavior:'smooth',block:'start'});},'viewer-message')));
+    }
     $('unmatched').append(row);
   }
   if (data.unmatched_fpv.length) $('unmatched').append(el('p', 'Unmatched FPV: ' + data.unmatched_fpv.join(', '), 'hint'));
@@ -1266,32 +1694,99 @@ function renderResults() {
   $('candidate-filter').options[0].value = ''; $('candidate-filter').value = filter; renderCandidatePage();
   const reviewed = assigned.filter(row => row.reviewed).length;
   $('export-batch').disabled = !reviewed; $('export-batch').textContent = `Export ${reviewed} reviewed pair${reviewed === 1 ? '' : 's'}`;
+  renderCounterpart();
 }
 function renderCandidatePage() {
   if (!state.results) return;
-  const rows = state.results.rows.filter(row => !$('candidate-filter').value || row.radio_video === $('candidate-filter').value).sort((a, b) => b.combined_score - a.combined_score);
+  const rows = state.results.rows.filter(row => (!$('candidate-filter').value || row.radio_video === $('candidate-filter').value) && (!$('review-filter').value || row.review_state===$('review-filter').value)).sort((a, b) => candidateStrength(b)-candidateStrength(a));
   const pages = Math.max(1, Math.ceil(rows.length / 100)); state.page = Math.min(pages - 1, Math.max(0, state.page));
   $('candidate-rows').replaceChildren(...rows.slice(state.page * 100, (state.page + 1) * 100).map(row => {
     const tr = el('tr');
-    for (const value of [row.radio_video, row.fpv_video, row.combined_score.toFixed(3), row.motion_included === false ? 'Not used' : row.score.toFixed(3), row.audio_included === false ? 'Not used' : row.audio_score_at_motion_offset.toFixed(3), offsetText(row.offset_seconds)]) tr.append(el('td', value));
-    const td = el('td'); td.append(action(row.global_assignment ? 'Open pair' : 'Try candidate', guarded(() => openPair(row.radio_video, row.fpv_video), 'viewer-message'))); tr.append(td); return tr;
+    for (const value of [row.radio_video, row.fpv_video, !row.alignment_available?'No matching evidence':`${row.review_state || 'candidate'} · ${row.manual_pair?'Manual':row.timing_only?'Clock only':candidateStrength(row).toFixed(3)}`, row.timing_only ? 'Unscanned' : row.gimbal_activity ? `Gimbal ${row.gimbal_activity.score.toFixed(3)} · ${row.gimbal_activity.sections.matched}/${row.gimbal_activity.sections.usable}` : row.motion_included === false ? 'Not used' : row.score.toFixed(3), row.timing_only ? 'Unscanned' : row.audio_included === false ? 'Not used' : row.audio_score_at_motion_offset.toFixed(3), row.alignment_available?offsetText(row.alignment_offset_seconds):'Not estimated']) tr.append(el('td', value));
+    const td = el('td');if(row.alignment_available)td.append(action(row.timing_only ? 'Preview suggestion' : row.global_assignment ? 'Open pair' : 'Try candidate', guarded(() => openCandidate(row), 'viewer-message')));else td.append(el('span',row.alignment_reason,'hint'));tr.append(td);return tr;
   }));
   message('page-label', `${state.page + 1} / ${pages}`); $('previous-page').disabled = state.page === 0; $('next-page').disabled = state.page === pages - 1;
 }
+function renderDateSuggestion(candidate) {
+  const row=el('div',undefined,'timing-suggestion-row'), controls=el('div',undefined,'actions');
+  controls.append(action('Preview; confirm content',guarded(()=>openPair(candidate.radio_video,candidate.fpv_video,candidate.offset_seconds,true),'viewer-message')),
+    action('Reject this clock alignment',guarded(async()=>{
+      const token=state.jobToken;
+      const result=await api(path('/clock-rejections'),{method:'POST',json:{radio_video:candidate.radio_video,fpv_video:candidate.fpv_video,offset_seconds:candidate.offset_seconds}});
+      if(token!==state.jobToken)return;
+      state.results=result; renderResults(); renderWorkflow();
+      message('clock-message','Clock alignment rejected. Other recorder groups and content matches remain available. Restore it under Rejected clock alignments.');
+    },'clock-message')));
+  row.append(el('span',`${candidate.radio_video} ↔ ${candidate.fpv_video}`),
+    el('small',`Offset ${offsetText(candidate.offset_seconds)} · ${time(candidate.overlap_seconds)} overlap · ${candidate.clock_source}${candidate.provisional_clock?' · provisional movement seed':` · ${candidate.clock_support} anchor(s)`}${candidate.tentative?' · tentative':''}${candidate.negative_support?.length?` · caution: ${candidate.negative_support.length} rejected prediction(s) for this FPV in this group`:''}`),controls);
+  return row;
+}
+function clockDetails(container, support, anchors=[], dateOnly=false) {
+  container.replaceChildren();
+  if (anchors.length) container.append(el('p','This independently reviewed pair contributes a camera-clock anchor. It is not evidence for itself.','hint'));
+  for (const item of support || []) {
+    const status=item.status==='available' && dateOnly ? `Predicted offset ${offsetText(item.expected_offset)} · content needs independent verification · tolerance ±${item.tolerance}s` : item.status==='available' ? `${item.agrees ? 'Agrees with' : 'Disagrees with'} content alignment · predicted offset ${offsetText(item.expected_offset)} · difference ${offsetText(item.alignment_difference)} · tolerance ±${item.tolerance}s` :
+      item.status==='conflicting' ? 'Unavailable: confirmed anchors conflict' : 'Unavailable: repeated dates within a feed';
+    const detail=el('details'),summary=el('summary',`${item.label || 'Recorder'} · ${item.method==='modified'?'Modified dates':'Filename dates'} · ${status}`);
+    detail.append(summary,el('p',`${item.independent_flights} independent flight(s)${item.tentative?' · tentative':''} · raw StickCam − FPV modified difference: ${item.raw_modified_difference_seconds==null?'unavailable':offsetText(item.raw_modified_difference_seconds)}`,'hint'));
+    for (const anchor of item.anchors || []) detail.append(el('p',`${anchor.radio_video} ↔ ${anchor.fpv_video} · saved offset ${offsetText(anchor.offset_seconds)}`,'hint'));
+    container.append(detail);
+  }
+  if (!support?.length && !anchors.length) container.append(el('p','No independently confirmed date model is available for this pair yet.','hint'));
+}
+function renderClocks(data) {
+  const models=data.learned_clocks || [];
+  const modified=models.filter(m=>m.method==='modified');
+  message('clock-summary',modified.length ? `Recorder modified-date clocks: ${modified.map(m=>`${m.label} ${offsetText(m.delta_seconds)} · ${m.independent_flights} flight(s)${m.tentative?' · tentative':''}${m.consistent?'':' · conflicting; disabled'}`).join('; ')}.` :
+    data.clock?.delta_seconds!=null ? `Tentative content-derived FPV − StickCam clock: ${offsetText(data.clock.delta_seconds)}. Independently confirm a pair and label its recorder to teach modified dates.` : 'Confirm a content match to learn its recorder’s modified-date difference. Different drones can have different clocks.');
+  $('clock-warnings').replaceChildren(...(data.clock_warnings || []).map(text=>el('p',text)));
+  $('modified-kind').value=data.clock_settings?.modified_kind || 'end';
+  $('modified-tolerance').value=String(data.clock_settings?.modified_tolerance || 5);
+  $('clock-filenames').checked=data.clock_settings?.use_filenames!==false;
+  const list=$('clock-anchor-list');list.replaceChildren();
+  for (const model of models) {
+    list.append(el('h3',`${model.label} · ${model.method==='modified'?'Modified dates':'Filename dates'} · ${model.independent_flights} flight(s) · ±${model.tolerance}s${model.consistent?'':' · conflicting'}`));
+    for (const anchor of model.anchors) list.append(el('p',`${anchor.radio_video} ↔ ${anchor.fpv_video} · sync ${offsetText(anchor.offset_seconds)} · raw modified difference ${anchor.raw_modified_difference_seconds==null?'unavailable':offsetText(anchor.raw_modified_difference_seconds)}`,'hint'));
+  }
+  if (!models.length) list.append(el('p','No independent anchors yet. A date-only confirmation does not teach the camera clock.','hint'));
+  const rejected=data.clock_rejections || [];
+  show('clock-rejections',rejected.length>0);
+  $('clock-rejection-rows').replaceChildren(...rejected.map(item=>{
+    const row=el('div',undefined,'actions');
+    row.append(el('span',`${item.radio_video} ↔ ${item.fpv_video} · ${item.clock_label} · rejected offset ${offsetText(item.offset_seconds)}`),
+      action('Restore alignment suggestion',guarded(async()=>{
+        const token=state.jobToken,result=await api(path(`/clock-rejections/${part(item.id)}`),{method:'DELETE'});
+        if(token!==state.jobToken)return;
+        state.results=result; renderResults(); renderWorkflow(); message('clock-message','Clock alignment suggestion restored.');
+      },'clock-message')));return row;
+  }));
+  if (state.pair) {
+    const row=data.rows.find(r=>r.radio_video===state.pair.radio_video && r.fpv_video===state.pair.fpv_video);
+    clockDetails($('pair-clock-details'),row?.clock_support,models.flatMap(m=>m.anchors.filter(a=>a.radio_video===state.pair.radio_video && a.fpv_video===state.pair.fpv_video)),state.pair.timing_only || state.pair.date_suggestion || state.pair.verification==='date_only');
+  }
+}
+$('refresh-clock-suggestions').onclick=guarded(async()=>{
+  const token=state.jobToken;
+  const result=await api(path('/clocks'),{method:'PATCH',json:{modified_kind:$('modified-kind').value,modified_tolerance:Number($('modified-tolerance').value),use_filenames:$('clock-filenames').checked}});
+  if(token!==state.jobToken)return;
+  state.results=result;renderResults();message('clock-message','Date evidence and suggestions updated without rescanning audio or motion.');
+},'clock-message');
 $('candidate-filter').onchange = () => { state.page = 0; renderCandidatePage(); };
+$('review-filter').onchange = () => { state.page = 0; renderCandidatePage(); };
 $('previous-page').onclick = () => { state.page--; renderCandidatePage(); }; $('next-page').onclick = () => { state.page++; renderCandidatePage(); };
 
 // The shared timeline ends at the overlap boundary. Source timestamps are always
 // derived from the saved start trims, independently of source frame rates.
 function pausePair() {
-  state.playing = false; state.startingPlayback = false; cancelAnimationFrame(state.animation); $('radio-preview').pause(); $('fpv-preview').pause(); $('fpv-preview').playbackRate = 1;
-  $('pair-play').textContent = 'Play';
+  state.playing = false; state.buffering = false; for(const video of [$('radio-preview'),$('fpv-preview')]) setPreviewPlaybackIntent(video,false); state.startingPlayback = false; cancelAnimationFrame(state.animation); $('radio-preview').pause(); $('fpv-preview').pause(); $('fpv-preview').playbackRate = 1;
+  $('pair-play').textContent = 'Play'; for(const kind of ['radio','fpv'])show(`${kind}-preview-buffer`,false);
 }
 function applyAudio() { $('radio-preview').muted = $('preview-audio').value !== 'radio'; $('fpv-preview').muted = $('preview-audio').value !== 'fpv'; }
+function previewFrameRate(){return Number($('export-fps').value) || Number(state.pair?.source_metadata?.radio?.fps) || 30;}
 function elapsed() { return state.pair ? Math.max(0, $('radio-preview').currentTime - state.pair.radio_start) : 0; }
 function seekPair(at) {
   if (!state.pair) return;
-  const value = Math.max(0, Math.min(at, Math.max(0, state.pair.overlap_duration - 1 / Number($('export-fps').value))));
+  const value = Math.max(0, Math.min(at, Math.max(0, state.pair.overlap_duration - 1 / previewFrameRate())));
   $('radio-preview').currentTime = state.pair.radio_start + value; $('fpv-preview').currentTime = state.pair.fpv_start + value;
   $('pair-seek').value = value; message('pair-time', `${time(value, true)} / ${time(state.pair.overlap_duration)}`);
 }
@@ -1304,27 +1799,49 @@ function intervalBars() {
     $('overlap-bars').append(row, el('div', `${time(start, true)} → ${time(start + state.pair.overlap_duration, true)} of ${time(duration)} source`, 'interval-label'));
   }
 }
-async function openPair(radioName, fpvName, customOffset = null) {
+async function openPair(radioName, fpvName, customOffset = null, dateSuggestion = false, rhythmSuggestion = false, manualOptions = null) {
   const token = ++state.viewerToken, jobToken = state.jobToken;
-  pausePair(); show('portrait-panel', false); state.pair = null; openPanel('viewer-panel'); message('viewer-message', 'Loading both videos…');
+  manualBrowser.pause(); pauseFlight(); pausePair(); show('portrait-panel', false); state.pair = null; openPanel('viewer-panel'); message('viewer-message', 'Loading both videos…');
   $('open-portrait').disabled = true;
   $('export-pair').disabled = $('save-alignment').disabled = true; $('pair-play').disabled = true;
   $('viewer-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
-  $('review-radio').replaceChildren(...state.results.clips.radio.map(record => { const option = el('option', record.name); option.value = record.name; return option; })); $('review-radio').value = radioName;
-  const candidates = state.results.rows.filter(row => row.radio_video === radioName).sort((a, b) => b.combined_score - a.combined_score);
-  $('review-fpv').replaceChildren(...candidates.map(row => { const option = el('option', `${row.fpv_video} · ${row.combined_score.toFixed(3)}${row.global_assignment ? ' · paired' : ''}`); option.value = row.fpv_video; return option; })); $('review-fpv').value = fpvName;
-  const info = await api(path('/pair-info'), { method: 'POST', json: { radio_video: radioName, fpv_video: fpvName, offset_seconds: customOffset } });
+  if (!state.results) {
+    await loadResults();
+    if(token!==state.viewerToken || jobToken!==state.jobToken)return;
+  }
+  const selected=state.results.rows.find(row=>row.radio_video===radioName && row.fpv_video===fpvName);
+  if(!manualOptions && customOffset===null) {
+    if(!selected?.alignment_available)throw new Error(selected?.alignment_reason || 'No matching alignment is available. Open Find a pair manually to align these recordings.');
+    customOffset=selected.alignment_offset_seconds;
+    dateSuggestion ||= selected.alignment_method==='timestamp';
+    rhythmSuggestion ||= selected.alignment_method==='gimbal_activity'?'gimbal_activity':selected.alignment_method==='rhythm';
+  }
+  const records=state.job.inputs;
+  $('review-radio').replaceChildren(...records.radio.map(record=>{const option=el('option',clipLabel(record));option.value=record.name;return option;}));$('review-radio').value=radioName;
+  const candidates=state.results.rows.filter(row=>row.radio_video===radioName).sort((a,b)=>candidateStrength(b)-candidateStrength(a));
+  $('review-fpv').replaceChildren(...records.fpv.map(record=>{const row=candidates.find(r=>r.fpv_video===record.name),option=el('option',`${clipLabel(record)} · ${row?.alignment_available?(row.manual_pair?'manual':row.timing_only?'dates':candidateStrength(row).toFixed(3)):'no alignment'}`);option.value=record.name;option.disabled=!manualOptions && !row?.alignment_available;return option;}));$('review-fpv').value=fpvName;
+  const analyzed=candidates.some(row=>row.fpv_video===fpvName);
+  const manual=!!manualOptions || !analyzed;
+  const info=await api(path('/pair-info'),{method:'POST',json:{radio_video:radioName,fpv_video:fpvName,offset_seconds:customOffset??(manual?0:null),manual_pair:manual,sync_points:manualOptions?.sync_points}});
+  if(manualOptions && JSON.stringify(manualOptions.source_revisions)!==JSON.stringify(info.source_revisions))throw new Error('A source changed since the manual players were loaded. Reload both recordings and mark the event again.');
   if (token !== state.viewerToken || jobToken !== state.jobToken) return;
-  state.pair = info;
+  state.pair = info; info.date_suggestion=dateSuggestion;info.rhythm_suggestion=rhythmSuggestion;info.manual_sync_points=manualOptions?.sync_points;info.manual_recorder=manualOptions?.recorder ?? state.job.inputs.fpv.find(r=>r.name===fpvName)?.fpv_recorder ?? '';
+  fingerprintReview.render();
+  renderSyncPoints();$('no-counterpart').textContent=state.job.no_counterpart?.includes(info.fpv_video)?'Restore FPV counterpart search':'No counterpart for this FPV';
+  $('independent-content-check').checked=!!info.reviewed && info.verification==='independent';show('independent-check-wrap',info.manual_pair || !!info.timing_only || dateSuggestion || rhythmSuggestion || info.verification!=='independent');
+  renderPairRhythm(rhythmSuggestion === 'gimbal_activity' ? info.gimbal_activity : info.rhythm || info.gimbal_activity);
+  clockDetails($('pair-clock-details'),info.clock_support,info.clock_anchors,info.timing_only || info.date_suggestion || info.verification==='date_only');
   selectMotionPair(info);
   $('radio-heading').textContent = radioName; $('fpv-heading').textContent = fpvName; $('review-offset').value = info.offset_seconds.toFixed(6);
-  $('review-state').textContent = info.reviewed ? 'Reviewed alignment' : info.review_reason || 'Automatic estimate · review';
+  $('review-state').textContent = info.reviewed ? 'Reviewed alignment' : info.review_reason || (info.manual_pair?'Manual alignment · check shared visible events':'Automatic estimate · review');
   $('replace-owner').checked = false; show('replace-owner-wrap', !!info.existing_owner); $('replace-owner-wrap').title = info.existing_owner ? `Currently saved with ${info.existing_owner}` : '';
   $('pair-audio-toggle').checked = false; show('pair-audio-charts', false);
   const candidate = candidates.find(row => row.fpv_video === fpvName);
-  if (customOffset !== null && Math.abs(customOffset - candidate.offset_seconds) > 1e-7) $('review-state').textContent = 'Unsaved alignment adjustment';
-  const motionEvidence = candidate.motion_included === false ? 'motion not used' : `${candidate.reliable_axes} motion axes · timing peak margin ${candidate.peak_margin.toFixed(3)}`;
-  message('pair-evidence', `${customOffset !== null && Math.abs(customOffset - candidate.offset_seconds) > 1e-7 ? 'Predicted filename alignment: confirm shared content; the original scores below were measured at another offset. ' : ''}${info.evidence} · score ${info.score.toFixed(3)} · ${motionEvidence} · candidate margin ${candidate.candidate_margin.toFixed(3)}. ${sectionsText(candidate)}`);
+  if (customOffset !== null && Math.abs(customOffset - (candidate?.offset_seconds ?? customOffset)) > 1e-7) $('review-state').textContent = 'Unsaved alignment adjustment';
+  const motionEvidence = candidate?.motion_included === false ? 'motion not used' : `${candidate?.reliable_axes || 0} motion axes · timing peak margin ${Number(candidate?.peak_margin || 0).toFixed(3)}`;
+  message('pair-evidence', `${customOffset !== null && Math.abs(customOffset - (candidate?.offset_seconds ?? customOffset)) > 1e-7 ? 'Suggested alignment: confirm shared content; the original axis/audio scores below were measured at another offset. ' : ''}${info.evidence} · score ${info.score.toFixed(3)} · ${motionEvidence} · candidate margin ${Number(candidate?.candidate_margin || 0).toFixed(3)}. ${candidate?sectionsText(candidate):''}`);
+  if(info.manual_pair)message('pair-evidence','Manual visual alignment. No audio, gyro or StickCam extraction was required, and no automated match score is claimed. Check more than one event where possible; confirming this pair teaches its recorder’s date clock.');
+  if(rhythmSuggestion) { const evidence=rhythmSuggestion==='gimbal_activity'?info.gimbal_activity:info.rhythm; message('pair-evidence',`Experimental ${rhythmSuggestion==='gimbal_activity'?'tip-free gimbal movement':'derived-input rhythm'} · score ${evidence?.score?.toFixed(3)} · resolution ${evidence?.timing_resolution_seconds}s plus unknown response delay. Check shared visible events and refine sync before confirming.`); }
   $('pair-seek').max = info.overlap_duration; intervalBars(); applyAudio();
   await Promise.all([loadVideo($('radio-preview'), 'radio', radioName, () => token === state.viewerToken && jobToken === state.jobToken, 'viewer-message', $('playback-proxy').checked, info.radio_start),
     loadVideo($('fpv-preview'), 'fpv', fpvName, () => token === state.viewerToken && jobToken === state.jobToken, 'viewer-message', $('playback-proxy').checked, info.fpv_start)]);
@@ -1332,62 +1849,80 @@ async function openPair(radioName, fpvName, customOffset = null) {
   seekPair(0); $('pair-play').disabled = $('save-alignment').disabled = false; $('export-pair').disabled = !info.reviewed;
   message('viewer-message', `Shared interval: ${time(info.overlap_duration)}. Check the beginning and end, then save your alignment.`);
   $('open-portrait').disabled = false;
+  if(manualOptions?.sync_points?.length)seekPair(manualOptions.sync_points[0].radio_time-info.radio_start);
   renderResults();
 }
 $('review-radio').onchange = guarded(async () => {
-  const name = $('review-radio').value, candidates = state.results.rows.filter(row => row.radio_video === name).sort((a, b) => b.combined_score - a.combined_score);
-  await openPair(name, (candidates.find(row => row.global_assignment) || candidates[0]).fpv_video);
+  const name = $('review-radio').value, candidates = state.results.rows.filter(row => row.radio_video === name && row.alignment_available && !row.rejected).sort((a, b) => candidateStrength(b)-candidateStrength(a));
+  if(state.pair?.manual_pair)return openPair(name,$('review-fpv').value,0,false,false,{recorder:state.pair.manual_recorder});
+  const candidate=candidates.find(row=>row.reviewed || row.global_assignment) || candidates[0];
+  if(!candidate){$('review-radio').value=state.pair?.radio_video || '';throw new Error('No matching alignment was found for this StickCam. Save its radio regions or find a pair manually.');}
+  await openCandidate(candidate);
 }, 'viewer-message');
-$('review-fpv').onchange = guarded(() => openPair($('review-radio').value, $('review-fpv').value), 'viewer-message');
+$('review-fpv').onchange = guarded(() => state.pair?.manual_pair?openPair($('review-radio').value,$('review-fpv').value,0,false,false,{recorder:state.pair.manual_recorder}):openPair($('review-radio').value, $('review-fpv').value), 'viewer-message');
 async function updateOffset() {
   if (!state.pair) return;
   const at = $('radio-preview').currentTime, old = state.pair, token = state.viewerToken, offsetToken = ++state.offsetToken;
   pausePair();
-  const info = await api(path('/pair-info'), { method: 'POST', json: { radio_video: old.radio_video, fpv_video: old.fpv_video, offset_seconds: Number($('review-offset').value) } });
+  const info = await api(path('/pair-info'), { method: 'POST', json: { radio_video: old.radio_video, fpv_video: old.fpv_video, offset_seconds: Number($('review-offset').value),manual_pair:!!old.manual_pair,sync_points:old.manual_sync_points } });
   if (token !== state.viewerToken || offsetToken !== state.offsetToken) return;
-  state.pair = info; $('export-pair').disabled = !info.reviewed; $('pair-audio-toggle').checked = false; show('pair-audio-charts', false); $('pair-seek').max = info.overlap_duration; intervalBars(); seekPair(at - info.radio_start);
+  info.date_suggestion=old.date_suggestion;info.rhythm_suggestion=old.rhythm_suggestion;info.manual_sync_points=old.manual_sync_points;info.manual_recorder=old.manual_recorder; state.pair = info; $('export-pair').disabled = !info.reviewed; $('pair-audio-toggle').checked = false; show('pair-audio-charts', false); $('pair-seek').max = info.overlap_duration; intervalBars(); seekPair(at - info.radio_start);
+  renderSyncPoints();
   $('review-state').textContent = 'Unsaved alignment adjustment'; message('viewer-message', 'Offset adjusted. Save pairing & alignment to keep it.');
 }
 $('review-offset').onchange = guarded(updateOffset, 'viewer-message');
 for (const [id, direction] of [['offset-back', -1], ['offset-forward', 1]]) $(id).onclick = guarded(async () => {
-  if (!state.pair) return; $('review-offset').value = (Number($('review-offset').value) + direction / Number($('export-fps').value)).toFixed(6); await updateOffset();
+  if (!state.pair) return; $('review-offset').value = (Number($('review-offset').value) + direction / previewFrameRate()).toFixed(6); await updateOffset();
 }, 'viewer-message');
-for (const [id, direction] of [['step-back', -1], ['step-forward', 1]]) $(id).onclick = () => { pausePair(); seekPair(elapsed() + direction / Number($('export-fps').value)); };
+for (const [id, direction] of [['step-back', -1], ['step-forward', 1]]) $(id).onclick = () => { pausePair(); seekPair(elapsed() + direction / previewFrameRate()); };
 $('pair-seek').oninput = () => { pausePair(); seekPair(Number($('pair-seek').value)); syncMotionCursor(); };
 $('preview-audio').onchange = applyAudio;
 $('playback-proxy').onchange = guarded(async () => {
-  localStorage.setItem('fpv-fast-preview', $('playback-proxy').checked ? '1' : '0');
+  storage.setItem('fpv-fast-preview', $('playback-proxy').checked ? '1' : '0');
   if (!state.pair) return;
   const current = state.pair, at = elapsed();
-  await openPair(current.radio_video, current.fpv_video, Number($('review-offset').value));
+  await openPair(current.radio_video,current.fpv_video,Number($('review-offset').value),!!current.date_suggestion,current.rhythm_suggestion || false,current.manual_pair?{recorder:current.manual_recorder,sync_points:current.manual_sync_points,source_revisions:current.source_revisions}:null);
   seekPair(at);
 }, 'viewer-message');
 $('pair-play').onclick = guarded(async () => {
   if (state.playing) { pausePair(); return; } if (!state.pair) return;
   pauseMotionPreview();
   if (elapsed() >= state.pair.overlap_duration - .1) seekPair(0);
-  state.playing = true; $('pair-play').textContent = 'Pause'; playbackTick();
+  manualBrowser.pause();state.playing = true; state.buffering=true; for(const video of [$('radio-preview'),$('fpv-preview')]) setPreviewPlaybackIntent(video,true); $('pair-play').textContent = 'Pause'; playbackTick();
 }, 'viewer-message');
 function playbackTick() {
   drawPortrait();
   if (!state.playing || !state.pair) return;
   const radio = $('radio-preview'), fpv = $('fpv-preview'), at = elapsed();
   const previewEnd = $('portrait-panel').checkVisibility() && portrait.pair ? Number($('portrait-out').value) : state.pair.overlap_duration;
-  if (at >= previewEnd - .5 / Number($('export-fps').value) || radio.ended || fpv.ended) { pausePair(); return; }
-  if (radio.readyState < 3 || fpv.readyState < 3 || radio.seeking || fpv.seeking) { radio.pause(); fpv.pause(); }
+  if (at >= previewEnd - .5 / previewFrameRate() || radio.ended || fpv.ended) { pausePair(); return; }
+  const remaining=state.pair.overlap_duration-at, refill=Math.min(1.5,Math.max(.05,remaining-.1));
+  const ready=radio.readyState>=3 && fpv.readyState>=3 && !radio.seeking && !fpv.seeking;
+  if(!ready || (state.buffering && (bufferedAhead(radio)<refill || bufferedAhead(fpv)<refill))) {
+    state.buffering=true; radio.pause(); fpv.pause();
+  }
   else {
+    state.buffering=false;
     const expected = state.pair.fpv_start + at, drift = fpv.currentTime - expected;
     if (Math.abs(drift) > .14 && performance.now() - state.lastCorrection > 300) { fpv.currentTime = expected; state.lastCorrection = performance.now(); }
     else fpv.playbackRate = Math.abs(drift) > .035 ? (drift > 0 ? .97 : 1.03) : 1;
     if ((radio.paused || fpv.paused) && !state.startingPlayback) {
       const token = state.viewerToken;
       state.startingPlayback = true;
-      Promise.all([radio.play(), fpv.play()]).catch(error => { if (token === state.viewerToken) { pausePair(); message('viewer-message', error.message, true); } }).finally(() => { if (token === state.viewerToken) state.startingPlayback = false; });
+      Promise.all([radio.play(), fpv.play()]).catch(error => { if (token === state.viewerToken && state.playing && error.name !== 'AbortError') { pausePair(); message('viewer-message', error.message, true); } }).finally(() => { if (token === state.viewerToken) state.startingPlayback = false; });
     }
+  }
+  for (const [kind,video] of [['radio',radio],['fpv',fpv]]) {
+    show(`${kind}-preview-buffer`,state.buffering || video.seeking);
+    $(`${kind}-preview-buffer`).textContent=video.seeking?'Seeking…':video.readyState<3 || bufferedAhead(video)<refill?'Buffering…':'Waiting for the other preview…';
   }
   syncMotionCursor();
   $('pair-seek').value = at; message('pair-time', `${time(at, true)} / ${time(state.pair.overlap_duration)}`);
   state.animation = requestAnimationFrame(playbackTick);
+}
+function bufferedAhead(video) {
+  for(let i=0;i<video.buffered.length;i++) if(video.buffered.start(i)<=video.currentTime+.04 && video.buffered.end(i)>video.currentTime) return video.buffered.end(i)-video.currentTime;
+  return 0;
 }
 for (const id of ['radio-preview', 'fpv-preview']) $(id).onended = pausePair;
 async function saveAlignment() {
@@ -1397,18 +1932,19 @@ async function saveAlignment() {
   if (Math.abs(Number($('review-offset').value) - state.pair.offset_seconds) > 1e-7) await updateOffset();
   if (initialToken !== state.viewerToken || !state.pair) return;
   const current = state.pair, token = state.viewerToken;
-  await api(path(`/pairs/${part(current.radio_video)}`), { method: 'PUT', json: { fpv_video: current.fpv_video, offset_seconds: current.offset_seconds, replace_owner: $('replace-owner').checked } });
+  await api(path(`/pairs/${part(current.radio_video)}`), { method: 'PUT', json: { fpv_video: current.fpv_video, offset_seconds: current.offset_seconds, replace_owner: $('replace-owner').checked, independent_check:$('independent-content-check').checked, date_suggestion:!!current.date_suggestion, rhythm_suggestion:!!current.rhythm_suggestion,manual_pair:!!current.manual_pair,fpv_recorder:current.manual_recorder,source_revisions:current.source_revisions,...(current.manual_sync_points?{sync_points:current.manual_sync_points}:{}) } });
   if (token !== state.viewerToken) return;
-  current.reviewed = true; $('export-pair').disabled = false; show('replace-owner-wrap', false); $('review-state').textContent = 'Reviewed alignment'; message('viewer-message', 'Segment pairing and offset saved. Other segments for this StickCam are kept.'); await loadResults();
+  state.job = await api(path(''));if(token!==state.viewerToken)return;manualBrowser.render();current.reviewed = true; $('export-pair').disabled = false; show('replace-owner-wrap', false); $('review-state').textContent = 'Reviewed alignment'; message('viewer-message', 'Segment pairing and offset saved. Other segments for this StickCam are kept.'); await loadResults();
   if ($('auto-find-segments').checked) await startRelatedSegments(current);
   return token === state.viewerToken ? current : null;
 }
 $('save-alignment').onclick = guarded(saveAlignment, 'viewer-message');
 $('reject-pair').onclick = guarded(async () => {
   if (!state.pair) return; pausePair();
-  await api(path(`/pairs/${part(state.pair.radio_video)}`), { method: 'PUT', json: { fpv_video: state.pair.fpv_video, reject:true } });
+  await api(path(`/pairs/${part(state.pair.radio_video)}`), { method: 'PUT', json: { fpv_video:state.pair.fpv_video,offset_seconds:state.pair.offset_seconds,reject:true,manual_pair:!!state.pair.manual_pair,source_revisions:state.pair.source_revisions } });
   state.pair.reviewed = false; $('export-pair').disabled = true; await loadResults(); $('review-state').textContent = 'Segment rejected'; message('viewer-message', 'This FPV segment is unmatched. Other saved segments for this StickCam are kept.');
 }, 'viewer-message');
+$('reject-pair').title='Reject these two recordings as a pair in every recorder group. To reject only a predicted offset, use Reject this clock alignment in date suggestions.';
 
 function renderRelatedSegments() {
   const groups = state.results?.segment_candidates || [];
@@ -1428,13 +1964,9 @@ function renderRelatedSegments() {
 }
 async function startRelatedSegments(pair) {
   if (!pair || !pair.reviewed) return;
-  const token = state.jobToken, jobId = state.job.id;
-  message('segment-scan-message', 'Looking for FPV files on the confirmed StickCam timeline…'); show('related-segments');
-  try {
-    const task = await api(`/api/jobs/${jobId}/pairs/${part(pair.radio_video)}/segments`, {method:'POST', json:{fpv_video:pair.fpv_video}});
-    if (token !== state.jobToken) return;
-    watchRelatedSegments(task.id, jobId, token);
-  } catch(error) { message('segment-scan-message', error.message, true); }
+  await loadResults();
+  if (state.results?.match_scope?.timing_suggestions?.length) {openPanel('timing-suggestions');$('timing-suggestions').scrollIntoView({behavior:'smooth',block:'start'});}
+  else message('viewer-message','Alignment saved. No additional reliable date overlaps were found; check the learned camera dates or find another content anchor.');
 }
 function watchRelatedSegments(task, jobId, jobToken) {
   clearTimeout(segmentScan.timer); const token = ++segmentScan.token;
@@ -1466,6 +1998,7 @@ $('segment-scan-cancel').onclick = guarded(async () => {
 // pair currently selected in the viewer.
 function renderExports() {
   if (!state.job) return;
+  if(!$('export-destination').value)$('export-destination').value=state.job.export_destination || '';
   show('exports-panel', !!state.results || !!state.job.exports?.length);
   $('export-list').replaceChildren();
   if (!state.job.exports?.length) $('export-list').append(el('p', 'No exports yet. Save an alignment and export a pair.', 'hint'));
@@ -1476,7 +2009,7 @@ function renderExports() {
 }
 async function requestExport(pairs) {
   const id = state.job.id, token = state.jobToken;
-  const result = await api(`/api/jobs/${id}/exports`, { method: 'POST', json: { pairs, fps: Number($('export-fps').value), profile: $('export-profile').value, stabilize_radio: $('export-radio-framing').value === 'stabilized' } });
+  const result = await api(`/api/jobs/${id}/exports`, { method: 'POST', json: { pairs, fps: $('export-fps').value==='original'?null:Number($('export-fps').value), profile: $('export-profile').value, stabilize_radio: $('export-radio-framing').value === 'stabilized', acknowledge_sync_warning:$('sync-export-ack').checked, destination:$('export-destination').value, verify_frames:$('export-verify-frames').checked } });
   if (token !== state.jobToken) return;
   state.job.exports ||= []; if (!state.job.exports.some(item => item.id === result.id)) state.job.exports.push({ id: result.id, status: 'queued', message: 'Preparing aligned clips' }); renderExports();
   openPanel('exports-panel'); $('exports-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1499,6 +2032,9 @@ async function pollExport(jobId, exportId, token) {
       for (const filename of status.files) { const link = el('a', filename.split('/').at(-1)); link.href = `/api/jobs/${jobId}/exports/${exportId}/files/${filename.split('/').map(part).join('/')}`; links.append(link); }
     }
     if (['queued', 'running'].includes(status.status)) links.append(action('Cancel export', guarded(async () => { await api(`/api/jobs/${jobId}/exports/${exportId}/cancel`, { method: 'POST' }); await pollExport(jobId, exportId, token); }, 'viewer-message')));
+    if(status.eta_seconds!=null && status.status==='running')row.append(el('p',`About ${time(status.eta_seconds)} remaining · ${time(status.elapsed_seconds)} elapsed`,'hint'));
+    if(status.directory)row.append(el('p',status.directory,'hint'));
+    if(status.percent!=null){const progress=el('progress');progress.max=100;progress.value=status.percent;row.append(progress);}
     row.append(links);
     if (!['queued', 'running'].includes(status.status)) return;
   } catch (error) { if (token !== state.jobToken) return; }
@@ -1507,19 +2043,26 @@ async function pollExport(jobId, exportId, token) {
 document.addEventListener('keydown', event => {
   if (!state.pair || ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'CANVAS'].includes(document.activeElement.tagName)) return;
   if (event.code === 'Space') { event.preventDefault(); $('pair-play').click(); }
-  if (event.code === 'ArrowLeft' || event.code === 'ArrowRight') { event.preventDefault(); pausePair(); seekPair(elapsed() + (event.code === 'ArrowLeft' ? -1 : 1) / Number($('export-fps').value)); }
+  if (event.code === 'ArrowLeft' || event.code === 'ArrowRight') { event.preventDefault(); pausePair(); seekPair(elapsed() + (event.code === 'ArrowLeft' ? -1 : 1) / previewFrameRate()); }
 });
 window.addEventListener('pagehide', () => { pausePair(); state.uploadController?.abort(); });
 (async () => {
+  let system;
   try {
-    const system = await api('/api/system');
+    system = await waitForServer();
+  } catch (error) {
+    message('system', 'Server connection failed', true);
+    message('input-error', error.message, true);
+    return;
+  }
+  try {
     const tracking = system.tracking || {};
     message('tracking-capability', tracking.available ? `CUDA available · ${tracking.device}. Accelerates optical flow, perspective crops and stick template matching. SIFT reacquisition and geometry/confidence checks use CPU.` : `CPU tracking · ${tracking.reason || 'GPU tracking unavailable'}`); message('system', `${bytes(system.free_bytes)} free · local processing · LAN ready${system.ffmpeg && system.ffprobe ? '' : ' · install FFmpeg before analyzing'}`);
-    $('playback-proxy').checked = localStorage.getItem('fpv-fast-preview') !== '0';
+    $('playback-proxy').checked = storage.getItem('fpv-fast-preview') !== '0';
     try { await loadRadioModels(); } catch (error) { message('radio-shape-message', error.message, true); }
     await history();
     try { await loadRatePresets(); } catch (error) { message('rate-preset-message', error.message, true); }
-    const saved = localStorage.getItem('fpv-session'); if (saved) await selectJob(saved);
+    const saved = storage.getItem('fpv-session'); if (saved) await selectJob(saved);
   } catch (error) { message('input-error', error.message, true); }
 })();
 
@@ -1528,7 +2071,7 @@ const motion = { token: 0, windowToken: 0, id: null, data: null, timer: null, cu
 const audioReview = { token: 0, windowToken: 0, id: null, jobId: null, data: null, timer: null, running: false };
 const gyroScan = { token: 0, id: null, jobId: null, timer: null, running: false };
 const motionPreview = { token: 0, pair: null, playing: false, frame: null, pending: false, lastDraw: 0, lastCorrection: 0 };
-const motionColors = ['#f92880', '#72cf6b', '#26a1ec', '#dda354'];
+const motionColors = ['#f06f62', '#72cf6b', '#49a7f2', '#dda354'];
 function resetMotionReview() {
   resetAudioReview();
   resetGyroScan();
@@ -1725,38 +2268,40 @@ function motionValueAt(trace, at) {
 function drawMotion() {
   if (!motion.data) return;
   const normalized = $('motion-normalize').checked;
-  for (const kind of ['fpv', 'radio']) {
+  show('motion-scene-chart',$('motion-scene-toggle').checked);
+  for (const kind of ['fpv', 'radio','scene']) {
+    if(kind==='scene'&&!$('motion-scene-toggle').checked)continue;
     const canvas = $(`motion-${kind}-canvas`), rect = canvas.getBoundingClientRect(), ratio = devicePixelRatio || 1;
     if (!rect.width) continue;
     canvas.width = Math.round(rect.width * ratio); canvas.height = Math.round(rect.height * ratio);
     const ctx = canvas.getContext('2d'); ctx.scale(ratio, ratio);
     const w = rect.width, h = rect.height, left = 55, right = w - 20, top = 18, bottom = h - 30;
     const [start, end] = motion.data.window, x = t => left + (t - start) / (end - start) * (right - left);
-    const traces = motion.data[kind].filter(t => !motion.hidden.has(`${kind}:${t.key}`));
+    const traces = (motion.data[kind] || []).filter(t => !motion.hidden.has(`${kind}:${t.key}`));
     const mixed = new Set(traces.map(t => t.unit)).size > 1;
     const relative = normalized || mixed;
     let maximum = relative ? 1 : 1e-6;
     for (const trace of traces) for (const [, value] of trace.points) if (value !== null) maximum = Math.max(maximum, Math.abs(value / (relative ? trace.scale : 1)));
     maximum *= 1.08;
     const y = value => (top + bottom) / 2 - value / maximum * (bottom - top) / 2;
-    ctx.font = '11px system-ui'; ctx.fillStyle = '#a8aec9'; ctx.strokeStyle = '#ffffff12'; ctx.lineWidth = 1;
+    ctx.font = '11px system-ui'; ctx.fillStyle = '#aaa99f'; ctx.strokeStyle = '#ffffff12'; ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const value = maximum * (1 - i / 2), yy = y(value); ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(right, yy); ctx.stroke(); ctx.fillText(value.toFixed(1), 2, yy + 4);
     }
     for (let i = 0; i <= 5; i++) { const t = start + i / 5 * (end - start), xx = x(t); ctx.beginPath(); ctx.moveTo(xx, top); ctx.lineTo(xx, bottom); ctx.stroke(); ctx.fillText(`${t.toFixed(1)}s`, Math.min(xx - 10, w - 45), h - 9); }
     ctx.fillText(relative ? 'relative' : (traces[0]?.unit || ''), left, 11);
     ctx.save(); ctx.beginPath(); ctx.rect(left, top, right - left, bottom - top); ctx.clip();
-    drawMatchingBands(ctx, motion.data.sections?.windows, x, top, bottom);
-    for (const [i, trace] of motion.data[kind].entries()) {
+    if(kind!=='scene')drawMatchingBands(ctx, motion.data.sections?.windows, x, top, bottom);
+    for (const [i, trace] of (motion.data[kind] || []).entries()) {
       if (motion.hidden.has(`${kind}:${trace.key}`)) continue;
       ctx.strokeStyle = motionColors[i]; ctx.lineWidth = 1.3; ctx.beginPath(); let pen = false;
       for (const [t, value] of trace.points) { if (value === null) { pen = false; continue; } const xx = x(t), yy = y(value / (relative ? trace.scale : 1)); if (pen) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy); pen = true; } ctx.stroke();
       const value = motion.cursor === null ? null : motionValueAt(trace, motion.cursor);
-      $(`motion-value-${kind}-${trace.key}`).textContent = value === null ? trace.unit : `${value.toFixed(2)} ${trace.unit}`;
+      const output=$(`motion-value-${kind}-${trace.key}`);if(output)output.textContent = value === null ? trace.unit : `${value.toFixed(2)} ${trace.unit}`;
     }
-    if (motion.cursor !== null) { ctx.strokeStyle = '#f5f4ff99'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(x(motion.cursor), top); ctx.lineTo(x(motion.cursor), bottom); ctx.stroke(); }
+    if (motion.cursor !== null) { ctx.strokeStyle = '#e8e3d899'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(x(motion.cursor), top); ctx.lineTo(x(motion.cursor), bottom); ctx.stroke(); }
     ctx.restore();
-    if (!motion.data[kind].length) { ctx.fillStyle = '#a8aec9'; ctx.fillText(kind === 'radio' ? 'No calibrated StickCam signal available' : 'No embedded orientation available for this source', left + 10, h / 2); }
+    if (!motion.data[kind]?.length) { ctx.fillStyle = '#aaa99f'; ctx.fillText(kind==='scene'?'No saved overall movement; extract reference signals first':kind === 'radio' ? 'No calibrated StickCam signal available' : 'No embedded orientation available for this source', left + 10, h / 2); }
   }
   $('motion-cursor').textContent = motion.cursor === null ? 'Time axis: seconds on StickCam recording' : `Cursor: ${motion.cursor.toFixed(3)}s on StickCam · ${(motion.cursor - Number($('motion-offset').value)).toFixed(3)}s on FPV`;
   drawAudio();
@@ -1764,7 +2309,7 @@ function drawMotion() {
 function syncMotionCursor() {
   if (motion.data && state.pair && motion.data.fpv_video === state.pair.fpv_video && motion.data.radio_video === state.pair.radio_video) { motion.cursor = $('radio-preview').currentTime; drawMotion(); }
 }
-for (const id of ['motion-fpv-canvas', 'motion-radio-canvas', 'audio-fpv-canvas', 'audio-radio-canvas']) {
+for (const id of ['motion-fpv-canvas', 'motion-radio-canvas','motion-scene-canvas', 'audio-fpv-canvas', 'audio-radio-canvas']) {
   const canvas = $(id);
   canvas.onwheel = event => { if (!motion.data) return; event.preventDefault(); clearTimeout(motion.timer); const at = motionTimeAt(canvas, event.clientX); motion.timer = setTimeout(() => zoomMotion(event.deltaY > 0 ? 1.4 : 1 / 1.4, at).catch(error => message('motion-message', error.message, true)), 100); };
   canvas.onpointerdown = event => { if (!motion.data) return; canvas.setPointerCapture(event.pointerId); motion.drag = { x: event.clientX, window: [...motion.data.window] }; };
@@ -1809,21 +2354,21 @@ function drawAudio() {
     const ctx = canvas.getContext('2d'); ctx.scale(ratio, ratio);
     const left = 55, right = rect.width - 20, top = 18, bottom = rect.height - 30, center = (top + bottom) / 2;
     const [start, end] = motion.data.window, x = t => left + (t - start) / (end - start) * (right - left);
-    ctx.font = '11px system-ui'; ctx.fillStyle = '#a8aec9'; ctx.strokeStyle = '#ffffff12';
+    ctx.font = '11px system-ui'; ctx.fillStyle = '#aaa99f'; ctx.strokeStyle = '#ffffff12';
     for (const value of [-1, 0, 1]) { const y = center - value * (bottom - top) / 2; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke(); ctx.fillText(String(value), 15, y + 4); }
     for (let i = 0; i <= 5; i++) { const t = start + i / 5 * (end - start); ctx.fillText(`${t.toFixed(1)}s`, Math.min(x(t) - 10, rect.width - 45), rect.height - 9); }
     ctx.save(); ctx.beginPath(); ctx.rect(left, top, right - left, bottom - top); ctx.clip();
     const data = audioReview.data?.[kind];
     drawMatchingBands(ctx, audioReview.data?.sections?.windows, x, top, bottom);
-    ctx.strokeStyle = '#90baff'; ctx.lineWidth = 1;
+    ctx.strokeStyle = '#49a7f2'; ctx.lineWidth = 1;
     const points = data?.points || [];
     const binWidth = points.length > 1 ? Math.min(5, Math.max(1, (x(points.at(-1)[0]) - x(points[0][0])) / points.length)) : 1;
     for (const [time, low, high] of points) {
       ctx.lineWidth = binWidth; ctx.beginPath(); ctx.moveTo(x(time), center - low * (bottom - top) / 2); ctx.lineTo(x(time), center - high * (bottom - top) / 2); ctx.stroke();
     }
-    if (motion.cursor !== null) { ctx.lineWidth = 1; ctx.strokeStyle = '#f5f4ff99'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(x(motion.cursor), top); ctx.lineTo(x(motion.cursor), bottom); ctx.stroke(); }
+    if (motion.cursor !== null) { ctx.lineWidth = 1; ctx.strokeStyle = '#e8e3d899'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(x(motion.cursor), top); ctx.lineTo(x(motion.cursor), bottom); ctx.stroke(); }
     ctx.restore();
-    if (!data?.available) { ctx.fillStyle = '#a8aec9'; ctx.fillText(audioReview.running ? 'Reading audio waveform…' : audioReview.data ? 'No audio track available' : 'Waveform not loaded', left + 10, center); }
+    if (!data?.available) { ctx.fillStyle = '#aaa99f'; ctx.fillText(audioReview.running ? 'Reading audio waveform…' : audioReview.data ? 'No audio track available' : 'Waveform not loaded', left + 10, center); }
   }
 }
 function resetAudioReview() {
@@ -1883,6 +2428,7 @@ async function refreshAudioWindow() {
   audioReview.data = result; audioReviewMessage(result); drawAudio();
 }
 $('motion-highlight-toggle').onchange = drawMotion;
+$('motion-scene-toggle').onchange=drawMotion;
 $('motion-audio-toggle').onchange = guarded(async () => {
   const enabled = $('motion-audio-toggle').checked;
   for (const kind of ['fpv', 'radio']) show(`audio-${kind}-chart`, enabled);
@@ -2025,7 +2571,7 @@ function drawStabilizedRadio() {
   const video = $('radio-stabilize-video'), canvas = $('radio-stabilize-canvas');
   if (video.readyState < 2 || !video.videoWidth || !stabilization.width || !$('radio-stabilize-media').checkVisibility()) return;
   canvas.width = Math.min(960, video.videoWidth); canvas.height = Math.round(canvas.width * 9 / 16);
-  const ctx = canvas.getContext('2d'); ctx.fillStyle = '#020619'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const ctx = canvas.getContext('2d'); ctx.fillStyle = '#0e100e'; ctx.fillRect(0, 0, canvas.width, canvas.height);
   const pose = radioPoseAt(video.currentTime), enabled = $('radio-stabilize-enable').checked;
   if (!pose || !enabled) {
     const scale = Math.min(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
@@ -2238,6 +2784,11 @@ async function refreshStickData(force = false) {
   const result = await api(`/api/jobs/${jobId}/stick-data?${new URLSearchParams({ sample_fps: fps, stick_sampling_ratio: ratio ?? '' })}`);
   if (jobToken !== state.jobToken || key !== stickPreparation.key) return;
   state.stickData = result;
+  for (const clip of result.clips) {
+    const record = state.job.inputs.radio.find(item => item.name === clip.name);
+    if (record && clip.metadata) record.metadata = clip.metadata;
+    if (record) record.modified_time = clip.modified_time;
+  }
   const sampling = ratio === null ? `${rateText(fps)} Hz` : `${ratio} × source fps`;
   $('stick-data-count').textContent = `${result.cached} / ${result.clips.length} at ${sampling}${result.saved_other_rate ? ` · ${result.saved_other_rate} saved at another rate` : ''}`;
   updateStickSamplingPreview();
@@ -2267,6 +2818,460 @@ async function refreshStickData(force = false) {
   $('stick-sampling-ratio').disabled = activeAnalysis() || !!active || stickPreparation.running;
   $('tracking-backend').disabled = activeAnalysis() || !!active || stickPreparation.running || fpvPreparation.running;
 }
+// Calibration and timed corrections share one source-coordinate canvas and player.
+function stickWorkspaceTime() {
+  const video = $('cal-video');
+  return !video.classList.contains('hidden') && Number.isFinite(video.currentTime)
+    ? video.currentTime : Number(state.calibration?.reference_time || 0);
+}
+function updateStickWorkspace() {
+  const watching = !$('cal-video').classList.contains('hidden'), correcting = stickReview.framePurpose === 'correction';
+  $('stick-workspace-mode').textContent = watching ? 'Reviewing saved tracking' : correcting ? `Correcting frame · ${time(stickWorkspaceTime(), true)}` : 'Initial calibration';
+  show('save-calibration', !correcting && !watching);
+  show('stick-review-calibration-landmark', correcting && !watching);
+  show('stick-review-save', !!stickReview.data);
+  show('stick-edit-initial', correcting || watching);
+  show('cal-pause', watching || (!correcting && calibrated(state.job?.calibrations[state.calibrationName])));
+  $('cal-pause').textContent = watching ? 'Pause & correct this frame' : 'Correct this frame';
+  show('stick-review-unsaved', stickReview.dirty || stickReview.frameEdits);
+  $('stick-review-unsaved').textContent = stickReview.frameEdits ? 'Frame correction draft · add or save it' : 'Corrections not saved';
+  $('stick-mark-hint').textContent = correcting
+    ? 'Mark either tip to add a timed tip correction. For lost radio/gimbal tracking, mark both housings, neutral centres, tips and shell corners, then Add frame correction. Tip marks alone cannot restore a lost radio pose.'
+    : watching ? 'Choose any marking tool, or Pause & correct this frame, to edit this same preview. Blue is physical left; red is physical right.'
+    : 'Mark both housings, neutral centres and tips. Optional: mark shell corners clockwise from top left. Blue is physical left; red is physical right.';
+  show('stick-review-overlay', !!stickReview.data && (watching || correcting));
+  if (correcting) {
+    show('calibration-dirty', false); show('discard-calibration-draft', stickReview.frameEdits);
+    $('discard-calibration-draft').textContent = 'Discard frame draft';
+  } else $('discard-calibration-draft').textContent = 'Discard draft';
+  if (document.activeElement !== $('stick-playhead')) $('stick-playhead').value = stickWorkspaceTime();
+  $('stick-playhead').max = Math.max(0, (state.metadata?.duration || 0) - 1 / (state.metadata?.fps || 30));
+  $('stick-playhead').disabled = !state.metadata || !state.calibrationFrameReady || stickReview.frameEdits || activeAnalysis() || !!stickReview.saving;
+}
+function stickTrackingAt(at) {
+  const window = stickReview.trackingWindow;
+  const movement = window && at >= window.start && at < window.end ? window : stickReview.data?.movement;
+  return {movement, sample: stickReviewNearestSample(at, movement)};
+}
+function seedStickCorrection(at) {
+  const point = stickReviewPointAt(at, .005), config = state.calibration;
+  if (point?.calibration) { Object.assign(config, clone(point.calibration)); return; }
+  // Do not copy the starting pose onto a later frame. Only seed visible saved poses.
+  delete config.radio_outline;
+  for (const side of ['left_gimbal', 'right_gimbal']) delete config[side];
+  const {movement, sample} = stickTrackingAt(at), i = sample?.index;
+  if (!sample || movement.stale || movement.tracking?.source !== 'stored') return;
+  if (movement.radio_outline?.[i] && movement.outline_quality?.[i] >= .35) config.radio_outline = clone(movement.radio_outline[i]);
+  for (const side of ['left', 'right']) {
+    const corners = movement.tracking.gimbals?.[side]?.[i];
+    if (!corners || movement.tracking.gimbal_quality?.[side]?.[i] < .35) continue;
+    const xs = corners.map(p => p[0]), ys = corners.map(p => p[1]);
+    const x = Math.max(0, Math.floor(Math.min(...xs))), y = Math.max(0, Math.floor(Math.min(...ys)));
+    const width = Math.min(state.metadata.width - x, Math.ceil(Math.max(...xs)) - x);
+    const height = Math.min(state.metadata.height - y, Math.ceil(Math.max(...ys)) - y);
+    if (Math.min(width, height) < 8) continue;
+    const spec = {x,y,width,height,center_x:width/2,center_y:height/2,travel_x:width*.4,travel_y:height*.4};
+    const tip = movement.tracking.tips?.[side]?.[i];
+    if (tip && movement.tracking.tip_quality?.[side]?.[i] > .1 && tip[0] >= x && tip[0] < x+width && tip[1] >= y && tip[1] < y+height) {
+      spec.tip_x = tip[0]-x; spec.tip_y = tip[1]-y;
+    }
+    config[side + '_gimbal'] = spec;
+  }
+}
+async function editStickPlaybackFrame() {
+  if (!state.metadata) return false;
+  const token = state.calToken, jobToken = state.jobToken;
+  if (stickReview.loading) throw new Error('Wait for saved tracking to finish loading.');
+  const at = stickWorkspaceTime();
+  $('cal-video').pause(); rememberCalibrationDraft();
+  stickReview.framePurpose = calibrated(state.job.calibrations[state.calibrationName]) ? 'correction' : 'initial';
+  $('reference-time').value = at.toFixed(3);
+  await ensureStickTrackingWindow(at);
+  if (token !== state.calToken || jobToken !== state.jobToken) return false;
+  await showFrame(true,token);
+  if (token !== state.calToken || jobToken !== state.jobToken) return false;
+  state.tool = null; document.querySelectorAll('[data-tool]').forEach(button => button.classList.remove('active'));
+  updateStickWorkspace();
+  message('calibration-message', stickReview.framePurpose === 'correction'
+    ? `Correcting ${time(at, true)}. Visible saved poses are editable starting suggestions; check the boxes and neutral centres. Missing poses stay unmarked. The initial calibration is kept separately.`
+    : 'Mark the initial calibration here, then confirm it before adding timed corrections.');
+  return true;
+}
+async function seekStickWorkspace(at) {
+  if (!state.metadata) return;
+  const token = state.calToken;
+  if (stickReview.saving) await stickReview.saving;
+  if (token !== state.calToken) return;
+  if (stickReview.frameEdits) throw new Error('Add or discard the current frame correction before seeking.');
+  at = Math.max(0, Math.min(Number(at) || 0, state.metadata.duration - 1 / (state.metadata.fps || 30)));
+  const video = $('cal-video');
+  if (!video.classList.contains('hidden') && video.readyState) { video.pause(); video.currentTime = at; }
+  else {
+    if (calibrated(state.job.calibrations[state.calibrationName])) { rememberCalibrationDraft(); stickReview.framePurpose = 'correction'; }
+    $('reference-time').value = at.toFixed(3); await showFrame();
+  }
+  updateStickWorkspace(); stickReviewPositionChanged();
+}
+function addStickTipCorrection(side, position) {
+  if (!stickReview.data || stickReview.name !== state.calibrationName) throw new Error('Wait for this clip’s saved tracking to load before adding corrections.');
+  const at = Number(stickWorkspaceTime().toFixed(4)), key = side.startsWith('left') ? 'left_tip' : 'right_tip';
+  const point = stickReviewPointAt(at, .005) || {time:at};
+  point[key] = [position.x / state.metadata.width, position.y / state.metadata.height];
+  // Keep an existing full-frame landmark and its tip consistent.
+  const spec = state.calibration[side];
+  if (spec && position.x >= spec.x && position.x < spec.x+spec.width && position.y >= spec.y && position.y < spec.y+spec.height) {
+    spec.tip_x = position.x-spec.x; spec.tip_y = position.y-spec.y;
+    if (point.calibration?.[side]) Object.assign(point.calibration[side], {tip_x:spec.tip_x,tip_y:spec.tip_y});
+  } else if (spec) {
+    delete spec.tip_x; delete spec.tip_y;
+  }
+  if (!stickReview.data.annotations.includes(point)) stickReview.data.annotations.push(point);
+  stickReview.data.annotations.sort((a,b) => a.time-b.time);
+  setStickReviewDirty(true); renderStickReviewRows(); stickReviewPositionChanged();
+}
+function addStickFrameCorrection() {
+  if (stickReview.framePurpose !== 'correction' || !stickReview.data || stickReview.name !== state.calibrationName) throw new Error('Pause the clip at the frame you want to correct first.');
+  if (!calibrated(state.job.calibrations[stickReview.name])) throw new Error('Confirm an initial calibration before adding frame corrections.');
+  const config = currentCalibrationConfig(), at = Number(config.reference_time.toFixed(4));
+  const point = stickReviewPointAt(at, .005) || {time:at};
+  point.calibration = Object.fromEntries(['left_gimbal','right_gimbal','radio_outline','radio_rotation_deg','stickcam_mode'].filter(key => config[key] !== undefined).map(key => [key,clone(config[key])]));
+  // Full-frame tips supersede any earlier tip-only marks at the same time.
+  delete point.left_tip; delete point.right_tip;
+  if (!stickReview.data.annotations.includes(point)) stickReview.data.annotations.push(point);
+  stickReview.data.annotations.sort((a,b) => a.time-b.time);
+  stickReview.frameEdits = false; setStickReviewDirty(true); renderStickReviewRows(); stickReviewPositionChanged();
+  message('stick-review-message', `Added a complete frame correction at ${time(at,true)}. Save corrections or re-derive this clip to apply it. The starting calibration is unchanged.`);
+}
+
+function stickReviewPointAt(at, tolerance = .2) {
+  const rows = stickReview.data?.annotations || [];
+  let best = null, delta = tolerance;
+  for (const row of rows) {
+    const distance = Math.abs(row.time - at);
+    if (distance <= delta) { best = row; delta = distance; }
+  }
+  return best;
+}
+function stickReviewSetFields(point) {
+  for (const axis of ['throttle', 'yaw', 'pitch', 'roll']) {
+    const input = $(`stick-review-${axis}`);
+    if (document.activeElement !== input) input.value = point?.controls?.[axis] ?? '';
+  }
+  if (document.activeElement !== $('stick-review-note')) $('stick-review-note').value = point?.note || '';
+}
+function stickReviewNearestSample(at, movement = stickReview.data?.movement) {
+  if (!movement?.time?.length) return null;
+  const times = movement.time; let low = 0, high = times.length - 1;
+  while (low < high) { const mid = (low + high) >> 1; if (times[mid] < at) low = mid + 1; else high = mid; }
+  if (low > 0 && Math.abs(times[low - 1] - at) < Math.abs(times[low] - at)) low--;
+  if (Math.abs(times[low] - at) > Math.max(.1, 1 / movement.sample_fps)) return null;
+  return { index: low, time: times[low], quality: movement.quality?.[low] ?? 0,
+    axes: Object.fromEntries(['throttle', 'yaw', 'pitch', 'roll'].map(axis => [axis, movement.axes?.[axis]?.[low] ?? null])) };
+}
+async function ensureStickTrackingWindow(at) {
+  if (!stickReview.data?.movement || stickReview.data.movement.stale || stickReview.windowPending || Date.now() < stickReview.windowRetry) return;
+  const current = stickReview.trackingWindow;
+  if (current && at >= current.start && (at < current.end - 2 || current.end >= stickReview.data.duration - .01)) return;
+  const token = ++stickReview.windowToken, reviewToken = stickReview.token, jobToken = state.jobToken;
+  stickReview.windowPending = true;
+  try {
+    const start = Math.max(0, at - 2), result = await api(`/api/jobs/${stickReview.jobId}/stick-review/${part(stickReview.name)}/tracking?${new URLSearchParams({start,duration:20})}`);
+    if (token !== stickReview.windowToken || reviewToken !== stickReview.token || jobToken !== state.jobToken) return;
+    stickReview.trackingWindow = result; stickReview.windowRetry = 0;
+    drawStickReviewOverlay();
+  } catch { if (token === stickReview.windowToken) stickReview.windowRetry = Date.now() + 5000; }
+  finally { if (token === stickReview.windowToken) stickReview.windowPending = false; }
+}
+function stickReviewPositionChanged() {
+  if (!stickReview.data) return;
+  const video = $('cal-video'), at = stickWorkspaceTime();
+  if (!video.classList.contains('hidden') && document.activeElement !== $('reference-time')) $('reference-time').value = at.toFixed(3);
+  const sample = stickReviewNearestSample(at), point = stickReviewPointAt(at);
+  const outlineQuality = sample && stickReview.data.movement?.outline_quality?.[sample.index];
+  message('stick-review-auto-values', sample ? `Saved automatic output at ${time(sample.time, true)} · quality ${Number(sample.quality).toFixed(2)} · ` +
+    ['throttle', 'yaw', 'pitch', 'roll'].map(axis => `${axis} ${sample.axes[axis] === null ? '—' : sample.axes[axis].toFixed(3)}`).join(' · ') +
+    (outlineQuality === undefined ? '' : ` · radio outline ${Number(outlineQuality).toFixed(2)}`) : 'No saved automatic movement trace is available at this tracking rate. You can still label expected controls and stick-tip positions against the video.');
+  stickReviewSetFields(point);
+  updateStickWorkspace(); drawStickReviewOverlay(); drawStickReviewChart();
+}
+function stickReviewVideoRect(width, height, videoWidth, videoHeight) {
+  const scale = Math.min(width / videoWidth, height / videoHeight);
+  const drawnWidth = videoWidth * scale, drawnHeight = videoHeight * scale;
+  return { x: (width - drawnWidth) / 2, y: (height - drawnHeight) / 2, width: drawnWidth, height: drawnHeight };
+}
+function drawStickReviewOverlay() {
+  const canvas = $('stick-review-overlay'), video = $('cal-video');
+  if (!canvas || !stickReview.data || !state.metadata) return;
+  const at = stickWorkspaceTime(), videoWidth = state.metadata.width, videoHeight = state.metadata.height;
+  const rect = canvas.getBoundingClientRect(); if (!rect.width || !rect.height) return;
+  const dpr = window.devicePixelRatio || 1, width = Math.round(rect.width * dpr), height = Math.round(rect.height * dpr);
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
+  const rotated = calibrationViewRotated();
+  if (rotated) { ctx.translate(rect.width, rect.height); ctx.scale(-1, -1); }
+  const point = stickReviewPointAt(at, .18), box = stickReviewVideoRect(rect.width, rect.height, videoWidth, videoHeight);
+  ensureStickTrackingWindow(at);
+  const overlayWindow = stickReview.trackingWindow;
+  const movement = overlayWindow && at >= overlayWindow.start && at < overlayWindow.end ? overlayWindow : stickReview.data?.movement;
+  const sample = stickReviewNearestSample(at, movement);
+  const corners = movement?.radio_outline?.[sample?.index], shellQuality = movement?.outline_quality?.[sample?.index] ?? 0;
+  const polygon = (points, color, dashed = false) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dashed ? [6, 4] : []); ctx.beginPath();
+    points.forEach((p, index) => { const x = box.x + (p[0] / stickReview.data.width) * box.width, y = box.y + (p[1] / stickReview.data.height) * box.height; if (index) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+    ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+  };
+  const showAutomatic = $('stick-review-show-overlay').checked;
+  if (showAutomatic && corners && shellQuality >= .35) {
+    ctx.strokeStyle = '#72cf6b'; ctx.fillStyle = '#72cf6b'; ctx.lineWidth = 2.5; ctx.beginPath();
+    corners.forEach((p, index) => { const x = box.x + (p[0] / stickReview.data.width) * box.width, y = box.y + (p[1] / stickReview.data.height) * box.height; if (index) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+    ctx.closePath(); ctx.stroke(); ctx.font = 'bold 12px system-ui'; if (!rotated) ctx.fillText(`AUTO RADIO OUTLINE · ${Number(shellQuality).toFixed(2)}`, box.x + 8, box.y + 18);
+  }
+  const tracking = movement?.tracking, status = [];
+  for (const [side, color] of [['left', '#49a7f2'], ['right', '#f06f62']]) {
+    const gimbal = tracking?.gimbals?.[side]?.[sample?.index], poseQuality = tracking?.gimbal_quality?.[side]?.[sample?.index] ?? 0;
+    const tip = tracking?.tips?.[side]?.[sample?.index], tipQuality = tracking?.tip_quality?.[side]?.[sample?.index] ?? 0;
+    if (showAutomatic && gimbal && poseQuality >= .35) polygon(gimbal, color);
+    if (showAutomatic && tip && tipQuality > .1) {
+      const x = box.x + tip[0] / stickReview.data.width * box.width, y = box.y + tip[1] / stickReview.data.height * box.height;
+      ctx.fillStyle = color; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
+    const reason = tracking?.gap_reasons?.[tracking?.tip_gap_reason?.[side]?.[sample?.index]] || 'No tracked position';
+    status.push(`${side}: ${tipQuality > .1 ? `tip ${(tipQuality * 100).toFixed(0)}% tracking quality` : reason}`);
+  }
+  message('stick-review-tracking-status', !sample ? 'No saved tracking sample at this time.' : !tracking || tracking.source === 'unavailable' ? 'This older trace has no moving gimbal/tip poses. Re-derive this clip once to save its complete tracking overlay.' : `${stickReview.data.movement?.stale ? 'Previous trace · save and re-derive to update. ' : ''}${status.join(' · ')}${tracking.source !== 'stored' ? ' · positions reconstructed from saved controls and calibrated geometry' : ''}`);
+  if (point?.calibration) {
+    const calibration = point.calibration;
+    if (calibration.radio_outline) polygon(calibration.radio_outline, '#ffcc72', true);
+    for (const side of ['left', 'right']) {
+      const spec = calibration[side + '_gimbal'];
+      polygon([[spec.x, spec.y], [spec.x + spec.width, spec.y], [spec.x + spec.width, spec.y + spec.height], [spec.x, spec.y + spec.height]], '#ffcc72', true);
+    }
+  }
+  if (!point) return;
+  for (const [key, color, label] of [['left_tip', '#49a7f2', 'L'], ['right_tip', '#f06f62', 'R']]) {
+    const spec = point.calibration?.[key === 'left_tip' ? 'left_gimbal' : 'right_gimbal'];
+    const marker = point[key] || (spec ? [(spec.x + spec.tip_x) / stickReview.data.width, (spec.y + spec.tip_y) / stickReview.data.height] : null); if (!marker) continue;
+    const x = box.x + marker[0] * box.width, y = box.y + marker[1] * box.height;
+    ctx.strokeStyle = '#ffcc72'; ctx.fillStyle = color; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - 12, y); ctx.lineTo(x + 12, y); ctx.moveTo(x, y - 12); ctx.lineTo(x, y + 12); ctx.stroke();
+    ctx.font = 'bold 13px system-ui'; if (!rotated) ctx.fillText(label, x + 13, y - 9);
+  }
+}
+function drawStickReviewChart() {
+  const canvas = $('stick-review-chart'), data = stickReview.data;
+  if (!canvas || !data) return;
+  const rect = canvas.getBoundingClientRect(); if (!rect.width) return;
+  const dpr = window.devicePixelRatio || 1, width = Math.round(rect.width * dpr), height = Math.round(rect.height * dpr);
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
+  ctx.fillStyle = '#111311'; ctx.fillRect(0, 0, rect.width, rect.height);
+  const left = 62, right = 12, top = 12, bottom = 28, plotWidth = Math.max(1, rect.width - left - right), plotHeight = Math.max(1, rect.height - top - bottom), band = plotHeight / 4;
+  const duration = Math.max(.01, data.duration || 0), movement = data.movement, colors = { throttle: '#dda354', yaw: '#49a7f2', pitch: '#72cf6b', roll: '#f06f62' };
+  ctx.font = '11px system-ui'; ctx.textBaseline = 'middle';
+  for (let index = 0; index < 4; index++) {
+    const axis = ['throttle', 'yaw', 'pitch', 'roll'][index], y0 = top + index * band, mid = y0 + band / 2;
+    ctx.strokeStyle = '#ffffff18'; ctx.lineWidth = 1;
+    for (const level of [-1, 0, 1]) { const y = mid - level * band * .4; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(rect.width - right, y); ctx.stroke(); }
+    ctx.fillStyle = colors[axis]; ctx.fillText(axis[0].toUpperCase() + axis.slice(1), 8, mid);
+    if (movement?.time?.length) {
+      const values = movement.axes?.[axis] || [], quality = movement.axis_quality?.[axis] || movement.quality || [];
+      ctx.strokeStyle = colors[axis]; ctx.lineWidth = 1.5; ctx.beginPath(); let drawing = false;
+      for (let i = 0; i < Math.min(movement.time.length, values.length); i++) {
+        if (!Number.isFinite(values[i]) || (quality[i] ?? 1) <= .1) { drawing = false; continue; }
+        const x = left + Math.max(0, Math.min(1, movement.time[i] / duration)) * plotWidth;
+        const y = mid - Math.max(-1, Math.min(1, values[i])) * band * .4;
+        if (!drawing) ctx.moveTo(x, y); else ctx.lineTo(x, y); drawing = true;
+      }
+      ctx.stroke();
+    }
+    for (const reference of data.annotations || []) {
+      if (reference.controls?.[axis] === undefined) continue;
+      const x = left + Math.max(0, Math.min(1, reference.time / duration)) * plotWidth;
+      const y = mid - Math.max(-1, Math.min(1, reference.controls[axis])) * band * .4;
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = colors[axis]; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 4.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
+  }
+  ctx.fillStyle = '#aaa99f'; ctx.textBaseline = 'top';
+  for (let tick = 0; tick <= 4; tick++) { const seconds = duration * tick / 4, x = left + plotWidth * tick / 4; ctx.fillText(time(seconds), x - 14, rect.height - bottom + 7); }
+  const at = stickWorkspaceTime(), x = left + Math.max(0, Math.min(1, at / duration)) * plotWidth;
+  ctx.strokeStyle = '#fff9'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + plotHeight); ctx.stroke();
+  $('stick-review-chart-summary').textContent = movement ? `${movement.stale ? 'Previous trace · ' : ''}${movement.source_samples.toLocaleString()} original samples · plotted at ${rateText(movement.sample_fps)} Hz` : 'No saved derivation for current settings';
+}
+function renderStickReviewRows() {
+  if (!stickReview.data) return;
+  const body = $('stick-review-rows'); body.replaceChildren();
+  for (const point of [...(stickReview.data.annotations || [])].sort((a, b) => a.time - b.time)) {
+    const tr = el('tr'), active = stickReview.data.calibration?.tracking_landmarks?.find(row => Math.abs(row.time - point.time) < .0001);
+    const event = !stickReview.data.movement?.stale && stickReview.data.movement?.landmark_events?.find(row => Math.abs(row.time - point.time) < .0001);
+    const labels = [];
+    if (point.calibration) labels.push(`full frame calibration · ${active?.calibration ? event ? 'applied' : 'awaiting derivation' : 'unsaved / inactive'}`);
+    for (const key of ['left_tip', 'right_tip']) if (point[key]) {
+      const enabled = JSON.stringify(active?.[key]) === JSON.stringify(point[key]);
+      labels.push(`${key === 'left_tip' ? 'left' : 'right'} tip · ${enabled ? event?.[key] || 'awaiting derivation' : 'unsaved / inactive'}`);
+    }
+    const landmarks = labels.join(', ') || '—';
+    const controls = point.controls ? ['throttle', 'yaw', 'pitch', 'roll'].filter(axis => point.controls[axis] !== undefined).map(axis => `${axis} ${point.controls[axis].toFixed(2)}`).join(' · ') : '—';
+    const inspect = el('td'), jump = action('Review', guarded(() => seekStickWorkspace(point.time), 'stick-review-message'));
+    const remove = action('Delete', () => { if (stickReview.saving || stickPreparation.running || activeAnalysis()) return; stickReview.data.annotations = stickReview.data.annotations.filter(row => row !== point); setStickReviewDirty(true); renderStickReviewRows(); stickReviewPositionChanged(); }, 'secondary');
+    inspect.append(jump, remove);
+    const check = el('td');
+    for (const [kind, title] of [['before', 'Earlier automatic trace'], ['current', 'Current trace']]) {
+      const diagnostic = stickReview.data.landmark_diagnostics?.[kind]?.find(row => Math.abs(row.time - point.time) < .0001);
+      if (!diagnostic || kind === 'current' && stickReview.data.movement?.stale) continue;
+      const text = Object.entries(diagnostic.tips || {}).map(([side, value]) => `${side}: ${value.reason}${value.error_pixels === null ? '' : ` · ${value.error_pixels.toFixed(1)} px from mark`}`).join('; ');
+      if (text) check.append(el('small', `${title} · ${text}`));
+    }
+    tr.append(el('td', time(point.time, true)), el('td', landmarks), check, el('td', controls), el('td', point.note || '—'), inspect); body.append(tr);
+  }
+  $('stick-review-landmark-count').textContent = `${stickReview.data.annotations.length} point(s)`;
+  $('stick-review-chart-summary').setAttribute('aria-label', `${stickReview.data.annotations.length} labeled reference points`);
+}
+function setStickReviewDirty(dirty = true) {
+  stickReview.dirty = dirty;
+  $('stick-review-save').disabled = !stickReview.data || !dirty;
+  $('stick-review-download').disabled = !stickReview.data;
+  updateStickWorkspace(); updateMarkTools();
+}
+function resetStickReviewState() {
+  stickReview.token++; cancelAnimationFrame(stickReview.frame);
+  stickReview.name = stickReview.jobId = stickReview.data = null;
+  stickReview.dirty = false; stickReview.reloadAfterDerivation = null;
+  stickReview.windowToken++; stickReview.trackingWindow = null; stickReview.windowPending = false; stickReview.windowRetry = 0;
+  const video = $('cal-video'); releasePreview(video); video.pause(); video.removeAttribute('src'); delete video.dataset.stickSource; video.load();
+  stickReview.framePurpose = 'initial'; stickReview.frameEdits = false; stickReview.loading = false;
+  show('stick-review-workspace', false); show('stick-review-reset', false);
+  $('stick-review-current-name').textContent = 'Select a StickCam clip above';
+  stickReview.saving = null; setStickReviewDirty(false);
+}
+async function openStickReview() {
+  if (!state.job) return;
+  const name = $('calibration-clip').value;
+  if (!name) throw new Error('Choose a StickCam clip in Calibrate & review StickCam first.');
+  if (stickReview.dirty) throw new Error('Save or download the current landmarks and references before reloading this review.');
+  if (state.calibrationName !== name || !state.metadata) { await loadCalibration(name); return; }
+  if (stickReview.loading) return;
+  if (stickReview.frameEdits) throw new Error('Add or discard the current frame correction before reloading.');
+  const token = ++stickReview.token, jobToken = state.jobToken, jobId = state.job.id;
+  stickReview.name = name; stickReview.jobId = jobId; stickReview.data = null; setStickReviewDirty(false);
+  stickReview.windowToken++; stickReview.trackingWindow = null; stickReview.windowPending = false; stickReview.windowRetry = 0;
+  $('stick-review-current-name').textContent = clipLabel(state.job.inputs.radio.find(record => record.name === name));
+  show('stick-review-workspace'); show('stick-review-reset', false); $('stick-review-rows').replaceChildren();
+  message('stick-review-message', 'Reading saved tracking and controls…');
+  stickReview.loading = true; updateMarkTools();
+  let data;
+  try { data = await api(`/api/jobs/${jobId}/stick-review/${part(name)}`); }
+  finally { if (token === stickReview.token) { stickReview.loading = false; updateMarkTools(); } }
+  if (token !== stickReview.token || jobToken !== state.jobToken) return;
+  stickReview.data = data; data.annotations ||= []; show('stick-review-reset', data.stale_source_annotations > 0);
+  const cacheLabel = data.movement ? `Saved movement trace loaded (${data.movement.source_samples.toLocaleString()} source samples; displayed at ${rateText(data.movement.sample_fps)} Hz).` : `No usable saved movement trace for current settings (${data.cache.status}). The video can still be labeled manually.`;
+  const warning = data.calibration_changed ? ' Calibration changed since these labels were saved; review them before reuse.' : '';
+  message('stick-review-message', `${cacheLabel} ${data.annotations.length} reference point(s) saved.${data.landmarks_pending ? ' Save and re-derive to activate the saved tracking landmarks.' : ''}${warning}${data.stale_source_annotations ? ' Saved labels belong to a changed source; start a new review to replace them.' : ''}`);
+  if (data.calibration_changed) $('stick-review-message').classList.add('warning');
+  setStickReviewDirty(data.landmarks_pending); renderStickReviewRows(); stickReviewPositionChanged(); updateStickWorkspace();
+}
+function addStickReviewReference() {
+  if (!stickReview.data || stickReview.saving) return;
+  const at = stickWorkspaceTime(), point = stickReviewPointAt(at, .005) || {time: Number(at.toFixed(3))};
+  point.time = Number(at.toFixed(3));
+  const controls = {};
+  for (const axis of ['throttle', 'yaw', 'pitch', 'roll']) {
+    const value = $(`stick-review-${axis}`).value.trim();
+    if (value === '') continue;
+    const number = Number(value); if (!Number.isFinite(number) || number < -1 || number > 1) throw new Error(`${axis} must be between −1 and +1.`);
+    controls[axis] = number;
+  }
+  if (Object.keys(controls).length) point.controls = controls; else delete point.controls;
+  point.note = $('stick-review-note').value.trim(); if (!point.note) delete point.note;
+  if (!point.left_tip && !point.right_tip && !point.calibration && !point.controls && !point.note) throw new Error('Mark a stick tip, enter at least one expected control value, or add a review note.');
+  const rows = stickReview.data.annotations, index = rows.findIndex(row => Math.abs(row.time - at) <= .005);
+  if (index >= 0) rows[index] = point; else rows.push(point);
+  rows.sort((a, b) => a.time - b.time); setStickReviewDirty(true); renderStickReviewRows(); stickReviewPositionChanged();
+}
+async function saveStickReview(resetStaleSource = false) {
+  if (stickReview.saving) return stickReview.saving;
+  if (!stickReview.data) return;
+  const pending = persistStickReview(resetStaleSource);
+  stickReview.saving = pending; updateMarkTools();
+  try { await pending; }
+  finally { if (stickReview.saving === pending) { stickReview.saving=null; updateMarkTools(); } }
+}
+async function persistStickReview(resetStaleSource) {
+  const token = stickReview.token, jobToken = state.jobToken;
+  const result = await api(`/api/jobs/${stickReview.jobId}/stick-review/${part(stickReview.name)}`, {method:'PUT', json:{annotations:stickReview.data.annotations, reset_stale_source:resetStaleSource, baseline_calibration:stickReview.data.calibration}});
+  if (token !== stickReview.token || jobToken !== state.jobToken) return;
+  stickReview.data.annotations = result.annotations; stickReview.data.annotation_revision = result.revision;
+  stickReview.data.calibration = result.calibration; stickReview.data.tracking_landmark_count = result.tracking_landmark_count; stickReview.data.landmarks_pending = false;
+  if (result.calibration && state.job?.id === stickReview.jobId) {
+    state.job.calibrations[stickReview.name] = clone(result.calibration);
+    for (const config of [state.calibrationName === stickReview.name ? state.calibration : null, state.calibrationDrafts[stickReview.name]?.config]) if (config) {
+      if (result.calibration.tracking_landmarks) config.tracking_landmarks = clone(result.calibration.tracking_landmarks);
+      else delete config.tracking_landmarks;
+    }
+    if (state.calibrationName === stickReview.name) rememberCalibrationDraft();
+  }
+  if (result.landmarks_changed && stickReview.data.movement) stickReview.data.movement.stale = true;
+  if (result.landmarks_changed) { stickReview.windowToken++; stickReview.windowPending = false; stickReview.trackingWindow = null; }
+  setStickReviewDirty(false); show('stick-review-reset', false);
+  message('stick-review-message', `Saved review revision ${result.revision}: ${result.tracking_landmark_count} timed tracking landmark(s). ${result.landmarks_enabled ? result.landmarks_changed ? 'Save & re-derive this clip to apply the changes to its movement trace.' : 'Unchanged tracking landmarks reuse their saved movement data.' : 'Confirm the clip calibration, then re-derive to use these landmarks.'} Expected controls and notes remain diagnostic references.`);
+  refreshStickData(true).catch(error => message('stick-data-message', error.message, true));
+  renderStickReviewRows(); drawStickReviewChart();
+}
+function downloadStickReview() {
+  if (!stickReview.data) return;
+  const payload = {...stickReview.data, exported_at: new Date().toISOString(), annotations: stickReview.data.annotations};
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'}));
+  const link = el('a'); link.href = url; link.download = `${stickReview.name.replace(/[^a-z0-9._-]+/gi, '_')}.stickcam-review.json`;
+  document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function removeStickReviewPoint() {
+  if (!stickReview.data || stickReview.saving) return;
+  const at = stickWorkspaceTime(), point = stickReviewPointAt(at, .2);
+  if (!point) { message('stick-review-message', 'There is no reference point near the current video time.'); return; }
+  stickReview.data.annotations = stickReview.data.annotations.filter(row => row !== point); setStickReviewDirty(true); renderStickReviewRows(); stickReviewPositionChanged();
+}
+function seekStickReviewFromChart(event) {
+  if (!stickReview.data) return;
+  const rect = $('stick-review-chart').getBoundingClientRect(), fraction = Math.max(0, Math.min(1, (event.clientX - rect.left - 62) / Math.max(1, rect.width - 74)));
+  seekStickWorkspace(fraction * stickReview.data.duration).catch(error => message('stick-review-message', error.message, true));
+}
+for (const event of ['timeupdate', 'seeked', 'loadedmetadata', 'loadeddata', 'pause']) $('cal-video').addEventListener(event, stickReviewPositionChanged);
+function stickReviewOverlayTick() { drawStickReviewOverlay(); if (!$('cal-video').paused) stickReview.frame = requestAnimationFrame(stickReviewOverlayTick); }
+$('cal-video').addEventListener('play', () => { setPreviewPlaybackIntent($('cal-video'),true); cancelAnimationFrame(stickReview.frame); stickReviewOverlayTick(); });
+$('cal-video').addEventListener('pause', () => { setPreviewPlaybackIntent($('cal-video'),false); cancelAnimationFrame(stickReview.frame); });
+$('stick-review-load').onclick = guarded(openStickReview, 'stick-review-message');
+$('stick-review-save').onclick = guarded(async () => { if (stickReview.frameEdits) addStickFrameCorrection(); await saveStickReview(false); }, 'stick-review-message');
+$('stick-review-download').onclick = downloadStickReview;
+$('stick-review-calibration-landmark').onclick = guarded(addStickFrameCorrection, 'stick-review-message');
+$('stick-review-rederive').onclick = guarded(async () => {
+  const name = $('calibration-clip').value, jobId = state.job.id, jobToken = state.jobToken;
+  if (!name) throw new Error('Choose a StickCam clip first.');
+  if (state.calibrationName !== name || !state.calibrationFrameReady) await loadCalibration(name);
+  if (stickReview.framePurpose === 'correction') { if (stickReview.frameEdits) addStickFrameCorrection(); }
+  else await saveCalibration(false);
+  if (stickReview.data && stickReview.name === name) await saveStickReview(false);
+  const settings = {sample_fps:Number($('sample-fps').value), stick_sampling_ratio:readStickSamplingRatio(), decode_mode:$('decode-mode').value, tracking_backend:$('tracking-backend').value, radio_names:[name], capture_tracking_geometry:true};
+  const task = await api(`/api/jobs/${jobId}/derive-sticks`, {method:'POST', json:settings});
+  if (jobToken !== state.jobToken) return;
+  Object.assign(state.job.calibrations, task.calibrations || {});
+  if (task.calibrations?.[name]) state.calibration = clone(task.calibrations[name]);
+  state.job.settings.sample_fps=settings.sample_fps; state.job.settings.stick_sampling_ratio=settings.stick_sampling_ratio; state.job.settings.tracking_backend=settings.tracking_backend;
+  stickReview.reloadAfterDerivation=name; $('cal-video').pause();
+  message('stick-review-message', `Re-deriving ${name} with its calibration and timed landmarks, including complete radio/gimbal/tip overlay data. Unchanged corrected data is reused.`);
+  watchStickPreparation(task.id, jobId, jobToken);
+}, 'stick-review-message');
+$('stick-review-add').onclick = guarded(addStickReviewReference, 'stick-review-message');
+$('stick-review-remove').onclick = removeStickReviewPoint;
+$('stick-review-chart').addEventListener('click', seekStickReviewFromChart);
+$('stick-review-show-overlay').onchange = drawStickReviewOverlay;
+$('stick-review-audio').onchange = () => { $('cal-video').muted = !$('stick-review-audio').checked; };
+$('stick-review-speed').onchange = () => { $('cal-video').playbackRate = Number($('stick-review-speed').value); };
+$('stick-review-reset').onclick = guarded(async () => {
+  if (!window.confirm('The saved points belong to an earlier version of this source video. Save the current review points as a new review for this source?')) return;
+  setStickReviewDirty(true); await saveStickReview(true);
+}, 'stick-review-message');
+window.addEventListener('resize', () => { drawStickReviewOverlay(); drawStickReviewChart(); });
+window.addEventListener('pagehide', () => $('cal-video').pause());
+
 function renderStickPreparationLog(result) {
   const list = $('stick-data-log'); list.replaceChildren();
   const rows = result.clips || result.progress?.clips || [];
@@ -2320,6 +3325,8 @@ function watchStickPreparation(task, jobId, jobToken) {
       updateFPVPreparationUI();
       renderStickPreparationLog(result);
       message('stick-data-message', result.status === 'complete' ? `${result.complete}/${result.total} StickCam recordings have saved movement data. ${result.total - result.complete} failed; see the derivation log.` : result.message, result.status === 'failed');
+      const reloadName = stickReview.reloadAfterDerivation;
+      if (reloadName && reloadName === stickReview.name) { stickReview.reloadAfterDerivation = null; await openStickReview(); }
     } catch (error) {
       message('stick-data-message', `Connection interrupted; retrying… ${error.message}`, true);
       stickPreparation.timer = setTimeout(poll, 3000);
@@ -2398,7 +3405,13 @@ async function refreshFPVData(force = false) {
   $('fpv-preparation-decode').value = $('decode-mode').value;
   const result = await api(`/api/jobs/${jobId}/fpv-data?${new URLSearchParams({sample_fps:fps,sampling_mode:mode})}`);
   if (jobToken !== state.jobToken || key !== fpvPreparation.key) return;
-  state.fpvData = result; renderFPVData();
+  state.fpvData = result;
+  for (const clip of result.clips) {
+    const record = state.job.inputs.fpv.find(item => item.name === clip.name);
+    if (record && clip.metadata) record.metadata = clip.metadata;
+    if (record) record.modified_time = clip.modified_time;
+  }
+  renderFPVData(); renderVideoLists();
   const active = result.tasks.find(task => ['queued','running'].includes(task.status));
   if (active && (!fpvPreparation.running || fpvPreparation.task !== active.id)) watchFPVPreparation(active.id, jobId, jobToken);
   if (!active && !fpvPreparation.running) {
@@ -2560,11 +3573,11 @@ function drawFPVVisualReview() {
     for (const [, value] of trace.points) if (value !== null) maximum = Math.max(maximum, Math.abs(value));
     maximum *= 1.1;
     const y = value => middle - value / maximum * (bottom - top) / 2;
-    ctx.fillStyle = '#a8aec9'; ctx.fillText(`${trace.label} · ${trace.unit}`, left, top - 9);
+    ctx.fillStyle = '#aaa99f'; ctx.fillText(`${trace.label} · ${trace.unit}`, left, top - 9);
     ctx.strokeStyle = '#ffffff18';
     for (const v of [-maximum,0,maximum]) { ctx.beginPath(); ctx.moveTo(left,y(v)); ctx.lineTo(right,y(v)); ctx.stroke(); ctx.fillText(v.toFixed(Math.abs(v) < 10 ? 2 : 0),2,y(v)+4); }
     ctx.save(); ctx.beginPath(); ctx.rect(left,top,right-left,bottom-top); ctx.clip();
-    ctx.strokeStyle = ['#fbc35c','#b794ff','#62d9e5'][index]; ctx.lineWidth = 1.4;
+    ctx.strokeStyle = ['#f06f62','#72cf6b','#49a7f2'][index]; ctx.lineWidth = 1.4;
     let previous = null;
     for (const point of trace.points) {
       const [t,value,estimated] = point;
@@ -2577,9 +3590,9 @@ function drawFPVVisualReview() {
     }
     ctx.setLineDash([]);
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x(at),top); ctx.lineTo(x(at),bottom); ctx.stroke(); ctx.restore();
-    if (!trace.points.some(p=>p[1] !== null)) { ctx.fillStyle = '#a8aec9'; ctx.fillText('Tracking unavailable in this window',left+8,middle); }
+    if (!trace.points.some(p=>p[1] !== null)) { ctx.fillStyle = '#aaa99f'; ctx.fillText('Tracking unavailable in this window',left+8,middle); }
   }
-  ctx.fillStyle = '#a8aec9'; for (let i=0;i<=5;i++) { const t=start+(end-start)*i/5; ctx.fillText(time(t),Math.min(x(t)-9,right-38),rect.height-7); }
+  ctx.fillStyle = '#aaa99f'; for (let i=0;i<=5;i++) { const t=start+(end-start)*i/5; ctx.fillText(time(t),Math.min(x(t)-9,right-38),rect.height-7); }
   $('fpv-visual-review-position').textContent = `${time(at,true)} / ${time(fpvVisualReview.duration)} · ${time(start)}–${time(end)} shown`;
 }
 function syncFPVVisualPlayback() {
@@ -2618,15 +3631,15 @@ function drawLiveStickInputs() {
   for (const [laneIndex,axis] of axes.entries()) {
     const top=laneIndex*lane+18, bottom=(laneIndex+1)*lane-5, middle=(top+bottom)/2;
     const y=v=>middle-v*(bottom-top)/2;
-    ctx.fillStyle='#a8aec9'; ctx.fillText(axis[0].toUpperCase()+axis.slice(1),5,middle+4);
+    ctx.fillStyle='#aaa99f'; ctx.fillText(axis[0].toUpperCase()+axis.slice(1),5,middle+4);
     ctx.strokeStyle='#ffffff18';
     for (const v of [-1,0,1]) { ctx.beginPath();ctx.moveTo(left,y(v));ctx.lineTo(right,y(v));ctx.stroke(); }
-    ctx.strokeStyle=['#fbc35c','#b794ff','#62d9e5','#61dca4'][laneIndex];ctx.lineWidth=1.5;ctx.beginPath();let pen=false;
+    ctx.strokeStyle=['#dda354','#49a7f2','#72cf6b','#f06f62'][laneIndex];ctx.lineWidth=1.5;ctx.beginPath();let pen=false;
     for (const i of order) { const v=preview.channels[axis][i]; if(v===null){pen=false;continue;}if(pen)ctx.lineTo(x(preview.time[i]),y(v));else ctx.moveTo(x(preview.time[i]),y(v));pen=true; }
     ctx.stroke(); const latest=preview.channels[axis].at(-1), q=preview.quality[axis].at(-1);
     ctx.fillStyle=ctx.strokeStyle;ctx.fillText(latest===null?'Unobserved':`${latest.toFixed(2)} · quality ${q.toFixed(2)}`,Math.max(left,right-175),top+10);
   }
-  ctx.fillStyle='#a8aec9';ctx.fillText(time(first,true),left,rect.height-4);ctx.fillText(time(last,true),right-55,rect.height-4);
+  ctx.fillStyle='#aaa99f';ctx.fillText(time(first,true),left,rect.height-4);ctx.fillText(time(last,true),right-55,rect.height-4);
 }
 new ResizeObserver(drawLiveStickInputs).observe($('stick-live-canvas'));
 let ratePresets = { presets: {}, default: null };
@@ -2745,6 +3758,7 @@ $('expand-all').onclick = () => { for (const panel of document.querySelectorAll(
 for (const panel of document.querySelectorAll('[data-major-panel]')) panel.addEventListener('toggle', () => {
   if (!panel.open) for (const video of panel.querySelectorAll('video')) video.pause();
   if (!panel.open && panel.id === 'viewer-panel') pausePair();
+  if (!panel.open && panel.id === 'manual-pair-panel') manualBrowser.pause();
   if (!panel.open && panel.id === 'motion-panel') pauseMotionPreview();
 });
 $('csv-download').addEventListener('click', event => event.stopPropagation());
@@ -2766,38 +3780,72 @@ $('confirm-delete-session').onclick = guarded(async () => {
 // A single main path; technical tools and evidence remain available on demand.
 function renderWorkflow() {
   if (!state.job) return;
-  const job = state.job, rows = state.results?.rows || [], proposed = rows.filter(r => r.global_assignment && !r.rejected), reviewed = rows.filter(r => r.reviewed && !r.rejected);
+  const job = state.job, rows = state.results?.rows || [], proposed = rows.filter(r => r.alignment_available && r.alignment_suggested && !r.rejected), reviewed = rows.filter(r => r.reviewed && !r.rejected);
+  const readiness=matchingReadiness(readEvidenceSources());message('matching-readiness',readiness.message,readiness.blocked);
+  $('match-sample-percent').disabled=readiness.autoSeed;
+  $('seed-run-summary').replaceChildren();
+  const seedRun=state.results?.workflow?.seed_search;
+  if(seedRun) {
+    const container=$('seed-run-summary'),seed=seedRun.seed;
+    container.append(el('p',seed?`Embedded-motion seed: ${seed.radio_video} ↔ ${seed.fpv_video} · offset ${offsetText(seed.offset_seconds)}. ${seedRun.attempts.length}/${job.inputs.radio.length} StickCam clips prepared; ${(seedRun.spot_checks || []).length} spot checks. All pairings need review.`:seedRun.seed_ignored?'The saved movement seed includes an ignored recording; its date predictions are inactive.':'No distinct embedded-motion seed found. Review the automatic region proposals or try another matching method.'));
+    const details=el('details');details.append(el('summary','Automatic preparation, clocks & spot checks'));
+    for(const model of seedRun.clocks || [])details.append(el('p',`${model.label}${model.recorder?` · ${model.recorder}`:' · recorder unassigned'} · raw modified-date difference ${offsetText(model.raw_modified_difference_seconds)} · duration-adjusted clock ${offsetText(model.delta_seconds)} · ${model.spot_status}. Provisional until content is independently confirmed.`));
+    for(const check of seedRun.spot_checks || [])details.append(el('p',`${check.radio_video} ↔ ${check.fpv_video}: ${check.status}${check.offset_seconds==null?'':` · motion offset ${offsetText(check.offset_seconds)}`}`,check.status==='disagrees'?'error':'hint'));
+    for(const clip of seedRun.attempts || []) {
+      const row=el('div',undefined,'actions');row.append(el('span',`${clip.name}: ${clip.status} · ${Number(clip.observed_seconds || 0).toFixed(1)}s observed · ${clip.cache_reused?'saved data reused':`${Number(clip.elapsed_seconds || 0).toFixed(1)}s preparation`}${clip.message?` · ${clip.message}`:''}`));
+      if(clip.calibration)row.append(action('Review radio regions',guarded(async()=>{openPanel('calibration-panel');await loadCalibration(clip.name);$('cal-stage').scrollIntoView({behavior:'smooth',block:'start'});},'workflow-message')));
+      details.append(row);
+    }
+    container.append(details);
+  }
   const ready = Object.values(job.inputs).flat().every(r => r.uploaded === r.size);
   const running = activeAnalysis() || stickPreparation.running || fpvPreparation.running;
   $('workflow-title').textContent = job.label;
   $('workflow-stats').replaceChildren(...[[job.inputs.fpv.length,'FPV files'],[job.inputs.radio.length,'StickCam files'],[proposed.length,'proposed pairs'],[reviewed.length,'confirmed alignments']].map(([count,label]) => {const tile=el('div',undefined,'workflow-stat');tile.append(el('strong',String(count)),el('span',label));return tile;}));
-  $('workflow-find').disabled = !ready || running || (!evidenceMode().motion && !evidenceMode().audio);
-  $('workflow-find').textContent = state.results ? 'Find / refine matches · reuse saved data' : 'Find matching flights';
-  $('workflow-review').disabled = !proposed.some(r => !r.reviewed);
+  $('workflow-find').disabled = !ready || running || readiness.blocked || (!evidenceMode().motion && !evidenceMode().audio);
+  $('workflow-find').textContent = state.results && !state.results.manual_only ? 'Run Quick Match · reuse saved data' : 'Run Quick Match';
+  $('workflow-review').disabled = !rows.some(r => r.alignment_available && r.alignment_suggested && !r.reviewed && !r.rejected && r.review_state!=='later');
+  $('workflow-manual').disabled = !ready;
+  $('workflow-stick-review').disabled = !ready || !job.inputs.radio.length;
   $('workflow-calibrate').disabled = !ready || running;
   show('workflow-cancel', activeAnalysis()); show('workflow-progress', activeAnalysis()); $('workflow-progress').value = job.progress?.percent || 0;
-  let advice = !ready ? 'Finish uploading your recordings first.' : running ? job.message : !state.results ? 'Start automatic matching. Audio is tried before motion; calibration is only needed for unresolved flights.' : proposed.some(r => !r.reviewed) ? 'Review a proposed pair, check its shared events and timing, then confirm the alignment.' : reviewed.length ? `${reviewed.length} confirmed alignment(s) ready for export or the portrait editor. Unresolved clips can be examined below.` : 'No pair is confirmed. Inspect the exceptions and evidence; uncertain results stay available for review.';
-  if (state.results && job.status !== 'complete') advice += ' Last completed results remain available while this run is pending, cancelled or failed.';
+  const samplePercent = Number($('match-sample-percent').value || 100);
+  let advice = !ready ? 'Finish uploading your recordings first.' : running ? job.message : !state.results ? `Start Quick Match. Audio is tried before motion; only ${samplePercent === 100 ? 'all files' : `${samplePercent}% of one feed against all candidates in the other`} are analyzed in this pass. Calibration is needed only for unresolved motion comparisons.` : proposed.some(r => !r.reviewed) ? 'Review a proposed pair, check its shared events and timing, then confirm the alignment.' : reviewed.length ? `${reviewed.length} confirmed alignment(s) ready for export or the portrait editor. Unresolved clips can be examined below.` : 'No pair is confirmed. Inspect the exceptions and evidence; uncertain results stay available for review.';
+  if (state.results && !state.results.manual_only && job.status !== 'complete') advice += ' Last completed results remain available while this run is pending, cancelled or failed.';
   const activeClips = job.progress?.active_clips || []; if (running && activeClips.length) advice += ' ' + activeClips.map(c=>`${c.name}: ${Number(c.percent || c.fraction * 100 || 0).toFixed(1)}%${c.eta_seconds == null ? '' : ` · about ${time(c.eta_seconds)} remaining`}`).join(' · ');
   message('workflow-message', advice, job.status === 'failed');
   const exceptions = [], workflow = state.results?.workflow || {};
+  const deferredCount = (workflow.unscanned_fpv || []).length + (workflow.unscanned_radio || []).length;
+  if (deferredCount) exceptions.push({text:workflow.strategy==='telemetry_seed'?`Sequential seed search left ${(workflow.unscanned_radio || []).length} StickCam clips unprocessed. Their pairs are date-only suggestions. Review the seed and spot-check results before confirming.`:`This ${workflow.sample_percent}% first pass left ${(workflow.unscanned_fpv || []).length} FPV and ${(workflow.unscanned_radio || []).length} StickCam files unscanned. Confirm a content match, use “Find related FPV segments” for possible O4 splits, then run all files to verify the remaining matches.`,action:'Run full matching',run:async()=>{$('match-sample-percent').value='100';$('embedded-seed-enabled').checked=false;$('matching-strategy').value='automatic';await startMatching();}});
   for (const item of workflow.unavailable_sources || []) exceptions.push({text:`${item.name}: ${item.reason}`,action:'Check sources',run:checkSources});
   const calibrationNames = [...(workflow.needs_calibration || [])];
   for (const name of job.inputs.radio.filter(r=>job.calibrations[r.name]?.source_changed).map(r=>r.name)) if (!calibrationNames.includes(name)) calibrationNames.push(name);
-  for (const name of calibrationNames) if (!calibrated(job.calibrations[name])) exceptions.push({text:`${name}: motion fallback needs a confirmed calibration. Audio remains available.`,action:'Calibrate',run:() => loadCalibration(name)});
+  for (const name of calibrationNames) if (!matchingCalibrationReady(job.calibrations[name],readEvidenceSources()) && (!readiness.autoSeed || seedRun?.attempts.some(r=>r.name===name && r.status!=='ready'))) exceptions.push({text:`${name}: ${readiness.autoSeed?'Automatic radio preparation was insufficient; review the attempted frame or try another clip.':'Motion fallback needs a saved calibration.'}`,action:'Calibrate',run:() => loadCalibration(name)});
   for (const clip of state.stickData?.clips || []) if (clip.quality_warning) exceptions.push({text:`${clip.name}: ${clip.quality_warning}`,action:'Inspect calibration',run:() => loadCalibration(clip.name)});
   for (const row of rows.filter(r => r.review_invalidated)) exceptions.push({text:`${row.fpv_video}: ${row.review_reason}`,action:'Review again',run:() => openPair(row.radio_video,row.fpv_video,row.saved_offset_seconds)});
+  for (const issue of workflow.gimbal_activity_errors || []) exceptions.push({text:`${issue.name}: ${issue.reason}`,action:'Radio regions',run:async()=>{openPanel('calibration-panel');$('calibration-clip').value=issue.name;await loadCalibration(issue.name);}});
   for (const name of state.results?.unmatched_fpv || []) exceptions.push({text:`${name}: no confirmed content match. Review candidate evidence or refine the unresolved set.`,action:'Candidates',run:() => {openPanel('results-panel'); $('results-panel').scrollIntoView({behavior:'smooth'});}});
   $('workflow-exception-count').textContent = String(exceptions.length);
   $('workflow-exception-list').replaceChildren(...exceptions.map(item => {const row=el('div',undefined,'workflow-exception');row.append(el('span',item.text),action(item.action,guarded(item.run,'workflow-message')));return row;}));
   if (!exceptions.length) $('workflow-exception-list').append(el('p',state.results ? 'No outstanding exceptions reported by the last run.' : 'Matching will report unreadable sources, calibration needs and uncertain results here.','hint'));
   message('source-summary', Object.entries(job.source_folders || {}).map(([kind,roots]) => `${kind==='radio'?'StickCam':'FPV'}: ${roots.join(', ')}`).join(' · ')); show('source-relink',job.source==='local');
 }
-function setTechnicalTools(enabled) { $('technical-tools').checked=enabled;document.body.classList.toggle('show-technical',enabled);localStorage.setItem('fpv-technical-tools',enabled?'1':'0'); }
-setTechnicalTools(localStorage.getItem('fpv-technical-tools')==='1');
+function setTechnicalTools(enabled) { $('technical-tools').checked=enabled;document.body.classList.toggle('show-technical',enabled);storage.setItem('fpv-technical-tools',enabled?'1':'0'); }
+setTechnicalTools(storage.getItem('fpv-technical-tools')==='1');
 $('technical-tools').onchange=()=>setTechnicalTools($('technical-tools').checked);
-$('matching-strategy').onchange=()=>{if ($('matching-strategy').value==='selected'){setTechnicalTools(true);openPanel('analysis-panel');}renderWorkflow();};
-$('workflow-review').onclick=guarded(async()=>{const row=(state.results?.rows||[]).filter(r=>r.global_assignment&&!r.reviewed&&!r.rejected).sort((a,b)=>(b.confidence==='strong')-(a.confidence==='strong') || b.combined_score-a.combined_score)[0];if(row)await openPair(row.radio_video,row.fpv_video);},'workflow-message');
+$('matching-strategy').onchange=()=>{if($('matching-strategy').value==='telemetry_seed'){selectEmbeddedSeed();return;}if ($('matching-strategy').value==='selected'){setTechnicalTools(true);openPanel('analysis-panel');}renderWorkflow();};
+for(const id of ['embedded-seed-enabled','seed-spot-checks'])$(id).onchange=()=>{if(state.job)state.job.settings[id==='embedded-seed-enabled'?'embedded_seed_enabled':'seed_spot_checks']=id==='embedded-seed-enabled'?$(id).checked:Number($(id).value);renderWorkflow();};
+$('match-sample-percent').onchange=()=>{if(state.job)state.job.settings.match_sample_percent=Number($('match-sample-percent').value);updateSelectionSummary();renderWorkflow();};
+$('workflow-review').onclick=guarded(async()=>{const row=(state.results?.rows||[]).filter(r=>r.alignment_available && r.alignment_suggested && !r.reviewed&&!r.rejected&&r.review_state!=='later').sort((a,b)=>(b.confidence==='strong')-(a.confidence==='strong') || candidateStrength(b)-candidateStrength(a))[0];if(row)await openCandidate(row);},'workflow-message');
+$('workflow-stick-review').onclick=guarded(async()=>{
+  openPanel('calibration-panel');
+  await refreshStickData(true);
+  const target = state.calibrationName || state.stickData?.clips.find(clip=>clip.status==='cached')?.name || state.job.inputs.radio[0]?.name;
+  if (!target) throw new Error('This session has no StickCam clips to review.');
+  if (state.calibrationName !== target || !state.metadata) await loadCalibration(target);
+  else if (!stickReview.data && !stickReview.loading) await openStickReview();
+  $('cal-stage').scrollIntoView({behavior:'smooth',block:'start'});
+},'workflow-message');
 $('workflow-calibrate').onclick=guarded(async()=>{const pending=state.job.inputs.radio.find(r=>!calibrated(state.job.calibrations[r.name]));const name=pending?.name || $('calibration-clip').value,proposal=calibrationScan.rows.find(r=>r.name===name&&!r.confirmed&&r.calibration);if(proposal)await openCalibrationProposal(proposal);else await loadCalibration(name);$('calibration-panel').scrollIntoView({behavior:'smooth'});},'workflow-message');
 $('workflow-scope').onclick=()=>{openPanel('video-list-panel');$('video-list-panel').scrollIntoView({behavior:'smooth'});};
 $('workflow-cancel').onclick=()=>$('cancel-analysis').click();
@@ -2805,9 +3853,19 @@ async function checkSources(){message('source-message','Checking source files…
 $('source-check').onclick=guarded(checkSources,'source-message');
 $('relink-source').onclick=guarded(async()=>{const id=state.job.id,result=await api(path('/sources'),{method:'PUT',json:{kind:$('relink-kind').value,path:$('relink-path').value}});await selectJob(id);$('session-sources').open=true;message('source-message',`${result.relinked} existing files relinked. ${result.missing.length} filenames not found; their previous paths are kept.`);await checkSources();},'source-message');
 function calibrationDraftKey(name){return `fpv-calibration-draft:${state.job?.id}:${name}`;}
-$('discard-calibration-draft').onclick=guarded(async()=>{const name=state.calibrationName;localStorage.removeItem(calibrationDraftKey(name));delete state.calibrationDrafts[name];state.calibration=null;await loadCalibration(name);},'calibration-message');
+$('discard-calibration-draft').onclick=guarded(async()=>{
+  if (stickReview.framePurpose === 'correction') {
+    stickReview.frameEdits=false; await showFrame(); updateStickWorkspace(); return;
+  }
+  const name=state.calibrationName;storage.removeItem(calibrationDraftKey(name));delete state.calibrationDrafts[name];state.calibration=null;await loadCalibration(name);
+},'calibration-message');
+$('stick-playhead').onchange=guarded(()=>seekStickWorkspace($('stick-playhead').value),'calibration-message');
+window.addEventListener('beforeunload',event=>{if(stickReview.dirty||stickReview.frameEdits){event.preventDefault();event.returnValue='';}});
 let calibrationDraftTimer=null;
-$('calibration-panel').addEventListener('input',()=>{clearTimeout(calibrationDraftTimer);calibrationDraftTimer=setTimeout(rememberCalibrationDraft,200);});
+$('calibration-panel').addEventListener('input',event=>{
+  if (stickReview.framePurpose==='correction' && ['tip-radius','tip-threshold','tip-polarity','stickcam-mode','radio-rotation-deg','cal-rotate-180'].includes(event.target.id)) { stickReview.frameEdits=true;updateStickWorkspace();updateMarkTools(); }
+  clearTimeout(calibrationDraftTimer);calibrationDraftTimer=setTimeout(rememberCalibrationDraft,200);
+});
 $('calibration-panel').addEventListener('toggle', guarded(async () => {
   if ($('calibration-panel').open && !calibrationLoad) await ensureCalibrationLoaded();
 }, 'calibration-message'));
@@ -2816,8 +3874,108 @@ $('prepare-stabilization').onclick=guarded(async()=>{if(!state.pair)return;const
 
 // Audio review is independent of optical motion and calibration.
 let pairAudioToken=0, pairAudioData=null;
-function drawPairAudio(){if(!pairAudioData||!state.pair)return;for(const kind of ['fpv','radio']){const canvas=$(`pair-audio-${kind}`),rect=canvas.getBoundingClientRect(),ratio=devicePixelRatio||1;if(!rect.width)continue;canvas.width=rect.width*ratio;canvas.height=rect.height*ratio;const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const [start,end]=pairAudioData.window,left=45,right=rect.width-15,top=12,bottom=rect.height-25,center=(top+bottom)/2,x=t=>left+(t-start)/(end-start)*(right-left);ctx.fillStyle='#72cf6b22';for(const w of pairAudioData.sections?.windows||[])if(w.matched)ctx.fillRect(x(w.start),top,x(w.end)-x(w.start),bottom-top);ctx.strokeStyle='#90baff';for(const [t,low,high] of pairAudioData[kind]?.points||[]){ctx.beginPath();ctx.moveTo(x(t),center-low*(bottom-top)/2);ctx.lineTo(x(t),center-high*(bottom-top)/2);ctx.stroke();}ctx.fillStyle='#a8aec9';ctx.font='11px system-ui';for(let i=0;i<=5;i++){const t=start+(end-start)*i/5;ctx.fillText(time(t,true),Math.min(x(t),right-48),rect.height-7);}if(!pairAudioData[kind]?.available)ctx.fillText('No audio track',left,center);}}
+function drawPairAudio(){if(!pairAudioData||!state.pair)return;for(const kind of ['fpv','radio']){const canvas=$(`pair-audio-${kind}`),rect=canvas.getBoundingClientRect(),ratio=devicePixelRatio||1;if(!rect.width)continue;canvas.width=rect.width*ratio;canvas.height=rect.height*ratio;const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const [start,end]=pairAudioData.window,left=45,right=rect.width-15,top=12,bottom=rect.height-25,center=(top+bottom)/2,x=t=>left+(t-start)/(end-start)*(right-left);ctx.fillStyle='#72cf6b22';for(const w of pairAudioData.sections?.windows||[])if(w.matched)ctx.fillRect(x(w.start),top,x(w.end)-x(w.start),bottom-top);ctx.strokeStyle='#49a7f2';for(const [t,low,high] of pairAudioData[kind]?.points||[]){ctx.beginPath();ctx.moveTo(x(t),center-low*(bottom-top)/2);ctx.lineTo(x(t),center-high*(bottom-top)/2);ctx.stroke();}ctx.fillStyle='#aaa99f';ctx.font='11px system-ui';for(let i=0;i<=5;i++){const t=start+(end-start)*i/5;ctx.fillText(time(t,true),Math.min(x(t),right-48),rect.height-7);}if(!pairAudioData[kind]?.available)ctx.fillText('No audio track',left,center);}}
 $('pair-audio-toggle').onchange=guarded(async()=>{const enabled=$('pair-audio-toggle').checked;show('pair-audio-charts',enabled);const token=++pairAudioToken,viewerToken=state.viewerToken;if(!enabled||!state.pair)return;const pair=state.pair;pairAudioData=null;message('pair-audio-message','Reading cached audio waveforms…');const task=await api(path('/audio-review'),{method:'POST',json:{fpv_video:pair.fpv_video,radio_video:pair.radio_video}});while(token===pairAudioToken&&viewerToken===state.viewerToken&&$('pair-audio-toggle').checked){const query=new URLSearchParams({offset:pair.offset_seconds,start:pair.radio_start,end:pair.radio_start+pair.overlap_duration}),result=await api(path(`/motion-review/${task.id}?${query}`));if(token!==pairAudioToken||viewerToken!==state.viewerToken)return;if(['queued','running'].includes(result.status)){message('pair-audio-message',result.message);await sleep(1200);continue;}if(result.status!=='complete')throw new Error(result.message);pairAudioData=result;drawPairAudio();message('pair-audio-message',`${result.sections?.correlated_sections||0}/${result.sections?.usable_sections||0} usable 3-second boundary sections agree at this offset. Green bands show supporting content, not a probability. Click a waveform to seek both videos.`);break;}},'pair-audio-message');
 for(const kind of ['fpv','radio'])$(`pair-audio-${kind}`).onclick=event=>{if(!pairAudioData||!state.pair)return;const rect=event.currentTarget.getBoundingClientRect(),[start,end]=pairAudioData.window,t=start+Math.max(0,Math.min(1,(event.clientX-rect.left-45)/(rect.width-60)))*(end-start);pausePair();seekPair(t-state.pair.radio_start);};
 window.addEventListener('resize',drawPairAudio);
 $('pair-motion-tools').onclick=guarded(async()=>{if(!state.pair)return;selectMotionPair(state.pair);openPanel('motion-panel');$('motion-panel').scrollIntoView({behavior:'smooth'});message('motion-message','Motion is loaded only when you choose Load motion signals. Experimental estimates require inspection.');},'viewer-message');
+
+function renderSyncPoints(){
+  const pair=state.pair;if(!pair)return;
+  $('sync-points').replaceChildren(...(pair.sync_points || []).map(p=>el('p',`FPV ${time(p.fpv_time,true)} ↔ StickCam ${time(p.radio_time,true)} · offset ${offsetText(p.radio_time-p.fpv_time)}`,'hint')));
+  message('sync-status',pair.sync_check?.message || 'No independent event checkpoints yet.', ['drift','offset_mismatch'].includes(pair.sync_check?.status));
+  $('sync-export-ack').checked=false;
+}
+async function saveSyncPoints(points){
+  if(!state.pair)return;const pair=state.pair,token=state.viewerToken;
+  const info=await api(path('/sync-points'),{method:'PUT',json:{radio_video:pair.radio_video,fpv_video:pair.fpv_video,offset_seconds:pair.offset_seconds,points,manual_pair:!!pair.manual_pair,source_revisions:pair.source_revisions}});
+  if(token!==state.viewerToken)return;info.date_suggestion=pair.date_suggestion;info.rhythm_suggestion=pair.rhythm_suggestion;info.manual_recorder=pair.manual_recorder;info.manual_sync_points=info.manual_pair?points:undefined;state.pair=info;renderSyncPoints();
+}
+$('sync-add').onclick=guarded(()=>saveSyncPoints([...(state.pair?.sync_points || []),{fpv_time:Number($('sync-fpv-time').value),radio_time:Number($('sync-radio-time').value)}]),'viewer-message');
+$('sync-clear').onclick=guarded(()=>saveSyncPoints([]),'viewer-message');
+async function decideReview(decision){
+  if(!state.pair)return;await api(path('/review-state'),{method:'POST',json:{radio_video:state.pair.radio_video,fpv_video:state.pair.fpv_video,state:decision,offset_seconds:state.pair.offset_seconds,manual_pair:!!state.pair.manual_pair,source_revisions:state.pair.source_revisions}});state.job=await api(path(''));await loadResults();
+  message('viewer-message',decision==='later'?'Saved for later review.':'FPV counterpart decision saved.');
+}
+$('review-later').onclick=guarded(()=>decideReview('later'),'viewer-message');
+$('no-counterpart').onclick=guarded(()=>decideReview(state.job.no_counterpart?.includes(state.pair?.fpv_video)?'restore_counterpart':'no_counterpart'),'viewer-message');
+$('review-next').onclick=guarded(async()=>{
+  const current=state.pair;
+  const next=(state.results?.rows || []).filter(r=>r.alignment_available && r.review_state==='candidate' && !state.job.no_counterpart?.includes(r.fpv_video) && !(r.radio_video===current?.radio_video && r.fpv_video===current?.fpv_video) && (r.alignment_suggested || candidateStrength(r)>=.4))
+    .sort((a,b)=>(b.confidence==='strong')-(a.confidence==='strong') || candidateStrength(b)-candidateStrength(a))[0];
+  if(next)await openCandidate(next);else message('viewer-message','No remaining review candidates.');
+},'viewer-message');
+$('preview-acceleration').onchange=()=>{$('playback-proxy').onchange();};
+$('export-profile').onchange=()=>{if($('export-profile').value==='copy')$('export-fps').value='original';};
+$('export-radio-framing').onchange=()=>{if($('export-radio-framing').value==='stabilized'){if($('export-profile').value==='copy')$('export-profile').value='h264';if($('export-fps').value==='original')$('export-fps').value='30';}};
+
+function saveJSON(name,value){const blob=new Blob([JSON.stringify(value,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+$('open-project').onclick=()=>$('project-file').click();
+$('project-file').onchange=guarded(async()=>{
+  const file=$('project-file').files[0];if(!file)return;
+  const response=await fetch('/api/projects/open',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
+  const job=await response.json();if(!response.ok)throw new Error(job.detail || 'Could not open project');
+  await history();await selectJob(job.id);message('session-message','Project opened as a separate session. Relink both source folders to verify recordings and reuse fingerprints.');$('project-file').value='';
+},'session-message');
+$('show-backups').onclick=guarded(async()=>{
+  if(!state.job)throw new Error('Select a session first.');const token=state.jobToken,jobId=state.job.id;
+  const data=await api(path('/backups'));if(token!==state.jobToken)return;
+  $('session-backup-list').replaceChildren(...data.backups.map(backup=>{
+    const row=el('div',undefined,'actions');row.append(el('span',new Date(backup.created*1000).toLocaleString(),'hint'),action('Restore this metadata snapshot',guarded(async()=>{
+      await api(`/api/jobs/${jobId}/backups/restore`,{method:'POST',json:{name:backup.name}});if(token===state.jobToken){await selectJob(jobId);message('session-message','Metadata restored. Previous JSON and completed exports were preserved.');}
+    },'session-message')));return row;
+  }));if(!data.backups.length)message('session-message','No metadata snapshots yet. The app keeps up to ten automatically.');
+},'session-message');
+$('installation-report').onclick=guarded(async()=>{
+  const report=await api('/api/diagnostics'+(state.job?'?job_id='+state.job.id:''));$('installation-details').textContent=JSON.stringify(report,null,2);show('installation-details');saveJSON('flight-matcher-diagnostics.json',report);
+},'session-message');
+const referenceValidation={timer:null,task:null,report:null,token:0};
+$('reference-save').onclick=guarded(async()=>{
+  if(!state.pair)return;const pair=state.pair;
+  await api(path('/references'),{method:'PUT',json:{radio_video:pair.radio_video,fpv_video:pair.fpv_video,match:$('reference-match').value==='yes',expected_offset:$('reference-offset').value===''?null:Number($('reference-offset').value)}});
+  message('reference-status','Independent reference label saved. It does not change pairing or the saved alignment.');
+},'reference-status');
+$('reference-run').onclick=guarded(async()=>{
+  const job=state.job.id,token=state.jobToken,task=await api(path('/validate-audio'),{method:'POST',json:{}});if(token!==state.jobToken)return;
+  referenceValidation.task=task.id;const run=++referenceValidation.token;show('reference-cancel');
+  const poll=async()=>{if(run!==referenceValidation.token||token!==state.jobToken)return;
+    try{const result=await api(`/api/jobs/${job}/motion-review/${task.id}`);if(token!==state.jobToken)return;
+      message('reference-status',result.progress?.message || result.message,result.status==='failed');
+      if(['queued','running'].includes(result.status)){referenceValidation.timer=setTimeout(poll,1500);return;}
+      show('reference-cancel',false);if(result.status==='complete'){referenceValidation.report=result;show('reference-download');message('reference-status',Object.entries(result.counts).map(([k,v])=>`${v} ${k.replaceAll('_',' ')}`).join(' · ')+'. '+result.note);}
+    }catch(error){message('reference-status',error.message,true);}
+  };poll();
+},'reference-status');
+$('reference-cancel').onclick=guarded(()=>api(path(`/motion-review/${referenceValidation.task}/cancel`),{method:'POST'}),'reference-status');
+$('reference-download').onclick=()=>{if(referenceValidation.report)saveJSON('audio-reference-report.json',referenceValidation.report);};
+
+function flightDocument() {
+  const data=state.results || {}, records=[];
+  if(state.flightData?.results===data && state.flightData?.job===state.job) return state.flightData.doc;
+  for(const kind of ['fpv','radio']) for(const record of state.job?.inputs?.[kind] || []) {
+    const clip=data.clips?.[kind]?.find(c=>c.name===record.name);
+    records.push({id:`${kind}:${record.name}`,name:record.name,kind:kind==='radio'?'stick':kind,
+      metadata:record.metadata?.duration ? record.metadata : clip,missing:clip?.source_usable===false});
+  }
+  const doc={id:state.job?.id,videos:records,flights:data.flights || [],pairs:(data.rows || []).filter(row=>row.alignment_available).map(row=>({
+    id:row.pair_id || pairKey(row.radio_video,row.fpv_video),stick:`radio:${row.radio_video}`,fpv:`fpv:${row.fpv_video}`,
+    radio_video:row.radio_video,fpv_video:row.fpv_video,offset:row.alignment_offset_seconds,confirmed:row.reviewed,
+    method:row.timing_only?'timestamp':'content',row}))};
+  state.flightData={results:data,job:state.job,doc};return doc;
+}
+function pairKey(radio,fpv) { return `${radio}::${fpv}`; }
+installFlightView({getDoc:flightDocument,fmt:time,escape:value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
+  isSimple:()=>false,notice:(text)=>message('viewer-message',text),clearReview:pausePair,
+  loadPreview:(video,record,initialTime,current)=>loadVideo(video,record.kind==='stick'?'radio':'fpv',record.name,current,'flight-preview-status',false,initialTime),
+  openPair:async(id)=>{const p=flightDocument().pairs.find(p=>p.id===id);if(p)await openCandidate(p.row);},
+  exportPairs:async(ids)=>requestExport(flightDocument().pairs.filter(p=>ids.includes(p.id)).map(p=>({radio_video:p.radio_video,fpv_video:p.fpv_video,offset_seconds:p.offset})))
+});
+
+function renderPairRhythm(data) {
+  show('pair-rhythm-details',!!data);$('pair-rhythm-sections').replaceChildren();if(!data)return;
+  message('pair-rhythm-summary',`${data.method==='gimbal_activity'?'Tip-free gimbal movement. ':''}${data.reason} Score ${data.score.toFixed(3)} · ${data.sections.matched}/${data.sections.usable} separate 3s sections · ${data.radio_events} StickCam and ${data.fpv_events} FPV bursts. Timing peak margin ${data.peak_margin.toFixed(3)} · candidate separation ${Number(data.candidate_margin || 0).toFixed(3)} · resolution ${data.timing_resolution_seconds}s plus flight-controller response delay. This checks changes, not reliable roll/pitch/yaw labels. Sections below use the rhythm offset ${offsetText(data.offset_seconds)}.`);
+  for(const w of data.sections.windows || [])if(w.usable) $('pair-rhythm-sections').append(el('p',`${w.matched?'✓ Matching rhythm':'Different rhythm'} · StickCam ${time(w.radio_start,true)} ↔ FPV ${time(w.fpv_start,true)} · ${w.duration.toFixed(1)}s · correlation ${w.correlation.toFixed(2)}`,w.matched?'rhythm-match':'hint'));
+}
+
+$('workflow-gimbal-activity').onchange=()=>{ $('use-gimbal-activity').checked=$('workflow-gimbal-activity').checked;updateEvidenceSummary();};
+$('workflow-rhythm').onchange=()=>{if($('workflow-rhythm').checked)$('use-stick-inputs').checked=true;$('use-movement-rhythm').checked=$('workflow-rhythm').checked;updateEvidenceSummary();};
