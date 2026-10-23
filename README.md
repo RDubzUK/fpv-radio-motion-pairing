@@ -55,7 +55,7 @@ Use `--host 127.0.0.1` when you want access only from the server itself. Stop th
 
 ## Install on another machine
 
-Requires Python 3.11+ and FFmpeg/ffprobe, including the `libx264` and `dnxhd` encoders.
+Requires Python 3.11+ and FFmpeg/ffprobe, including the `libx264` and `dnxhd` encoders. Source installation builds the vendored telemetry parser with Rust/Cargo and a native compiler. Windows users should follow **Windows source setup** below before installing dependencies.
 
 ```bash
 uv sync --frozen
@@ -71,9 +71,40 @@ python3.11 -m venv .venv
 
 The user service example is in `deploy/fpv-radio-motion-pairing.service`. Adjust its project path when installing elsewhere.
 
+### Windows source setup
+
+The source checkout compiles the vendored Rust telemetry parser during `uv sync`. On Windows x64, install these prerequisites first:
+
+1. [uv](https://docs.astral.sh/uv/getting-started/installation/). The launcher requests Python 3.11 through uv.
+2. [FFmpeg and ffprobe](https://ffmpeg.org/download.html#build-windows), with their `bin` directory on PATH.
+3. [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/). In its installer select **Desktop development with C++**, including **MSVC x64/x86 build tools** and a **Windows 10 or Windows 11 SDK**. Visual Studio Code is an editor and does not supply this compiler/linker; the Visual C++ Redistributable alone is also insufficient.
+4. [Rust using rustup](https://rust-lang.org/tools/install/), using its default stable MSVC toolchain. Rustup supplies both `cargo` and `rustc`.
+5. Close and reopen PowerShell. If using VS Code's integrated terminal, restart VS Code so it inherits the updated PATH.
+
+From the project folder:
+
+```powershell
+.\start.ps1 -Check  # Check prerequisites without installing or starting the app.
+.\start.ps1         # Install locked dependencies, then serve on 127.0.0.1:8767.
+# Use .\start.ps1 -Lan for access from another device on the LAN.
+```
+
+The preflight also checks the usual Rust installation folders when an existing terminal has not picked up Cargo's PATH. It reports missing MSVC tools and SDK files before starting dependency compilation.
+
+| Error | Action |
+| --- | --- |
+| `Missing cargo` / `cargo` is not recognised | Install rustup, then reopen the terminal. Check `cargo --version` and `rustc --version`. |
+| rustup reports no default toolchain | Run `rustup default stable`, then retry the preflight. |
+| `link.exe` missing / "VS Code is a different product, and is not sufficient" | Modify Visual Studio Build Tools to include the C++ desktop workload, MSVC tools and a Windows SDK. |
+| Many crates fail, followed by `maturin failed` / exit code 101 | Read the first compiler/linker error above the list; these are often cascading failures from missing build tools. |
+
+After fixing prerequisites, rerun `start.ps1`; deleting sessions, source videos or the virtual environment is unnecessary. Microsoft's [Windows Rust setup guide](https://learn.microsoft.com/en-us/windows/dev-environment/rust/setup) describes the native compiler requirements.
+
 ### Windows portable test build
 
 The project includes a Windows x64 PyInstaller build for friends to try without installing Python. It is a portable folder in a ZIP, not an installer. Build it on Windows with `tools/build_windows.ps1`, or use **Actions → Windows portable test package → Run workflow** in the private GitHub repository and download the artifact from that run. PyInstaller needs a Windows runner to produce a Windows executable. The package uses CPU processing and requires FFmpeg/ffprobe on the tester's PATH; see [`packaging/windows/README.txt`](packaging/windows/README.txt) for launch and LAN-access instructions. The normal Linux service and project workflow are unchanged.
+
+For friends using the portable ZIP, launch **Start-FPV-Matcher.bat** from the extracted package. They need FFmpeg/ffprobe, but no Rust, Cargo or C++ compiler. Running `start.ps1` from a source checkout follows the source-build path above. To check a Windows build machine without creating a package, run `.\tools\build_windows.ps1 -Check`.
 
 ## Recommended workflow
 

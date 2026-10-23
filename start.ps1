@@ -1,15 +1,13 @@
-param([switch]$Lan, [int]$Port = 8767)
+param([switch]$Lan, [int]$Port = 8767, [switch]$Check)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-foreach ($Tool in @("uv", "ffmpeg", "ffprobe", "cargo")) {
-    if (-not (Get-Command $Tool -ErrorAction SilentlyContinue)) {
-        throw "Missing $Tool. See README.md. Rust/cargo is needed to build the source telemetry parser; portable packages do not need it."
-    }
-}
+. (Join-Path $PSScriptRoot 'tools\windows_prerequisites.ps1')
+Assert-FpvWindowsPrerequisites -RequireMediaTools
+if ($Check) { return }
 $env:OPENBLAS_NUM_THREADS = "1"
 $env:OMP_NUM_THREADS = "1"
 uv sync --frozen --python 3.11
-if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed. For telemetry-parser/link.exe errors, see README.md: Windows source setup. Check the MSVC C++ workload and Windows SDK in Visual Studio Installer." }
 $BindAddress = if ($Lan) { "0.0.0.0" } else { "127.0.0.1" }
 uv run --frozen fpv-match-web --host $BindAddress --port $Port
 if ($LASTEXITCODE -ne 0) { throw "Flight Matcher stopped with an error. Run uv run --frozen fpv-match-web --check for diagnostics." }

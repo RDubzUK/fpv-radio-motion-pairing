@@ -1,14 +1,12 @@
+param([switch]$Check)
 $ErrorActionPreference = "Stop"
-
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    throw "Install uv first: https://docs.astral.sh/uv/getting-started/installation/"
-}
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    throw "Install Rust with rustup first. The vendored telemetry parser is built from Rust source."
-}
+Set-Location (Split-Path -Parent $PSScriptRoot)
+. (Join-Path $PSScriptRoot 'windows_prerequisites.ps1')
+Assert-FpvWindowsPrerequisites
+if ($Check) { return }
 
 uv sync --frozen --python 3.11
-if ($LASTEXITCODE -ne 0) { throw "uv dependency installation failed." }
+if ($LASTEXITCODE -ne 0) { throw "uv dependency installation failed. For telemetry-parser/link.exe errors, see README.md: Windows source setup. Check the MSVC C++ workload and Windows SDK in Visual Studio Installer." }
 uv pip install --python .venv\Scripts\python.exe "pyinstaller==6.22.3"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller installation failed." }
 
