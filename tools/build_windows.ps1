@@ -1,8 +1,8 @@
-param([switch]$Check)
+param([switch]$Check, [switch]$SkipInstall)
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 . (Join-Path $PSScriptRoot 'windows_prerequisites.ps1')
-Assert-FpvWindowsPrerequisites
+Initialize-FpvWindowsPrerequisites -Check:$Check -SkipInstall:$SkipInstall
 if ($Check) { return }
 
 uv sync --frozen --python 3.11

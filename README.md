@@ -73,7 +73,43 @@ The user service example is in `deploy/fpv-radio-motion-pairing.service`. Adjust
 
 ### Windows source setup
 
-The source checkout compiles the vendored Rust telemetry parser during `uv sync`. On Windows x64, install these prerequisites first:
+On Windows x64, **`start.cmd` / `start.ps1` and `tools/build_windows.ps1` install missing prerequisites automatically**, then run the locked Python dependency installation. The source checkout compiles the vendored Rust telemetry parser during `uv sync`.
+
+After cloning or pulling the project:
+
+```powershell
+git pull --ff-only
+.\start.cmd
+```
+
+For later updates, **`.\update.cmd`** combines a fast-forward Git pull with the normal setup/launch. Pass `-Lan` for LAN access. Git pull itself fetches source code; dependency installation is an explicit part of these launch/build scripts, without Git hooks.
+
+Automatic setup uses **WinGet** (normally supplied by Windows App Installer). It installs only missing tools:
+
+| Tool | WinGet package / action |
+| --- | --- |
+| uv | `astral-sh.uv`; uv supplies Python 3.11 when needed |
+| MSVC C++ tools | `Microsoft.VisualStudio.2022.BuildTools`, including the C++ workload and recommended components; an existing 2022 Build Tools installation is modified to add that workload if necessary |
+| Windows SDK | Included with the C++ workload; `Microsoft.WindowsSDK.10.0.26100` is used if a usable SDK is still missing |
+| Rust/Cargo | `Rustlang.Rustup`; missing compiler/Cargo components or an absent default toolchain are prepared as needed |
+| FFmpeg/ffprobe | `Gyan.FFmpeg` when launching; not required merely to build the package |
+
+The scripts refresh PATH within the current process and recheck prerequisites before compiling. Existing working tools are reused, without blanket upgrades or virtual-environment deletion. The first C++ installation can download several GB. Package/source agreements are accepted for these prerequisites, and installers may show Windows administrator/UAC prompts. A required restart stops setup with an instruction to reboot and rerun; the scripts never request an automatic reboot.
+
+If WinGet is missing, install/update [App Installer](https://apps.microsoft.com/detail/9nblggh4nns1), then rerun the same command.
+
+To diagnose setup or manage prerequisites yourself:
+
+```powershell
+.\start.ps1 -Check        # Report prerequisites without installing or launching.
+.\start.ps1 -SkipInstall  # Require existing native tools; still sync Python dependencies.
+.\start.ps1 -Lan          # Install missing tools, then allow LAN access.
+.\tools\build_windows.ps1 # Install missing build tools and create the portable ZIP.
+```
+
+#### Manual installation
+
+For managed PCs or manual setup, install:
 
 1. [uv](https://docs.astral.sh/uv/getting-started/installation/). The launcher requests Python 3.11 through uv.
 2. [FFmpeg and ffprobe](https://ffmpeg.org/download.html#build-windows), with their `bin` directory on PATH.
@@ -81,15 +117,7 @@ The source checkout compiles the vendored Rust telemetry parser during `uv sync`
 4. [Rust using rustup](https://rust-lang.org/tools/install/), using its default stable MSVC toolchain. Rustup supplies both `cargo` and `rustc`.
 5. Close and reopen PowerShell. If using VS Code's integrated terminal, restart VS Code so it inherits the updated PATH.
 
-From the project folder:
-
-```powershell
-.\start.ps1 -Check  # Check prerequisites without installing or starting the app.
-.\start.ps1         # Install locked dependencies, then serve on 127.0.0.1:8767.
-# Use .\start.ps1 -Lan for access from another device on the LAN.
-```
-
-The preflight also checks the usual Rust installation folders when an existing terminal has not picked up Cargo's PATH. It reports missing MSVC tools and SDK files before starting dependency compilation.
+The preflight checks the usual tool installation folders and the current/persisted PATH. Use `-Check` for diagnostics or `-SkipInstall` to disable automatic native-tool installation on a managed machine.
 
 | Error | Action |
 | --- | --- |
@@ -102,7 +130,7 @@ After fixing prerequisites, rerun `start.ps1`; deleting sessions, source videos 
 
 ### Windows portable test build
 
-The project includes a Windows x64 PyInstaller build for friends to try without installing Python. It is a portable folder in a ZIP, not an installer. Build it on Windows with `tools/build_windows.ps1`, or use **Actions → Windows portable test package → Run workflow** in the private GitHub repository and download the artifact from that run. PyInstaller needs a Windows runner to produce a Windows executable. The package uses CPU processing and requires FFmpeg/ffprobe on the tester's PATH; see [`packaging/windows/README.txt`](packaging/windows/README.txt) for launch and LAN-access instructions. The normal Linux service and project workflow are unchanged.
+The project includes a Windows x64 PyInstaller build for friends to try without installing Python. It is a portable folder in a ZIP, not an installer. Build it on Windows with `tools/build_windows.ps1`, or use **Actions → Windows portable test package → Run workflow** in the GitHub repository and download the artifact from that run. PyInstaller needs a Windows runner to produce a Windows executable. The package uses CPU processing and requires FFmpeg/ffprobe on the tester's PATH; see [`packaging/windows/README.txt`](packaging/windows/README.txt) for launch and LAN-access instructions. The normal Linux service and project workflow are unchanged.
 
 For friends using the portable ZIP, launch **Start-FPV-Matcher.bat** from the extracted package. They need FFmpeg/ffprobe, but no Rust, Cargo or C++ compiler. Running `start.ps1` from a source checkout follows the source-build path above. To check a Windows build machine without creating a package, run `.\tools\build_windows.ps1 -Check`.
 

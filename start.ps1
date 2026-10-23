@@ -1,8 +1,8 @@
-param([switch]$Lan, [int]$Port = 8767, [switch]$Check)
+param([switch]$Lan, [int]$Port = 8767, [switch]$Check, [switch]$SkipInstall)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 . (Join-Path $PSScriptRoot 'tools\windows_prerequisites.ps1')
-Assert-FpvWindowsPrerequisites -RequireMediaTools
+Initialize-FpvWindowsPrerequisites -RequireMediaTools -Check:$Check -SkipInstall:$SkipInstall
 if ($Check) { return }
 $env:OPENBLAS_NUM_THREADS = "1"
 $env:OMP_NUM_THREADS = "1"
